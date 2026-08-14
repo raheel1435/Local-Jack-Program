@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(node .tmp-drive.mjs 2>&1)",
+      "PowerShell(npm run dev)",
+      "PowerShell(npm run build 2>&1)",
+      "PowerShell(npm test 2>&1)",
+      "PowerShell(node -e \"import\\('c:/Users/shani/Downloads/Jack-AI-Presenter-Platform/dist/server/index.js'\\).then\\(m => console.log\\(Object.keys\\(m\\), typeof m.default, m.default && Object.keys\\(m.default\\)\\)\\)\")",
+      "PowerShell(npm run start)",
+      "PowerShell(node .tmp-inspect.mjs 2>&1)",
+      "PowerShell(npx tsc --noEmit 2>&1)",
+      "PowerShell(npx eslint app 2>&1)",
+      "PowerShell(npm uninstall playwright-core 2>&1)",
+      "WebSearch",
+      "WebFetch(domain:openai.github.io)",
+      "WebFetch(domain:developers.openai.com)",
+      "WebFetch(domain:platform.openai.com)",
+      "WebFetch(domain:www.npmjs.com)",
+      "PowerShell(npm install @openai/agents-realtime openai zod 2>&1)"
+    ]
+  }
+}
