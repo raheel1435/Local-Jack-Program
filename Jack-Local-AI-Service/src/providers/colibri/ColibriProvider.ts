@@ -31,7 +31,7 @@ export class ColibriProvider {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: req.model ?? "colibri",
+        model: req.model ?? config.colibriModelId,
         messages: req.messages,
         temperature: req.temperature,
         max_tokens: req.max_tokens,
