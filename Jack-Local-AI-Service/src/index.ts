@@ -14,6 +14,10 @@ import type { LlmProvider } from "./types/jack.js";
 
 const app = express();
 app.use(express.json());
+// Raw binary audio uploads for POST /jack/transcribe (browser microphone
+// capture). Only activates for audio/* content types; JSON requests to the
+// same route (the pre-existing audioFilePath contract) are unaffected.
+app.use(express.raw({ type: ["audio/wav", "audio/wave", "audio/x-wav"], limit: "25mb" }));
 
 // Minimal CORS: this gateway is a machine-local dev service consumed
 // directly by the browser-based Jack-AI-Presenter-Platform frontend, which

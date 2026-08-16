@@ -132,6 +132,8 @@
 .jack-local-command-form input{flex:1;background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:8px;color:var(--text);padding:8px 12px;font-size:12px}
 .jack-local-command-form button{background:rgba(0,217,245,.1);border:1px solid rgba(0,217,245,.3);border-radius:8px;color:var(--cyan);padding:8px 14px;font-size:12px;cursor:pointer}
 .jack-local-command-form button:disabled{opacity:.4;cursor:not-allowed}
+.jack-local-mic{flex:0 0 auto;font-size:14px;line-height:1;padding:8px 10px}
+.jack-local-mic.state-listening{background:rgba(255,118,28,.15);border-color:rgba(255,118,28,.5);color:#ff9a5c}
 .jack-local-result{margin:8px 0 0;color:#dff8ff;font-size:12px}
 
 /* Present stage (full-screen) */

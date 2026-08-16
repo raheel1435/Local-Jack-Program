@@ -2,7 +2,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { OpenAIRealtimeWebRTC, RealtimeAgent, RealtimeSession, type RealtimeItem } from "@openai/agents-realtime";
-import { findRelevantSections } from "../lib/askJackProvider";
+import { useLocalRecorder, type LocalRecorderState } from "../hooks/useLocalRecorder";
 import { jackApi, type JackHealth, type JackIntentAction } from "../lib/jackApi";
 import { summarizeDocuments } from "./documentContext";
 import { buildInstructions } from "./instructions";
@@ -10,10 +10,10 @@ import { nextAttentionState } from "./jackStateMachine";
 import { toOrbPresentation, type OrbPresentation } from "./orbStateMap";
 import { buildPresentationContext, formatContextForPrompt } from "./presentationContext";
 import { unsupportedController, type PresentationController } from "./presentationController";
+import { resolveSlideTarget } from "./slideTargetResolver";
 import { createPresentationTools } from "./tools";
 import { createWakeWordService } from "./wakeWordService";
 import { useSession } from "../session/SessionContext";
-import type { ParsedDocument } from "../session/types";
 import type {
   AudienceQuestionPolicy,
   ConnectionStatus,
@@ -81,16 +81,6 @@ function playAudioBlob(blob: Blob, onEnded?: () => void) {
   void audio.play().catch(cleanup);
 }
 
-function resolveSlideIndexFromTarget(
-  target: string | undefined,
-  parsedDocs: Record<string, ParsedDocument>,
-  activeFileId: string | null,
-): number | null {
-  if (!target) return null;
-  const matches = findRelevantSections(target, Object.values(parsedDocs), activeFileId, 1);
-  return matches.length > 0 ? matches[0].sectionIndex : null;
-}
-
 export interface JackContextValue {
   attentionState: JackAttentionState;
   orb: OrbPresentation;
@@ -140,6 +130,13 @@ export interface JackContextValue {
    * both ultimately drive the same controller, never raw UI state.
    */
   runLocalCommand(text: string): Promise<LocalCommandOutcome>;
+
+  /** Push-to-talk capture -> whisper.cpp -> runLocalCommand, entirely local (no OpenAI). */
+  localMicState: LocalRecorderState;
+  localMicLevel: number;
+  localMicError: string | null;
+  startLocalListening(): Promise<void>;
+  stopLocalListening(): Promise<{ transcript: string; outcome: LocalCommandOutcome } | null>;
 }
 
 const JackContext = createContext<JackContextValue | null>(null);
@@ -167,6 +164,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const [questions] = useState<QueuedQuestion[]>([]);
   const [presenterControl, setPresenterControl] = useState<ControlOwner>("presenter");
   const [jackLocalHealth, setJackLocalHealth] = useState<JackHealth | null>(null);
+  const localRecorder = useLocalRecorder();
 
   const realtimeSessionRef = useRef<RealtimeSession | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -507,15 +505,17 @@ export function JackProvider({ children }: { children: ReactNode }) {
             result = controller.goToPreviousSlide();
             break;
           case "jump_to_slide": {
-            const index = resolveSlideIndexFromTarget(
-              intent.target,
-              appSessionRef.current.parsedDocs,
-              appSessionRef.current.activeFileId,
-            );
-            result =
-              index === null
-                ? { success: false, error: `Couldn't find a slide matching "${intent.target ?? ""}".` }
-                : controller.goToSlide(index);
+            const { parsedDocs, activeFileId } = appSessionRef.current;
+            const sections = (activeFileId && parsedDocs[activeFileId]?.sections) || [];
+            const resolution = resolveSlideTarget(text, intent.target, sections);
+            if (resolution.status === "resolved") {
+              result = controller.goToSlide(resolution.slideIndex);
+            } else if (resolution.status === "ambiguous") {
+              const names = resolution.candidates.map((c) => `"${c.title ?? `slide ${c.index + 1}`}"`).join(", ");
+              result = { success: false, error: `That could mean ${names} -- which one did you mean?` };
+            } else {
+              result = { success: false, error: `Couldn't find a slide matching "${intent.target || text}".` };
+            }
             break;
           }
           case "pause_presentation":
@@ -553,6 +553,37 @@ export function JackProvider({ children }: { children: ReactNode }) {
     },
     [dispatchEvent],
   );
+
+  const startLocalListening = useCallback(async () => {
+    setLastError(null);
+    await localRecorder.start();
+    dispatchEvent({ type: "LOCAL_MIC_START" });
+  }, [localRecorder, dispatchEvent]);
+
+  const stopLocalListening = useCallback(async (): Promise<{ transcript: string; outcome: LocalCommandOutcome } | null> => {
+    const audio = await localRecorder.stop();
+    if (!audio) {
+      dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
+      return null;
+    }
+    dispatchEvent({ type: "LOCAL_COMMAND_START" });
+    try {
+      const { text } = await jackApi.transcribeAudio(audio);
+      const transcript = text.trim();
+      if (!transcript) {
+        dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
+        setLastError("Didn't catch any speech -- try again.");
+        return null;
+      }
+      const outcome = await runLocalCommand(transcript);
+      return { transcript, outcome };
+    } catch (err) {
+      dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
+      const message = err instanceof Error ? err.message : "Transcription failed.";
+      setLastError(message);
+      return { transcript: "", outcome: { source: "deterministic", ok: false, message } };
+    }
+  }, [localRecorder, dispatchEvent, runLocalCommand]);
 
   // Push updated instructions to a live session whenever behavior-affecting settings change.
   useEffect(() => {
@@ -613,6 +644,11 @@ export function JackProvider({ children }: { children: ReactNode }) {
     unregisterController,
     endSession,
     runLocalCommand,
+    localMicState: localRecorder.state,
+    localMicLevel: localRecorder.level,
+    localMicError: localRecorder.error,
+    startLocalListening,
+    stopLocalListening,
   };
 
   return <JackContext.Provider value={value}>{children}</JackContext.Provider>;

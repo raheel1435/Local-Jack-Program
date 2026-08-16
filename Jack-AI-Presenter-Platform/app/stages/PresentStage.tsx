@@ -74,6 +74,7 @@ function PresentSession({
   const [commandInput, setCommandInput] = useState("");
   const [commandBusy, setCommandBusy] = useState(false);
   const [lastCommandResult, setLastCommandResult] = useState<LocalCommandOutcome | null>(null);
+  const [lastTranscript, setLastTranscript] = useState<string | null>(null);
 
   const offlineSpeech = useSpeech();
   const controlsVisible = useAutoHideControls(3500);
@@ -269,6 +270,7 @@ function PresentSession({
     jack.jackLocalHealth !== null &&
     jack.jackLocalHealth.llamacpp === "unavailable" &&
     jack.jackLocalHealth.colibri === "unavailable";
+  const whisperUnavailable = jack.jackLocalHealth?.whisper === "unavailable";
 
   async function submitLocalCommand(e: FormEvent) {
     e.preventDefault();
@@ -276,11 +278,31 @@ function PresentSession({
     if (!text || commandBusy) return;
     setCommandBusy(true);
     setCommandInput("");
+    setLastTranscript(null);
     try {
       const outcome = await jack.runLocalCommand(text);
       setLastCommandResult(outcome);
     } finally {
       setCommandBusy(false);
+    }
+  }
+
+  async function handleLocalMicClick() {
+    if (jack.localMicState === "listening") {
+      setCommandBusy(true);
+      try {
+        const result = await jack.stopLocalListening();
+        if (result) {
+          setLastTranscript(result.transcript || null);
+          setLastCommandResult(result.outcome);
+        }
+      } finally {
+        setCommandBusy(false);
+      }
+    } else {
+      setLastTranscript(null);
+      setLastCommandResult(null);
+      await jack.startLocalListening();
     }
   }
 
@@ -335,11 +357,22 @@ function PresentSession({
           </p>
         )}
         <form className="jack-local-command-form" onSubmit={submitLocalCommand}>
+          <button
+            type="button"
+            className={`jack-local-mic state-${jack.localMicState}`}
+            onClick={handleLocalMicClick}
+            disabled={commandBusy || whisperUnavailable || jack.localMicState === "requesting"}
+            aria-pressed={jack.localMicState === "listening"}
+            aria-label={jack.localMicState === "listening" ? "Stop recording and send to Jack" : "Talk to Jack (local)"}
+            title={whisperUnavailable ? "Local Whisper transcription is unavailable" : undefined}
+          >
+            {jack.localMicState === "listening" ? "⏹" : jack.localMicState === "requesting" ? "…" : "🎤"}
+          </button>
           <input
             type="text"
             value={commandInput}
             onChange={(e) => setCommandInput(e.target.value)}
-            placeholder='Type a command, e.g. "Next slide." or "Summarize this slide."'
+            placeholder='Type or press 🎤 to talk, e.g. "Next slide." or "Summarize this slide."'
             aria-label="Type a command for Jack"
             disabled={commandBusy}
           />
@@ -347,6 +380,9 @@ function PresentSession({
             {commandBusy ? "…" : "Send"}
           </button>
         </form>
+        {jack.localMicState === "listening" && <p className="jack-local-result">Listening… press ⏹ when done.</p>}
+        {jack.localMicError && <p className="jack-local-result speech-error">{jack.localMicError}</p>}
+        {lastTranscript && <p className="jack-local-result">You said: &ldquo;{lastTranscript}&rdquo;</p>}
         {lastCommandResult && (
           <p className={`jack-local-result ${lastCommandResult.ok ? "" : "speech-error"}`} aria-live="polite">
             [{lastCommandResult.source}{lastCommandResult.action ? ` · ${lastCommandResult.action}` : ""}]{" "}

@@ -104,6 +104,22 @@ export const jackApi = {
     return postJson("/jack/transcribe", { audioFilePath, language }, 30_000);
   },
 
+  /** Transcribes browser-captured audio (a WAV blob) via whisper.cpp -- no filesystem path ever crosses the browser boundary. */
+  async transcribeAudio(audio: Blob, language?: string): Promise<{ text: string; latencyMs: number }> {
+    const qs = language ? `?language=${encodeURIComponent(language)}` : "";
+    const res = await fetch(`${BASE_URL}/jack/transcribe${qs}`, {
+      method: "POST",
+      headers: { "Content-Type": "audio/wav" },
+      body: audio,
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!res.ok) {
+      const detail = (await res.json().catch(() => null)) as { detail?: string } | null;
+      throw new Error(detail?.detail || `Jack Local AI transcription failed: ${res.status}`);
+    }
+    return res.json();
+  },
+
   /** Fetches Kokoro-synthesized speech audio for the given text. */
   async speak(text: string, voice?: string): Promise<Blob> {
     const res = await fetch(`${BASE_URL}/jack/speak`, {
