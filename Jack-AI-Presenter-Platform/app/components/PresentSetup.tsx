@@ -1,6 +1,5 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import { JackOrb } from "../JackOrb";
 import { useJack } from "../jack/JackProvider";
 import type { AudienceQuestionPolicy, ControlMode } from "../jack/types";
@@ -20,19 +19,16 @@ const QUESTION_POLICIES: { id: AudienceQuestionPolicy; label: string }[] = [
 
 export function PresentSetup({ onReady, title }: { onReady: () => void; title: string }) {
   const jack = useJack();
-  const [starting, setStarting] = useState(false);
 
-  useEffect(() => {
-    if (starting && jack.connectionStatus === "connected") onReady();
-  }, [starting, jack.connectionStatus, onReady]);
-
-  const handleStart = async () => {
-    setStarting(true);
-    await jack.wake();
+  // Manual presentation must always be reachable (Phase 9): the presenter
+  // proceeds immediately. Jack (OpenAI voice, or the local-command panel
+  // inside PresentSession) connects on demand from there, same as
+  // Practice/Ask Jack -- neither of those gates entry on a live connection
+  // either, and Present shouldn't be the one mode that becomes unusable
+  // when OpenAI (or Jack Local AI) is unreachable.
+  const handleStart = () => {
+    onReady();
   };
-
-  const connecting = jack.connectionStatus === "connecting";
-  const failed = jack.connectionStatus === "error" && starting;
 
   return (
     <section className="stage-shell present-setup">
@@ -81,11 +77,11 @@ export function PresentSetup({ onReady, title }: { onReady: () => void; title: s
       {jack.lastError && <p className="speech-error" role="alert">{jack.lastError}</p>}
 
       <div className="setup-actions">
-        <button type="button" className="primary" onClick={handleStart} disabled={connecting}>
-          {connecting ? "Connecting…" : failed ? "Retry" : "Start presentation"}
+        <button type="button" className="primary" onClick={handleStart}>
+          Start presentation
         </button>
         <p className="setup-note">
-          Starting will ask for microphone permission and connect to OpenAI Realtime. Jack won&rsquo;t speak until you explicitly ask.
+          Manual navigation and typed Jack commands work immediately. Connect the mic from the presentation screen for live OpenAI voice, or type commands to use Jack Local AI instead.
         </p>
       </div>
     </section>

@@ -101,4 +101,9 @@ export type JackEvent =
   | { type: "TOOL_END" }
   | { type: "PAUSE" }
   | { type: "RESUME" }
-  | { type: "ERROR"; message: string };
+  | { type: "ERROR"; message: string }
+  // Local (Jack-Local-AI-Service) intent path -- typed/voice text routed
+  // through /jack/intent rather than the OpenAI Realtime audio pipeline.
+  | { type: "LOCAL_COMMAND_START" }
+  | { type: "LOCAL_COMMAND_ACTING" }
+  | { type: "LOCAL_COMMAND_DONE" };

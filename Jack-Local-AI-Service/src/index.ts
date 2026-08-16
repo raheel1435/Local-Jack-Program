@@ -15,6 +15,23 @@ import type { LlmProvider } from "./types/jack.js";
 const app = express();
 app.use(express.json());
 
+// Minimal CORS: this gateway is a machine-local dev service consumed
+// directly by the browser-based Jack-AI-Presenter-Platform frontend, which
+// runs on a different origin (Vite dev server). Reflect the request origin
+// rather than "*" so credentials/cookies remain usable if ever needed, and
+// short-circuit the preflight -- no external CORS package required for this.
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin) res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") {
+    res.sendStatus(204);
+    return;
+  }
+  next();
+});
+
 // Both providers are always constructed and health-checked (see /health),
 // but only one backs /jack/chat and /jack/intent's LLM fallback at a time --
 // selected via JACK_LLM_PROVIDER. Colibri remains available as a fallback/

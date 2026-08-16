@@ -2,24 +2,39 @@
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { OpenAIRealtimeWebRTC, RealtimeAgent, RealtimeSession, type RealtimeItem } from "@openai/agents-realtime";
+import { findRelevantSections } from "../lib/askJackProvider";
+import { jackApi, type JackHealth, type JackIntentAction } from "../lib/jackApi";
 import { summarizeDocuments } from "./documentContext";
 import { buildInstructions } from "./instructions";
 import { nextAttentionState } from "./jackStateMachine";
 import { toOrbPresentation, type OrbPresentation } from "./orbStateMap";
+import { buildPresentationContext, formatContextForPrompt } from "./presentationContext";
 import { unsupportedController, type PresentationController } from "./presentationController";
 import { createPresentationTools } from "./tools";
 import { createWakeWordService } from "./wakeWordService";
 import { useSession } from "../session/SessionContext";
+import type { ParsedDocument } from "../session/types";
 import type {
   AudienceQuestionPolicy,
   ConnectionStatus,
   ControlMode,
+  ControlOwner,
   JackAttentionState,
   JackEvent,
   MicPipelineStatus,
   QueuedQuestion,
   TranscriptEntry,
 } from "./types";
+
+const JACK_LOCAL_HEALTH_POLL_MS = 8000;
+
+export interface LocalCommandOutcome {
+  source: "deterministic" | "llm";
+  action?: string;
+  ok: boolean;
+  /** Human-readable result: the failure reason, or Jack's spoken answer for explain/summarize. */
+  message?: string;
+}
 
 const REALTIME_MODEL = "gpt-realtime-2";
 
@@ -54,6 +69,28 @@ function textFromHistory(history: RealtimeItem[]): TranscriptEntry[] {
   return entries;
 }
 
+function playAudioBlob(blob: Blob, onEnded?: () => void) {
+  const url = URL.createObjectURL(blob);
+  const audio = new Audio(url);
+  const cleanup = () => {
+    URL.revokeObjectURL(url);
+    onEnded?.();
+  };
+  audio.addEventListener("ended", cleanup);
+  audio.addEventListener("error", cleanup);
+  void audio.play().catch(cleanup);
+}
+
+function resolveSlideIndexFromTarget(
+  target: string | undefined,
+  parsedDocs: Record<string, ParsedDocument>,
+  activeFileId: string | null,
+): number | null {
+  if (!target) return null;
+  const matches = findRelevantSections(target, Object.values(parsedDocs), activeFileId, 1);
+  return matches.length > 0 ? matches[0].sectionIndex : null;
+}
+
 export interface JackContextValue {
   attentionState: JackAttentionState;
   orb: OrbPresentation;
@@ -72,6 +109,12 @@ export interface JackContextValue {
   wakeWordMode: "local-wake-word" | "push-to-talk";
   wakeWordAvailable: boolean;
 
+  /** Who currently owns slide navigation. Set by start_presentation (-> jack) and handoff_to_presenter (-> human) via runLocalCommand, or explicitly. */
+  presenterControl: ControlOwner;
+  setPresenterControl(owner: ControlOwner): void;
+  /** Jack-Local-AI-Service reachability -- polled independently of the OpenAI Realtime connection, so manual mode can always report an honest status even when Jack is fully offline. */
+  jackLocalHealth: JackHealth | null;
+
   wake(): Promise<void>;
   sleep(): void;
   mute(): void;
@@ -88,6 +131,15 @@ export interface JackContextValue {
   registerController(modeName: string, controller: PresentationController): void;
   unregisterController(): void;
   endSession(): void;
+
+  /**
+   * Routes typed or transcribed presenter text through the local gateway's
+   * /jack/intent (deterministic router, then llama.cpp fallback) and applies
+   * the result to whichever PresentationController is currently registered.
+   * This is the local-brain equivalent of the OpenAI tool-calling path --
+   * both ultimately drive the same controller, never raw UI state.
+   */
+  runLocalCommand(text: string): Promise<LocalCommandOutcome>;
 }
 
 const JackContext = createContext<JackContextValue | null>(null);
@@ -113,6 +165,8 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const [humourEnabled, setHumourEnabledState] = useState(true);
   const [language, setLanguageState] = useState("English");
   const [questions] = useState<QueuedQuestion[]>([]);
+  const [presenterControl, setPresenterControl] = useState<ControlOwner>("presenter");
+  const [jackLocalHealth, setJackLocalHealth] = useState<JackHealth | null>(null);
 
   const realtimeSessionRef = useRef<RealtimeSession | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -130,6 +184,24 @@ export function JackProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     appSessionRef.current = appSession;
   }, [appSession]);
+
+  // Independent of the OpenAI Realtime connection -- this is what lets the UI
+  // honestly report "Jack Local AI is unavailable" instead of silently
+  // failing the next local command.
+  useEffect(() => {
+    let cancelled = false;
+    const poll = () => {
+      void jackApi.health().then((h) => {
+        if (!cancelled) setJackLocalHealth(h);
+      });
+    };
+    poll();
+    const interval = setInterval(poll, JACK_LOCAL_HEALTH_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
 
   const dispatchEvent = useCallback((event: JackEvent) => {
     setAttentionState((prev) => nextAttentionState(prev, event));
@@ -391,6 +463,97 @@ export function JackProvider({ children }: { children: ReactNode }) {
     dispatchEvent({ type: "DISCONNECTED" });
   }, [teardownMic, dispatchEvent, wakeWordService]);
 
+  const runLocalCommand = useCallback(
+    async (text: string): Promise<LocalCommandOutcome> => {
+      dispatchEvent({ type: "LOCAL_COMMAND_START" });
+      const controller = controllerRef.current.controller;
+      try {
+        const intent = await jackApi.detectIntent(text);
+        dispatchEvent({ type: "LOCAL_COMMAND_ACTING" });
+        const action = intent.action as JackIntentAction | undefined;
+
+        if (action === "explain_slide" || action === "summarize_slide") {
+          const ctx = buildPresentationContext(controller);
+          const instruction =
+            action === "explain_slide"
+              ? "Explain this slide to the audience in 2-3 concise sentences."
+              : "Summarize this slide in one or two sentences.";
+          const prompt = ctx ? `${formatContextForPrompt(ctx)}\n\n${instruction}` : instruction;
+          const chat = await jackApi.chat([{ role: "user", content: prompt }], { maxTokens: 150 });
+          setCurrentCaption(chat.content);
+          dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
+          void jackApi
+            .speak(chat.content)
+            .then((blob) => {
+              dispatchEvent({ type: "AUDIO_START" });
+              playAudioBlob(blob, () => dispatchEvent({ type: "AUDIO_STOPPED" }));
+            })
+            .catch(() => {
+              // Kokoro unavailable -- the text answer above already landed; speech is best-effort.
+            });
+          return { source: intent.source, action, ok: true, message: chat.content };
+        }
+
+        let result: { success: boolean; error?: string } | null = null;
+        switch (action) {
+          case "start_presentation":
+            result = controller.startPresentation();
+            if (result.success) setPresenterControl("jack");
+            break;
+          case "next_slide":
+            result = controller.goToNextSlide();
+            break;
+          case "previous_slide":
+            result = controller.goToPreviousSlide();
+            break;
+          case "jump_to_slide": {
+            const index = resolveSlideIndexFromTarget(
+              intent.target,
+              appSessionRef.current.parsedDocs,
+              appSessionRef.current.activeFileId,
+            );
+            result =
+              index === null
+                ? { success: false, error: `Couldn't find a slide matching "${intent.target ?? ""}".` }
+                : controller.goToSlide(index);
+            break;
+          }
+          case "pause_presentation":
+            result = controller.pausePresentation();
+            break;
+          case "resume_presentation":
+            result = controller.resumePresentation();
+            break;
+          case "handoff_to_presenter":
+            result = controller.handControlToPresenter();
+            if (result.success) setPresenterControl("presenter");
+            break;
+          case "stop_presentation":
+            result = controller.endPresentation();
+            break;
+          default:
+            result = { success: false, error: `Jack didn't recognize "${text}" as a presentation command.` };
+        }
+
+        dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
+        return {
+          source: intent.source,
+          action,
+          ok: result?.success ?? false,
+          message: result?.success ? undefined : result?.error,
+        };
+      } catch (err) {
+        dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
+        return {
+          source: "llm",
+          ok: false,
+          message: err instanceof Error ? err.message : "Local Jack request failed.",
+        };
+      }
+    },
+    [dispatchEvent],
+  );
+
   // Push updated instructions to a live session whenever behavior-affecting settings change.
   useEffect(() => {
     if (realtimeSessionRef.current && connectionStatus === "connected") {
@@ -430,6 +593,9 @@ export function JackProvider({ children }: { children: ReactNode }) {
     questions,
     wakeWordMode: wakeWordService.mode,
     wakeWordAvailable: wakeWordService.available,
+    presenterControl,
+    setPresenterControl,
+    jackLocalHealth,
     wake,
     sleep,
     mute,
@@ -446,6 +612,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     registerController,
     unregisterController,
     endSession,
+    runLocalCommand,
   };
 
   return <JackContext.Provider value={value}>{children}</JackContext.Provider>;

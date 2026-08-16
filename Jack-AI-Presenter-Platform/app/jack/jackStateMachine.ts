@@ -59,6 +59,17 @@ export function nextAttentionState(state: JackAttentionState, event: JackEvent):
     case "RESUME":
       return state === "paused" ? "standby" : state;
 
+    // Mirrors RESPONSE_REQUESTED/TOOL_START/TOOL_END/AUDIO_STOPPED, but for
+    // the local intent path: it can start from any awake, non-busy state
+    // (not just "listening") since it's triggered by typed or one-shot
+    // transcribed text, not a live speech turn.
+    case "LOCAL_COMMAND_START":
+      return state === "sleeping" || state === "disconnected" || state === "error" ? state : "thinking";
+    case "LOCAL_COMMAND_ACTING":
+      return state === "thinking" ? "acting" : state;
+    case "LOCAL_COMMAND_DONE":
+      return state === "thinking" || state === "acting" ? "standby" : state;
+
     default:
       return state;
   }

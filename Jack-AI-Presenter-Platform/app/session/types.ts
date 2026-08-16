@@ -59,6 +59,9 @@ export interface AnalysisProgress {
 
 export type PresentMode = "practice" | "present" | "askJack";
 
+/** "ready" is the PresentSetup screen (before the presenter clicks Start); PresentSession itself only ever holds presenting/paused/completed. */
+export type PresentationStatus = "ready" | "presenting" | "paused" | "completed";
+
 export interface SessionState {
   stage: StageId;
   jackState: JackState;

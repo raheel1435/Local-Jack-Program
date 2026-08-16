@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { JackOrb } from "../JackOrb";
 import { JackStatusBar } from "../components/JackStatusBar";
 import { MicButton } from "../components/MicButton";
@@ -8,12 +8,12 @@ import { PresentSetup } from "../components/PresentSetup";
 import { useAutoHideControls } from "../hooks/useAutoHideControls";
 import { useFullscreen } from "../hooks/useFullscreen";
 import { useSpeech } from "../hooks/useSpeech";
-import { useJack } from "../jack/JackProvider";
+import { useJack, type LocalCommandOutcome } from "../jack/JackProvider";
 import { searchDocuments } from "../jack/documentContext";
 import { fail, ok, type PresentationController } from "../jack/presentationController";
 import { openPdfForRender, type PdfRenderHandle } from "../lib/parsers/pdf";
 import { useSession } from "../session/SessionContext";
-import type { ParsedDocument, SessionAction, UploadedFile } from "../session/types";
+import type { ParsedDocument, PresentationStatus, SessionAction, UploadedFile } from "../session/types";
 
 export function PresentStage() {
   const { session, dispatch } = useSession();
@@ -68,8 +68,12 @@ function PresentSession({
   const [followMode, setFollowMode] = useState<"auto" | "manual">("auto");
   const [jackSectionIndex, setJackSectionIndex] = useState<number | null>(null);
   const [pdfHandle, setPdfHandle] = useState<PdfRenderHandle | null>(null);
-  const [paused, setPaused] = useState(false);
+  const [presentationStatus, setPresentationStatus] = useState<PresentationStatus>("presenting");
+  const paused = presentationStatus === "paused";
   const [offlineVoiceEnabled, setOfflineVoiceEnabled] = useState(false);
+  const [commandInput, setCommandInput] = useState("");
+  const [commandBusy, setCommandBusy] = useState(false);
+  const [lastCommandResult, setLastCommandResult] = useState<LocalCommandOutcome | null>(null);
 
   const offlineSpeech = useSpeech();
   const controlsVisible = useAutoHideControls(3500);
@@ -158,16 +162,20 @@ function PresentSession({
       const s = latest.current;
       return ok({ title: s.doc.title, totalSlides: s.sections.length, currentSlideIndex: s.sectionIndex, mode: "present" });
     },
-    startPresentation: () => ok({ started: true as const }),
+    startPresentation: () => {
+      setPresentationStatus("presenting");
+      return ok({ started: true as const });
+    },
     pausePresentation: () => {
-      setPaused(true);
+      setPresentationStatus("paused");
       return ok({ paused: true as const });
     },
     resumePresentation: () => {
-      setPaused(false);
+      setPresentationStatus("presenting");
       return ok({ resumed: true as const });
     },
     endPresentation: () => {
+      setPresentationStatus("completed");
       latest.current.dispatch({ type: "BACK_TO_MODE_SELECT" });
       return ok({ ended: true as const });
     },
@@ -257,6 +265,25 @@ function PresentSession({
     else if (jack.micStatus === "muted") jack.unmute();
   }
 
+  const localUnavailable =
+    jack.jackLocalHealth !== null &&
+    jack.jackLocalHealth.llamacpp === "unavailable" &&
+    jack.jackLocalHealth.colibri === "unavailable";
+
+  async function submitLocalCommand(e: FormEvent) {
+    e.preventDefault();
+    const text = commandInput.trim();
+    if (!text || commandBusy) return;
+    setCommandBusy(true);
+    setCommandInput("");
+    try {
+      const outcome = await jack.runLocalCommand(text);
+      setLastCommandResult(outcome);
+    } finally {
+      setCommandBusy(false);
+    }
+  }
+
   return (
     <div ref={stageRef} className="present-stage-root">
       <JackStatusBar
@@ -290,10 +317,43 @@ function PresentSession({
       {doc.warnings.length > 0 && <p className="present-warning">{doc.warnings[0]}</p>}
       {paused && <p className="present-warning">Paused · Say &ldquo;Jack, continue&rdquo;</p>}
 
-      {jack.attentionState === "speaking" && jack.currentCaption && (
+      {jack.currentCaption && jack.attentionState !== "sleeping" && jack.attentionState !== "disconnected" && (
         <p className="present-subtitle-line" aria-live="polite">{jack.currentCaption}</p>
       )}
       {jack.lastError && <p className="speech-error present-subtitle-line" role="alert">{jack.lastError}</p>}
+
+      <div className="jack-local-panel">
+        <div className="jack-local-status">
+          <span className={`sync-item ${localUnavailable ? "sync-error" : ""}`}>
+            Jack Local AI: {jack.jackLocalHealth === null ? "checking…" : localUnavailable ? "unavailable" : "connected"}
+          </span>
+          <span className="sync-item">Control: <strong>{jack.presenterControl === "jack" ? "Jack" : "Presenter"}</strong></span>
+        </div>
+        {localUnavailable && (
+          <p className="present-warning">
+            Jack Local AI is unavailable. Manual presentation is still available.
+          </p>
+        )}
+        <form className="jack-local-command-form" onSubmit={submitLocalCommand}>
+          <input
+            type="text"
+            value={commandInput}
+            onChange={(e) => setCommandInput(e.target.value)}
+            placeholder='Type a command, e.g. "Next slide." or "Summarize this slide."'
+            aria-label="Type a command for Jack"
+            disabled={commandBusy}
+          />
+          <button type="submit" disabled={commandBusy || !commandInput.trim()}>
+            {commandBusy ? "…" : "Send"}
+          </button>
+        </form>
+        {lastCommandResult && (
+          <p className={`jack-local-result ${lastCommandResult.ok ? "" : "speech-error"}`} aria-live="polite">
+            [{lastCommandResult.source}{lastCommandResult.action ? ` · ${lastCommandResult.action}` : ""}]{" "}
+            {lastCommandResult.ok ? lastCommandResult.message ?? "Done." : lastCommandResult.message}
+          </p>
+        )}
+      </div>
 
       {isOffline && (
         <div className="offline-voice-toggle">
