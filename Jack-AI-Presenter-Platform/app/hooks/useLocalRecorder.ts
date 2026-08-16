@@ -136,7 +136,13 @@ export function useLocalRecorder(): UseLocalRecorderResult {
     setError(null);
     chunksRef.current = [];
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Best-effort suppression of Jack's own speaker output being picked
+      // back up as "user speech" during barge-in monitoring. Not validated
+      // as true acoustic echo cancellation on real hardware -- browsers
+      // apply this on a best-effort basis and it can vary by device/OS.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
       streamRef.current = stream;
 
       const AudioContextCtor = window.AudioContext ?? (window as unknown as WebkitAudioContextWindow).webkitAudioContext;

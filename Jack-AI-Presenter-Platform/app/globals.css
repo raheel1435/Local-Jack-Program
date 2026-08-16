@@ -124,6 +124,7 @@
 .sync-follow-toggle,.sync-action{margin-left:auto;background:rgba(0,217,245,.08);border:1px solid rgba(0,217,245,.28);border-radius:20px;color:var(--cyan);font-size:10px;padding:6px 12px;cursor:pointer}
 .sync-action{background:rgba(255,184,77,.1);border-color:rgba(255,184,77,.4);color:#ffb84d;margin-left:0}
 .sync-item.sync-error{color:#ff8660}
+.sync-item.sync-autonomous{color:#5cffb0}
 
 /* Jack Local AI command panel (typed intent testing + status) */
 .jack-local-panel{margin:0 24px 8px;padding:10px 14px;background:rgba(6,12,26,.75);border:1px solid var(--line);border-radius:10px;font-size:12px}

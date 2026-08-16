@@ -30,8 +30,14 @@ export interface JackHealth {
   activeLlmProvider: "colibri" | "llamacpp";
 }
 
+export type JackIntentType = "action" | "conversation" | "unknown";
+
 export interface JackIntentResult {
   source: "deterministic" | "llm";
+  /** "action" is the only type for which `action` is meaningful -- the gateway
+   * enforces this server-side, but never trust a truthy `action` without also
+   * checking `type === "action"`. */
+  type: JackIntentType;
   action?: JackIntentAction | string;
   target?: string;
   raw?: string;

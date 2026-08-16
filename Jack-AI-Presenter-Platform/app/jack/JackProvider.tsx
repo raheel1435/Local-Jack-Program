@@ -6,9 +6,11 @@ import { useLocalRecorder, type LocalRecorderState } from "../hooks/useLocalReco
 import { jackApi, type JackHealth, type JackIntentAction } from "../lib/jackApi";
 import { summarizeDocuments } from "./documentContext";
 import { buildInstructions } from "./instructions";
+import { createJackSpeechPlayer } from "./jackSpeechPlayer";
 import { nextAttentionState } from "./jackStateMachine";
+import { answerDeckQuestion, generateSlideNarration } from "./narration";
 import { toOrbPresentation, type OrbPresentation } from "./orbStateMap";
-import { buildPresentationContext, formatContextForPrompt } from "./presentationContext";
+import { buildPresentationContext, formatContextForPrompt, type PresentationContext } from "./presentationContext";
 import { unsupportedController, type PresentationController } from "./presentationController";
 import { resolveSlideTarget } from "./slideTargetResolver";
 import { createPresentationTools } from "./tools";
@@ -28,11 +30,19 @@ import type {
 
 const JACK_LOCAL_HEALTH_POLL_MS = 8000;
 
+// Barge-in tuning: level is a 0..1 RMS-derived value from the existing mic
+// meter code. These are first-pass thresholds (see Phase 9 caveats in the
+// milestone report) -- not validated against real acoustic hardware/echo.
+const BARGE_IN_LEVEL = 0.12;
+const BARGE_IN_SUSTAIN_TICKS = 4; // consecutive over-threshold rAF ticks before it counts as real speech
+const BARGE_IN_SILENCE_MS = 900; // sustained quiet before auto-ending the captured utterance
+const BARGE_IN_MAX_CAPTURE_MS = 8000; // hard cap so a stuck capture can't hang forever
+
 export interface LocalCommandOutcome {
   source: "deterministic" | "llm";
   action?: string;
   ok: boolean;
-  /** Human-readable result: the failure reason, or Jack's spoken answer for explain/summarize. */
+  /** Human-readable result: the failure reason, Jack's spoken answer, or a conversational reply. */
   message?: string;
 }
 
@@ -67,18 +77,6 @@ function textFromHistory(history: RealtimeItem[]): TranscriptEntry[] {
     entries.push({ id: item.itemId, role, text, final: item.status === "completed", timestamp: Date.now() });
   }
   return entries;
-}
-
-function playAudioBlob(blob: Blob, onEnded?: () => void) {
-  const url = URL.createObjectURL(blob);
-  const audio = new Audio(url);
-  const cleanup = () => {
-    URL.revokeObjectURL(url);
-    onEnded?.();
-  };
-  audio.addEventListener("ended", cleanup);
-  audio.addEventListener("error", cleanup);
-  void audio.play().catch(cleanup);
 }
 
 export interface JackContextValue {
@@ -137,6 +135,13 @@ export interface JackContextValue {
   localMicError: string | null;
   startLocalListening(): Promise<void>;
   stopLocalListening(): Promise<{ transcript: string; outcome: LocalCommandOutcome } | null>;
+
+  /** True while Jack's autonomous narrate-then-advance loop is running (presenterControl === "jack" and not paused/interrupted). */
+  isPresentingAutonomously: boolean;
+
+  /** Set only by barge-in (typed/push-to-talk callers already get this as runLocalCommand's/stopLocalListening's return value). */
+  lastBargeInTranscript: string | null;
+  lastLocalCommandOutcome: LocalCommandOutcome | null;
 }
 
 const JackContext = createContext<JackContextValue | null>(null);
@@ -150,12 +155,23 @@ export function useJack(): JackContextValue {
 export function JackProvider({ children }: { children: ReactNode }) {
   const { session: appSession } = useSession();
 
-  const [attentionState, setAttentionState] = useState<JackAttentionState>("disconnected");
+  // "standby", not "disconnected": attentionState represents Jack's own
+  // activity (idle/listening/thinking/speaking), not the OpenAI Realtime
+  // link -- that's the separate `connectionStatus` state below. Starting at
+  // "disconnected" blocked every local-only transition (LOCAL_COMMAND_*,
+  // AUDIO_START, USER_SPEECH_DETECTED all guard against it), which silently
+  // froze the orb and made barge-in impossible to arm for any session that
+  // never calls wake(). The OpenAI flow already converges on "standby" once
+  // connected+awake (CONNECTED -> "sleeping", then wake()'s own WAKE ->
+  // "standby"), so this doesn't change that path's eventual behavior.
+  const [attentionState, setAttentionState] = useState<JackAttentionState>("standby");
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("disconnected");
   const [micStatus, setMicStatus] = useState<MicPipelineStatus>("off");
   const [micLevel, setMicLevel] = useState(0);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [currentCaption, setCurrentCaption] = useState("");
+  const [lastLocalCommandOutcome, setLastLocalCommandOutcome] = useState<LocalCommandOutcome | null>(null);
+  const [lastBargeInTranscript, setLastBargeInTranscript] = useState<string | null>(null);
   const [lastError, setLastError] = useState<string | null>(null);
   const [controlMode, setControlModeState] = useState<ControlMode>("presenterLeads");
   const [audienceQuestionPolicy, setAudienceQuestionPolicyState] = useState<AudienceQuestionPolicy>("askPresenterFirst");
@@ -164,7 +180,40 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const [questions] = useState<QueuedQuestion[]>([]);
   const [presenterControl, setPresenterControl] = useState<ControlOwner>("presenter");
   const [jackLocalHealth, setJackLocalHealth] = useState<JackHealth | null>(null);
+  const [isPresentingAutonomously, setIsPresentingAutonomously] = useState(false);
   const localRecorder = useLocalRecorder();
+  const presenterControlRef = useRef(presenterControl);
+  useEffect(() => {
+    presenterControlRef.current = presenterControl;
+  }, [presenterControl]);
+
+  const [speechPlayer] = useState(() => createJackSpeechPlayer());
+  const narrationGenerationRef = useRef(0);
+  const narrationActiveRef = useRef(false);
+  // "idle": not listening for interruption. "armed": Jack is speaking, watching
+  // mic level for a loud-enough burst to count as a real interruption.
+  // "capturing": interruption detected, audio stopped, recording the presenter's utterance.
+  const bargeInPhaseRef = useRef<"idle" | "armed" | "capturing">("idle");
+  const bargeInLoudTicksRef = useRef(0);
+  const bargeInSilenceStartRef = useRef<number | null>(null);
+  const bargeInCaptureTimeoutRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Kept in sync with localRecorder.level so the interval-based silence
+  // poll below can read the CURRENT level without depending on a React
+  // effect re-running -- level settling at an exactly-constant value (e.g.
+  // true digital silence, 0) never re-fires a useEffect keyed on it, since
+  // React skips updates that don't change by Object.is. An interval sidesteps that.
+  const localMicLevelRef = useRef(0);
+  // Lets finishBargeInCapture (defined before runLocalCommand, since
+  // runLocalCommand itself needs the barge-in machinery) call the latest
+  // runLocalCommand without a circular useCallback dependency.
+  const runLocalCommandRef = useRef<(text: string) => Promise<LocalCommandOutcome>>(
+    async () => ({ source: "deterministic", ok: false, message: "Jack isn't ready yet." }),
+  );
+  // Same forward-reference pattern for pause()/resume() (defined earlier,
+  // for the manual Pause/Resume buttons) to reach the autonomy controls
+  // (defined later, since they depend on the speech player/narration deps).
+  const cancelAutonomousPresentingRef = useRef<() => void>(() => {});
+  const startAutonomousPresentingRef = useRef<() => void>(() => {});
 
   const realtimeSessionRef = useRef<RealtimeSession | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -414,16 +463,19 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const pause = useCallback(() => {
     realtimeSessionRef.current?.interrupt();
     controllerRef.current.controller.pausePresentation();
+    cancelAutonomousPresentingRef.current(); // manual Pause button must also stop Jack's own narration loop
     dispatchEvent({ type: "PAUSE" });
   }, [dispatchEvent]);
 
   const resume = useCallback(() => {
     controllerRef.current.controller.resumePresentation();
+    if (presenterControlRef.current === "jack") startAutonomousPresentingRef.current();
     dispatchEvent({ type: "RESUME" });
   }, [dispatchEvent]);
 
   const interrupt = useCallback(() => {
     realtimeSessionRef.current?.interrupt();
+    cancelAutonomousPresentingRef.current(); // manual Stop must also cancel local narration + pending advance
   }, []);
 
   const sendText = useCallback((text: string) => {
@@ -452,6 +504,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     realtimeSessionRef.current = null;
     teardownMic();
     wakeWordService.stop();
+    cancelAutonomousPresentingRef.current();
     setMicStatus("off");
     setConnectionStatus("disconnected");
     setTranscript([]);
@@ -461,6 +514,219 @@ export function JackProvider({ children }: { children: ReactNode }) {
     dispatchEvent({ type: "DISCONNECTED" });
   }, [teardownMic, dispatchEvent, wakeWordService]);
 
+  // --- Controlled Jack speech (Phase 6) ---------------------------------
+  const stopJackAudio = useCallback(() => {
+    speechPlayer.stop();
+  }, [speechPlayer]);
+
+  /** Fetches Kokoro audio and plays it through the single shared player, with real completion (not a timer) driving AUDIO_START/AUDIO_STOPPED. Failures are swallowed -- the caller's text response already landed. */
+  const speakThroughPlayer = useCallback(
+    async (text: string) => {
+      try {
+        const audio = await jackApi.speak(text);
+        dispatchEvent({ type: "AUDIO_START" });
+        speechPlayer.play(audio, () => dispatchEvent({ type: "AUDIO_STOPPED" }));
+      } catch {
+        // Kokoro unavailable -- text already shown via currentCaption; speech is best-effort.
+      }
+    },
+    [dispatchEvent, speechPlayer],
+  );
+
+  // --- Barge-in capture teardown ------------------------------------------
+  const clearBargeInCaptureTimeout = useCallback(() => {
+    if (bargeInCaptureTimeoutRef.current !== null) {
+      clearInterval(bargeInCaptureTimeoutRef.current);
+      bargeInCaptureTimeoutRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    localMicLevelRef.current = localRecorder.level;
+  }, [localRecorder.level]);
+
+  // --- Autonomous narration loop (Phase 2-5) ------------------------------
+  /** Stops Jack's autonomy safely: audio, pending advance, and any in-flight capture. Does NOT change presenterControl -- callers decide that separately. Safe to call even when nothing is running. */
+  const cancelAutonomousPresenting = useCallback(() => {
+    narrationGenerationRef.current += 1;
+    narrationActiveRef.current = false;
+    setIsPresentingAutonomously(false);
+    stopJackAudio();
+    if (bargeInPhaseRef.current !== "idle") {
+      bargeInPhaseRef.current = "idle";
+      clearBargeInCaptureTimeout();
+      void localRecorder.stop(); // discard whatever was captured -- cancellation, not a command
+    }
+  }, [stopJackAudio, clearBargeInCaptureTimeout, localRecorder]);
+
+  const runNarrationStep = useCallback(
+    async (generation: number) => {
+      const stillCurrent = () => narrationGenerationRef.current === generation && narrationActiveRef.current;
+      if (!stillCurrent()) return;
+
+      const controller = controllerRef.current.controller;
+      const context: PresentationContext | null = buildPresentationContext(controller);
+      if (!context) {
+        cancelAutonomousPresenting();
+        return;
+      }
+
+      dispatchEvent({ type: "LOCAL_COMMAND_START" }); // -> thinking
+      let narrationText: string;
+      try {
+        narrationText = await generateSlideNarration(context);
+      } catch (err) {
+        // Phase 17: LLM failure during autonomy -- stop, don't guess, stay put.
+        cancelAutonomousPresenting();
+        setLastError(err instanceof Error ? err.message : "Jack couldn't prepare narration for this slide.");
+        return;
+      }
+      if (!stillCurrent()) return;
+
+      let audio: Blob;
+      try {
+        audio = await jackApi.speak(narrationText);
+      } catch (err) {
+        // Phase 17: Kokoro failure -- show the text, stop autonomy, hand control back safely.
+        setCurrentCaption(narrationText);
+        cancelAutonomousPresenting();
+        setLastError(err instanceof Error ? err.message : "Jack's voice is unavailable right now.");
+        return;
+      }
+      if (!stillCurrent()) return;
+
+      setCurrentCaption(narrationText);
+      dispatchEvent({ type: "AUDIO_START" });
+      speechPlayer.play(audio, () => {
+        dispatchEvent({ type: "AUDIO_STOPPED" });
+        if (!stillCurrent()) return; // cancelled/interrupted during playback -- do NOT advance
+        const advance = controller.goToNextSlide();
+        if (!advance.success) {
+          // Phase 5: end of deck -- finish cleanly, do not wrap to slide 1.
+          controller.pausePresentation();
+          cancelAutonomousPresenting();
+          return;
+        }
+        void runNarrationStep(generation);
+      });
+    },
+    [cancelAutonomousPresenting, dispatchEvent, speechPlayer],
+  );
+
+  const startAutonomousPresenting = useCallback(() => {
+    narrationGenerationRef.current += 1;
+    const generation = narrationGenerationRef.current;
+    narrationActiveRef.current = true;
+    setIsPresentingAutonomously(true);
+    void runNarrationStep(generation);
+  }, [runNarrationStep]);
+
+  useEffect(() => {
+    cancelAutonomousPresentingRef.current = cancelAutonomousPresenting;
+    startAutonomousPresentingRef.current = startAutonomousPresenting;
+  }, [cancelAutonomousPresenting, startAutonomousPresenting]);
+
+  // --- Barge-in: capture finished (silence/timeout) -> transcribe -> route ---
+  const finishBargeInCapture = useCallback(async () => {
+    bargeInPhaseRef.current = "idle";
+    clearBargeInCaptureTimeout();
+    const audio = await localRecorder.stop();
+    if (!audio) {
+      dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
+      return;
+    }
+    dispatchEvent({ type: "LOCAL_COMMAND_START" });
+    try {
+      const { text } = await jackApi.transcribeAudio(audio);
+      const transcript = text.trim();
+      if (!transcript) {
+        dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
+        return;
+      }
+      // Reuses the exact same intent-routing path as typed/push-to-talk
+      // input -- interruption is just another way text reaches Jack. The
+      // outcome is captured here (unlike typed/mic-button input, nothing
+      // else is listening for this call's return value) so the UI can show
+      // what an interruption actually resulted in.
+      setLastBargeInTranscript(transcript);
+      const outcome = await runLocalCommandRef.current(transcript);
+      setLastLocalCommandOutcome(outcome);
+    } catch (err) {
+      dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
+      setLastError(err instanceof Error ? err.message : "Transcription failed.");
+    }
+  }, [clearBargeInCaptureTimeout, localRecorder, dispatchEvent]);
+
+  const handleBargeInDetected = useCallback(() => {
+    bargeInPhaseRef.current = "capturing";
+    bargeInSilenceStartRef.current = null;
+    narrationGenerationRef.current += 1; // invalidate the in-flight narration step
+    narrationActiveRef.current = false;
+    setIsPresentingAutonomously(false);
+    stopJackAudio(); // cancel, not natural completion -- no auto-advance
+    dispatchEvent({ type: "USER_SPEECH_DETECTED" }); // speaking -> listening (existing transition)
+    clearBargeInCaptureTimeout();
+    const captureStarted = Date.now();
+    let finished = false;
+    // Polling interval, not a level-keyed effect: true silence can hold at
+    // an exactly-constant level (e.g. 0) for the whole capture, which would
+    // never re-fire a useEffect dependency on that value. This runs on its
+    // own clock regardless of whether the level state technically "changes".
+    bargeInCaptureTimeoutRef.current = setInterval(() => {
+      const now = Date.now();
+      const level = localMicLevelRef.current;
+      if (level < BARGE_IN_LEVEL) {
+        if (bargeInSilenceStartRef.current === null) bargeInSilenceStartRef.current = now;
+      } else {
+        bargeInSilenceStartRef.current = null;
+      }
+      const sustainedSilence =
+        bargeInSilenceStartRef.current !== null && now - bargeInSilenceStartRef.current > BARGE_IN_SILENCE_MS;
+      const hardCap = now - captureStarted > BARGE_IN_MAX_CAPTURE_MS;
+      if ((sustainedSilence || hardCap) && !finished) {
+        finished = true;
+        clearBargeInCaptureTimeout();
+        void finishBargeInCapture();
+      }
+    }, 150);
+  }, [stopJackAudio, dispatchEvent, clearBargeInCaptureTimeout, finishBargeInCapture]);
+
+  // Arm/disarm ambient listening as Jack's own autonomous speech starts and
+  // stops. Only while Jack himself holds the floor (presenterControl ===
+  // "jack") -- barge-in during a human-triggered explain/summarize answer is
+  // out of scope for this milestone.
+  useEffect(() => {
+    const shouldArm = attentionState === "speaking" && presenterControl === "jack";
+    if (shouldArm && bargeInPhaseRef.current === "idle") {
+      bargeInPhaseRef.current = "armed";
+      bargeInLoudTicksRef.current = 0;
+      void localRecorder.start();
+    } else if (!shouldArm && bargeInPhaseRef.current === "armed") {
+      // Jack finished/was stopped without a detected interruption -- disarm and discard.
+      bargeInPhaseRef.current = "idle";
+      void localRecorder.stop();
+    }
+    // "capturing" is left alone here; handleBargeInDetected/finishBargeInCapture own that transition.
+  }, [attentionState, presenterControl, localRecorder]);
+
+  // Watches mic level while armed for a sustained loud burst -> real
+  // interruption. (Silence detection during "capturing" is handled by the
+  // interval started in handleBargeInDetected, not here -- see its comment.)
+  // First-pass level-threshold VAD, not perfect acoustic echo cancellation --
+  // see Phase 9 caveats in the milestone report.
+  useEffect(() => {
+    if (bargeInPhaseRef.current !== "armed") return;
+    if (localRecorder.level > BARGE_IN_LEVEL) {
+      bargeInLoudTicksRef.current += 1;
+      if (bargeInLoudTicksRef.current >= BARGE_IN_SUSTAIN_TICKS) {
+        bargeInLoudTicksRef.current = 0;
+        handleBargeInDetected();
+      }
+    } else {
+      bargeInLoudTicksRef.current = 0;
+    }
+  }, [localRecorder.level, handleBargeInDetected]);
+
   const runLocalCommand = useCallback(
     async (text: string): Promise<LocalCommandOutcome> => {
       dispatchEvent({ type: "LOCAL_COMMAND_START" });
@@ -468,9 +734,37 @@ export function JackProvider({ children }: { children: ReactNode }) {
       try {
         const intent = await jackApi.detectIntent(text);
         dispatchEvent({ type: "LOCAL_COMMAND_ACTING" });
+
+        // Phase 1 safety gate: the presentation may ONLY change for
+        // type === "action". Conversation/unknown never reach the switch
+        // below, no matter what the model happened to put in `action`.
+        if (intent.type === "unknown") {
+          dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
+          return { source: intent.source, ok: false, message: "I didn't catch a presentation command there." };
+        }
+
+        if (intent.type === "conversation") {
+          // Any conversational turn pauses autonomy first -- Phase 12: after
+          // an answer, Jack stays paused until an explicit "Continue.".
+          cancelAutonomousPresenting();
+          const ctx = buildPresentationContext(controller);
+          const { parsedDocs, activeFileId } = appSessionRef.current;
+          const { answer } = await answerDeckQuestion(
+            text,
+            ctx ?? { deckTitle: "", currentSlideNumber: 0, totalSlides: 0, currentSlideText: "" },
+            Object.values(parsedDocs),
+            activeFileId,
+          );
+          setCurrentCaption(answer);
+          dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
+          void speakThroughPlayer(answer);
+          return { source: intent.source, ok: true, message: answer };
+        }
+
         const action = intent.action as JackIntentAction | undefined;
 
         if (action === "explain_slide" || action === "summarize_slide") {
+          cancelAutonomousPresenting();
           const ctx = buildPresentationContext(controller);
           const instruction =
             action === "explain_slide"
@@ -480,15 +774,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
           const chat = await jackApi.chat([{ role: "user", content: prompt }], { maxTokens: 150 });
           setCurrentCaption(chat.content);
           dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
-          void jackApi
-            .speak(chat.content)
-            .then((blob) => {
-              dispatchEvent({ type: "AUDIO_START" });
-              playAudioBlob(blob, () => dispatchEvent({ type: "AUDIO_STOPPED" }));
-            })
-            .catch(() => {
-              // Kokoro unavailable -- the text answer above already landed; speech is best-effort.
-            });
+          void speakThroughPlayer(chat.content);
           return { source: intent.source, action, ok: true, message: chat.content };
         }
 
@@ -496,15 +782,21 @@ export function JackProvider({ children }: { children: ReactNode }) {
         switch (action) {
           case "start_presentation":
             result = controller.startPresentation();
-            if (result.success) setPresenterControl("jack");
+            if (result.success) {
+              setPresenterControl("jack");
+              startAutonomousPresenting();
+            }
             break;
           case "next_slide":
+            cancelAutonomousPresenting();
             result = controller.goToNextSlide();
             break;
           case "previous_slide":
+            cancelAutonomousPresenting();
             result = controller.goToPreviousSlide();
             break;
           case "jump_to_slide": {
+            cancelAutonomousPresenting();
             const { parsedDocs, activeFileId } = appSessionRef.current;
             const sections = (activeFileId && parsedDocs[activeFileId]?.sections) || [];
             const resolution = resolveSlideTarget(text, intent.target, sections);
@@ -519,17 +811,25 @@ export function JackProvider({ children }: { children: ReactNode }) {
             break;
           }
           case "pause_presentation":
+            cancelAutonomousPresenting();
             result = controller.pausePresentation();
             break;
           case "resume_presentation":
             result = controller.resumePresentation();
+            if (result.success && presenterControlRef.current === "jack") {
+              // Phase 10: regenerate/restart narration for the CURRENT slide -- never skip ahead.
+              startAutonomousPresenting();
+            }
             break;
           case "handoff_to_presenter":
+            cancelAutonomousPresenting();
             result = controller.handControlToPresenter();
             if (result.success) setPresenterControl("presenter");
             break;
           case "stop_presentation":
+            cancelAutonomousPresenting();
             result = controller.endPresentation();
+            setPresenterControl("presenter");
             break;
           default:
             result = { success: false, error: `Jack didn't recognize "${text}" as a presentation command.` };
@@ -551,8 +851,12 @@ export function JackProvider({ children }: { children: ReactNode }) {
         };
       }
     },
-    [dispatchEvent],
+    [dispatchEvent, cancelAutonomousPresenting, startAutonomousPresenting, speakThroughPlayer],
   );
+
+  useEffect(() => {
+    runLocalCommandRef.current = runLocalCommand;
+  }, [runLocalCommand]);
 
   const startLocalListening = useCallback(async () => {
     setLastError(null);
@@ -649,6 +953,9 @@ export function JackProvider({ children }: { children: ReactNode }) {
     localMicError: localRecorder.error,
     startLocalListening,
     stopLocalListening,
+    isPresentingAutonomously,
+    lastBargeInTranscript,
+    lastLocalCommandOutcome,
   };
 
   return <JackContext.Provider value={value}>{children}</JackContext.Provider>;

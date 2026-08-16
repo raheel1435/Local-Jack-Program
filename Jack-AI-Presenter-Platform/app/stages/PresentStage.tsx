@@ -350,6 +350,7 @@ function PresentSession({
             Jack Local AI: {jack.jackLocalHealth === null ? "checking…" : localUnavailable ? "unavailable" : "connected"}
           </span>
           <span className="sync-item">Control: <strong>{jack.presenterControl === "jack" ? "Jack" : "Presenter"}</strong></span>
+          {jack.isPresentingAutonomously && <span className="sync-item sync-autonomous">● Jack is presenting</span>}
         </div>
         {localUnavailable && (
           <p className="present-warning">
@@ -389,6 +390,15 @@ function PresentSession({
             {lastCommandResult.ok ? lastCommandResult.message ?? "Done." : lastCommandResult.message}
           </p>
         )}
+        {jack.lastBargeInTranscript && (
+          <p className="jack-local-result">Interruption heard: &ldquo;{jack.lastBargeInTranscript}&rdquo;</p>
+        )}
+        {jack.lastLocalCommandOutcome && (
+          <p className={`jack-local-result ${jack.lastLocalCommandOutcome.ok ? "" : "speech-error"}`} aria-live="polite">
+            [interruption · {jack.lastLocalCommandOutcome.source}{jack.lastLocalCommandOutcome.action ? ` · ${jack.lastLocalCommandOutcome.action}` : ""}]{" "}
+            {jack.lastLocalCommandOutcome.ok ? jack.lastLocalCommandOutcome.message ?? "Done." : jack.lastLocalCommandOutcome.message}
+          </p>
+        )}
       </div>
 
       {isOffline && (
@@ -419,7 +429,7 @@ function PresentSession({
         <div className="present-progress"><i style={{ width: `${((sectionIndex + 1) / sections.length) * 100}%` }} /></div>
         <button type="button" onClick={() => goTo(sectionIndex + 1)} disabled={sectionIndex === sections.length - 1} aria-label="Next slide">Next ›</button>
 
-        <button type="button" onClick={paused ? () => controllerRef.current.resumePresentation() : jack.pause} aria-label={paused ? "Resume" : "Pause Jack"}>
+        <button type="button" onClick={paused ? jack.resume : jack.pause} aria-label={paused ? "Resume" : "Pause Jack"}>
           {paused ? "▶ Resume" : "❚❚ Pause"}
         </button>
         <button type="button" onClick={jack.interrupt} disabled={jack.attentionState !== "speaking"} aria-label="Stop Jack speaking">■ Stop</button>

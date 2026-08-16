@@ -1,11 +1,24 @@
 import { Router } from "express";
-import { matchDeterministicCommand } from "../intent/commandRouter.js";
+import { matchDeterministicCommand, type IntentType } from "../intent/commandRouter.js";
 import { ACTION_GRAMMAR, ACTION_SYSTEM_PROMPT } from "../intent/actionGrammar.js";
 import type { JackErrorResponse, LlmProvider } from "../types/jack.js";
 
 interface JackIntentRequest {
   text: string;
 }
+
+const VALID_ACTIONS = new Set([
+  "start_presentation",
+  "next_slide",
+  "previous_slide",
+  "jump_to_slide",
+  "pause_presentation",
+  "resume_presentation",
+  "explain_slide",
+  "summarize_slide",
+  "handoff_to_presenter",
+  "stop_presentation",
+]);
 
 export function intentRouter(llm: LlmProvider): Router {
   const router = Router();
@@ -26,6 +39,7 @@ export function intentRouter(llm: LlmProvider): Router {
     if (deterministic) {
       res.json({
         source: "deterministic",
+        type: deterministic.type,
         action: deterministic.action,
         target: deterministic.target,
         latencyMs: Date.now() - start,
@@ -55,21 +69,38 @@ export function intentRouter(llm: LlmProvider): Router {
         grammar: ACTION_GRAMMAR,
       });
 
+      let type: IntentType = "unknown";
       let action: string | undefined;
       let target: string | undefined;
       try {
         const parsed = JSON.parse(result.content.trim()) as {
+          type?: string;
           action?: string;
           target?: string;
         };
-        action = parsed.action;
-        target = parsed.target;
+        // Safety boundary enforced here, not just by grammar/prompt: an
+        // `action` is only ever honored when the model's own `type` is
+        // "action" AND that action is one of the known ten. Anything else
+        // -- including a model bug that fills `action` on a conversation/
+        // unknown classification -- is discarded server-side before it
+        // ever reaches a client that might act on it.
+        if (parsed.type === "action" && typeof parsed.action === "string" && VALID_ACTIONS.has(parsed.action)) {
+          type = "action";
+          action = parsed.action;
+          target = typeof parsed.target === "string" ? parsed.target : undefined;
+        } else if (parsed.type === "conversation") {
+          type = "conversation";
+        } else {
+          type = "unknown";
+        }
       } catch {
-        // fall through with action left undefined -- caller sees raw content
+        // Unparseable model output -- fail safe as "unknown", never as an action.
+        type = "unknown";
       }
 
       res.json({
         source: "llm",
+        type,
         action,
         target,
         raw: result.content,
