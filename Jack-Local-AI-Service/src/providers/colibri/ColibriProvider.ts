@@ -2,12 +2,13 @@ import { config } from "../../config/services.js";
 import type {
   JackChatRequest,
   JackChatResponse,
+  LlmProvider,
   ProviderStatus,
 } from "../../types/jack.js";
 
 const HEALTH_TIMEOUT_MS = 2000;
 
-export class ColibriProvider {
+export class ColibriProvider implements LlmProvider {
   private readonly baseUrl: string;
 
   constructor(baseUrl: string = config.colibriBaseUrl) {

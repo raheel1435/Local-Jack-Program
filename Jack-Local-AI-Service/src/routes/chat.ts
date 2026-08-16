@@ -1,8 +1,11 @@
 import { Router } from "express";
-import { ColibriProvider } from "../providers/colibri/ColibriProvider.js";
-import type { JackChatRequest, JackErrorResponse } from "../types/jack.js";
+import type {
+  JackChatRequest,
+  JackErrorResponse,
+  LlmProvider,
+} from "../types/jack.js";
 
-export function chatRouter(colibri: ColibriProvider): Router {
+export function chatRouter(llm: LlmProvider): Router {
   const router = Router();
 
   router.post("/jack/chat", async (req, res) => {
@@ -16,23 +19,23 @@ export function chatRouter(colibri: ColibriProvider): Router {
       return;
     }
 
-    const status = await colibri.checkHealth();
+    const status = await llm.checkHealth();
     if (status === "unavailable") {
       const err: JackErrorResponse = {
-        error: "colibri_unavailable",
+        error: "llm_unavailable",
         detail:
-          "Colibri's OpenAI-compatible server is not reachable. Start it with `coli serve --model <model-path>`.",
+          "The configured local LLM provider is not reachable. Start Colibri (`coli serve --model <model-path>`) or llama-server, matching JACK_LLM_PROVIDER.",
       };
       res.status(503).json(err);
       return;
     }
 
     try {
-      const result = await colibri.chat(body as JackChatRequest);
+      const result = await llm.chat(body as JackChatRequest);
       res.json(result);
     } catch (e) {
       const err: JackErrorResponse = {
-        error: "colibri_request_failed",
+        error: "llm_request_failed",
         detail: e instanceof Error ? e.message : String(e),
       };
       res.status(502).json(err);
