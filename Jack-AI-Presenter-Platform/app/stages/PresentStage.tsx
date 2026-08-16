@@ -351,6 +351,11 @@ function PresentSession({
           </span>
           <span className="sync-item">Control: <strong>{jack.presenterControl === "jack" ? "Jack" : "Presenter"}</strong></span>
           {jack.isPresentingAutonomously && <span className="sync-item sync-autonomous">● Jack is presenting</span>}
+          {jack.presenterControl === "jack" && jack.bargeInPhase !== "idle" && (
+            <span className="sync-item sync-bargein" title="Barge-in listening state -- for real-hardware interruption testing">
+              mic: {jack.bargeInPhase} ({jack.localMicLevel.toFixed(2)})
+            </span>
+          )}
         </div>
         {localUnavailable && (
           <p className="present-warning">

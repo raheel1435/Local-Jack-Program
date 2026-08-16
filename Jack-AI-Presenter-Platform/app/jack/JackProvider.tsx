@@ -31,12 +31,31 @@ import type {
 const JACK_LOCAL_HEALTH_POLL_MS = 8000;
 
 // Barge-in tuning: level is a 0..1 RMS-derived value from the existing mic
-// meter code. These are first-pass thresholds (see Phase 9 caveats in the
-// milestone report) -- not validated against real acoustic hardware/echo.
+// meter code. These are first-pass thresholds (see the "Real-Hardware
+// Limitation" section of the milestone report) -- algorithmic hardening
+// against OBVIOUS self-triggering (the loudest, most predictable false-
+// positive source: Jack's own TTS output starting up), not a substitute for
+// real acoustic verification with real speaker/mic hardware.
 const BARGE_IN_LEVEL = 0.12;
 const BARGE_IN_SUSTAIN_TICKS = 4; // consecutive over-threshold rAF ticks before it counts as real speech
 const BARGE_IN_SILENCE_MS = 900; // sustained quiet before auto-ending the captured utterance
 const BARGE_IN_MAX_CAPTURE_MS = 8000; // hard cap so a stuck capture can't hang forever
+// Jack's TTS output has the loudest, least-adapted transient in the first
+// instant of playback (volume ramp-up, echo-cancellation filter not yet
+// converged) -- arming the mic for interruption detection immediately at
+// AUDIO_START made that transient itself the single likeliest false trigger.
+// This guard simply doesn't START WATCHING for a burst until Jack has been
+// speaking for a moment; it does not silence or gate the mic itself.
+const BARGE_IN_ARM_GUARD_MS = 350;
+// After the guard, sample the mic level for a short window while Jack is
+// already speaking to estimate a per-utterance noise floor (room noise +
+// whatever of Jack's own voice leaks through despite echoCancellation). The
+// trigger threshold is raised above this floor by a margin, so a merely
+// elevated baseline (echo cancellation working imperfectly, a noisy room)
+// needs a real spike on top of it to count as an interruption, rather than
+// arming exactly at the fixed BARGE_IN_LEVEL regardless of conditions.
+const BARGE_IN_CALIBRATION_MS = 250;
+const BARGE_IN_FLOOR_MARGIN = 0.06;
 
 export interface LocalCommandOutcome {
   source: "deterministic" | "llm";
@@ -142,6 +161,9 @@ export interface JackContextValue {
   /** Set only by barge-in (typed/push-to-talk callers already get this as runLocalCommand's/stopLocalListening's return value). */
   lastBargeInTranscript: string | null;
   lastLocalCommandOutcome: LocalCommandOutcome | null;
+
+  /** Barge-in ambient-listening phase -- for a subtle dev/status indicator only (Phase 13), not part of the main presentation UI. */
+  bargeInPhase: "idle" | "guarding" | "calibrating" | "armed" | "capturing";
 }
 
 const JackContext = createContext<JackContextValue | null>(null);
@@ -190,13 +212,30 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const [speechPlayer] = useState(() => createJackSpeechPlayer());
   const narrationGenerationRef = useRef(0);
   const narrationActiveRef = useRef(false);
-  // "idle": not listening for interruption. "armed": Jack is speaking, watching
-  // mic level for a loud-enough burst to count as a real interruption.
-  // "capturing": interruption detected, audio stopped, recording the presenter's utterance.
-  const bargeInPhaseRef = useRef<"idle" | "armed" | "capturing">("idle");
+  // "idle": not listening. "guarding": mic recording started but Jack just
+  // began speaking -- too early to trust levels (playback-start transient).
+  // "calibrating": sampling ambient level to set an effective threshold for
+  // this utterance. "armed": watching for a sustained burst above that
+  // threshold. "capturing": interruption detected, recording the utterance.
+  type BargeInPhase = "idle" | "guarding" | "calibrating" | "armed" | "capturing";
+  const bargeInPhaseRef = useRef<BargeInPhase>("idle");
+  // Reactive mirror of bargeInPhaseRef, for the dev status indicator only --
+  // all logic reads/writes the ref (see the capture-silence-poll comment for
+  // why refs+timers, not state+effects, drive the actual barge-in machinery).
+  const [bargeInPhase, setBargeInPhase] = useState<BargeInPhase>("idle");
+  const setBargeInPhaseBoth = useCallback((phase: BargeInPhase) => {
+    bargeInPhaseRef.current = phase;
+    setBargeInPhase(phase);
+  }, []);
   const bargeInLoudTicksRef = useRef(0);
   const bargeInSilenceStartRef = useRef<number | null>(null);
   const bargeInCaptureTimeoutRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const bargeInArmGuardTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const bargeInCalibrationIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const bargeInCalibrationSamplesRef = useRef<number[]>([]);
+  // Effective trigger threshold for the CURRENT utterance -- BARGE_IN_LEVEL
+  // floor, raised if the calibrated ambient level is already elevated.
+  const bargeInEffectiveThresholdRef = useRef(BARGE_IN_LEVEL);
   // Kept in sync with localRecorder.level so the interval-based silence
   // poll below can read the CURRENT level without depending on a React
   // effect re-running -- level settling at an exactly-constant value (e.g.
@@ -541,6 +580,17 @@ export function JackProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const clearBargeInArmTimers = useCallback(() => {
+    if (bargeInArmGuardTimeoutRef.current !== null) {
+      clearTimeout(bargeInArmGuardTimeoutRef.current);
+      bargeInArmGuardTimeoutRef.current = null;
+    }
+    if (bargeInCalibrationIntervalRef.current !== null) {
+      clearInterval(bargeInCalibrationIntervalRef.current);
+      bargeInCalibrationIntervalRef.current = null;
+    }
+  }, []);
+
   useEffect(() => {
     localMicLevelRef.current = localRecorder.level;
   }, [localRecorder.level]);
@@ -553,11 +603,12 @@ export function JackProvider({ children }: { children: ReactNode }) {
     setIsPresentingAutonomously(false);
     stopJackAudio();
     if (bargeInPhaseRef.current !== "idle") {
-      bargeInPhaseRef.current = "idle";
+      setBargeInPhaseBoth("idle");
+      clearBargeInArmTimers();
       clearBargeInCaptureTimeout();
       void localRecorder.stop(); // discard whatever was captured -- cancellation, not a command
     }
-  }, [stopJackAudio, clearBargeInCaptureTimeout, localRecorder]);
+  }, [stopJackAudio, clearBargeInArmTimers, clearBargeInCaptureTimeout, localRecorder, setBargeInPhaseBoth]);
 
   const runNarrationStep = useCallback(
     async (generation: number) => {
@@ -628,7 +679,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
 
   // --- Barge-in: capture finished (silence/timeout) -> transcribe -> route ---
   const finishBargeInCapture = useCallback(async () => {
-    bargeInPhaseRef.current = "idle";
+    setBargeInPhaseBoth("idle");
     clearBargeInCaptureTimeout();
     const audio = await localRecorder.stop();
     if (!audio) {
@@ -655,16 +706,17 @@ export function JackProvider({ children }: { children: ReactNode }) {
       dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
       setLastError(err instanceof Error ? err.message : "Transcription failed.");
     }
-  }, [clearBargeInCaptureTimeout, localRecorder, dispatchEvent]);
+  }, [clearBargeInCaptureTimeout, localRecorder, dispatchEvent, setBargeInPhaseBoth]);
 
   const handleBargeInDetected = useCallback(() => {
-    bargeInPhaseRef.current = "capturing";
+    setBargeInPhaseBoth("capturing");
     bargeInSilenceStartRef.current = null;
     narrationGenerationRef.current += 1; // invalidate the in-flight narration step
     narrationActiveRef.current = false;
     setIsPresentingAutonomously(false);
     stopJackAudio(); // cancel, not natural completion -- no auto-advance
     dispatchEvent({ type: "USER_SPEECH_DETECTED" }); // speaking -> listening (existing transition)
+    clearBargeInArmTimers();
     clearBargeInCaptureTimeout();
     const captureStarted = Date.now();
     let finished = false;
@@ -689,34 +741,63 @@ export function JackProvider({ children }: { children: ReactNode }) {
         void finishBargeInCapture();
       }
     }, 150);
-  }, [stopJackAudio, dispatchEvent, clearBargeInCaptureTimeout, finishBargeInCapture]);
+  }, [stopJackAudio, dispatchEvent, clearBargeInArmTimers, clearBargeInCaptureTimeout, finishBargeInCapture]);
 
   // Arm/disarm ambient listening as Jack's own autonomous speech starts and
   // stops. Only while Jack himself holds the floor (presenterControl ===
   // "jack") -- barge-in during a human-triggered explain/summarize answer is
   // out of scope for this milestone.
+  //
+  // Sequence once Jack starts speaking: start the recorder immediately (so
+  // there's no audio gap), but hold off actually watching for a burst for
+  // BARGE_IN_ARM_GUARD_MS (skips the playback-start transient), then spend
+  // BARGE_IN_CALIBRATION_MS sampling the level to set an effective threshold
+  // for this utterance, THEN arm. All timers are on their own clock (not a
+  // level-keyed effect) for the same reason the capture-silence poll is --
+  // see its comment.
   useEffect(() => {
     const shouldArm = attentionState === "speaking" && presenterControl === "jack";
     if (shouldArm && bargeInPhaseRef.current === "idle") {
-      bargeInPhaseRef.current = "armed";
+      setBargeInPhaseBoth("guarding");
       bargeInLoudTicksRef.current = 0;
       void localRecorder.start();
-    } else if (!shouldArm && bargeInPhaseRef.current === "armed") {
-      // Jack finished/was stopped without a detected interruption -- disarm and discard.
-      bargeInPhaseRef.current = "idle";
+      bargeInArmGuardTimeoutRef.current = setTimeout(() => {
+        if (bargeInPhaseRef.current !== "guarding") return; // disarmed/interrupted during the guard window
+        setBargeInPhaseBoth("calibrating");
+        bargeInCalibrationSamplesRef.current = [];
+        bargeInCalibrationIntervalRef.current = setInterval(() => {
+          bargeInCalibrationSamplesRef.current.push(localMicLevelRef.current);
+        }, 50);
+        bargeInArmGuardTimeoutRef.current = setTimeout(() => {
+          if (bargeInPhaseRef.current !== "calibrating") return;
+          clearBargeInArmTimers();
+          const samples = bargeInCalibrationSamplesRef.current;
+          const floor = samples.length > 0 ? samples.reduce((a, b) => a + b, 0) / samples.length : 0;
+          bargeInEffectiveThresholdRef.current = Math.max(BARGE_IN_LEVEL, floor + BARGE_IN_FLOOR_MARGIN);
+          bargeInLoudTicksRef.current = 0;
+          setBargeInPhaseBoth("armed");
+        }, BARGE_IN_CALIBRATION_MS);
+      }, BARGE_IN_ARM_GUARD_MS);
+    } else if (!shouldArm && bargeInPhaseRef.current !== "idle" && bargeInPhaseRef.current !== "capturing") {
+      // Jack finished/was stopped before completing calibration or without a
+      // detected interruption -- disarm and discard.
+      setBargeInPhaseBoth("idle");
+      clearBargeInArmTimers();
       void localRecorder.stop();
     }
     // "capturing" is left alone here; handleBargeInDetected/finishBargeInCapture own that transition.
-  }, [attentionState, presenterControl, localRecorder]);
+  }, [attentionState, presenterControl, localRecorder, clearBargeInArmTimers, setBargeInPhaseBoth]);
 
   // Watches mic level while armed for a sustained loud burst -> real
-  // interruption. (Silence detection during "capturing" is handled by the
-  // interval started in handleBargeInDetected, not here -- see its comment.)
-  // First-pass level-threshold VAD, not perfect acoustic echo cancellation --
-  // see Phase 9 caveats in the milestone report.
+  // interruption, against this utterance's calibrated effective threshold
+  // (see the arm/disarm effect above), not the bare BARGE_IN_LEVEL constant.
+  // (Silence detection during "capturing" is handled by the interval started
+  // in handleBargeInDetected, not here -- see its comment.) First-pass
+  // level-threshold VAD, not perfect acoustic echo cancellation -- see the
+  // "Real-Hardware Limitation" section of the milestone report.
   useEffect(() => {
     if (bargeInPhaseRef.current !== "armed") return;
-    if (localRecorder.level > BARGE_IN_LEVEL) {
+    if (localRecorder.level > bargeInEffectiveThresholdRef.current) {
       bargeInLoudTicksRef.current += 1;
       if (bargeInLoudTicksRef.current >= BARGE_IN_SUSTAIN_TICKS) {
         bargeInLoudTicksRef.current = 0;
@@ -956,6 +1037,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     isPresentingAutonomously,
     lastBargeInTranscript,
     lastLocalCommandOutcome,
+    bargeInPhase,
   };
 
   return <JackContext.Provider value={value}>{children}</JackContext.Provider>;
