@@ -137,4 +137,26 @@ export const jackApi = {
     if (!res.ok) throw new Error(`Jack Local AI speech request failed: ${res.status}`);
     return res.blob();
   },
+
+  /**
+   * Converts a .pptx file to a faithful PDF via local PowerPoint COM
+   * automation (real layout/fonts/images), for the PresentStage visual
+   * renderer -- entirely separate from the semantic PPTX parser Jack's
+   * context comes from. Throws with a clear reason on failure (no
+   * PowerPoint installed, conversion error, timeout); callers must fall
+   * back to the simplified reading view rather than retry indefinitely.
+   */
+  async convertPptxToPdf(file: File): Promise<Blob> {
+    const res = await fetch(`${BASE_URL}/jack/convert-pptx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/vnd.openxmlformats-officedocument.presentationml.presentation" },
+      body: file,
+      signal: AbortSignal.timeout(75_000),
+    });
+    if (!res.ok) {
+      const detail = (await res.json().catch(() => null)) as { detail?: string } | null;
+      throw new Error(detail?.detail || `PPTX conversion failed: ${res.status}`);
+    }
+    return res.blob();
+  },
 };

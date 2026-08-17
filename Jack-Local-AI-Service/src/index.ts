@@ -10,6 +10,7 @@ import { chatRouter } from "./routes/chat.js";
 import { intentRouter } from "./routes/intent.js";
 import { speechRouter } from "./routes/speech.js";
 import { transcriptionRouter } from "./routes/transcription.js";
+import { pptxConvertRouter } from "./routes/pptxConvert.js";
 import type { LlmProvider } from "./types/jack.js";
 
 const app = express();
@@ -18,6 +19,14 @@ app.use(express.json());
 // capture). Only activates for audio/* content types; JSON requests to the
 // same route (the pre-existing audioFilePath contract) are unaffected.
 app.use(express.raw({ type: ["audio/wav", "audio/wave", "audio/x-wav"], limit: "25mb" }));
+// Raw binary .pptx uploads for POST /jack/convert-pptx (PowerPoint COM
+// visual-fidelity conversion).
+app.use(
+  express.raw({
+    type: ["application/vnd.openxmlformats-officedocument.presentationml.presentation"],
+    limit: "100mb",
+  }),
+);
 
 // Minimal CORS: this gateway is a machine-local dev service consumed
 // directly by the browser-based Jack-AI-Presenter-Platform frontend, which
@@ -52,6 +61,7 @@ app.use(chatRouter(activeLlm));
 app.use(intentRouter(activeLlm));
 app.use(speechRouter(kokoro));
 app.use(transcriptionRouter(whisper));
+app.use(pptxConvertRouter());
 
 app.listen(config.port, () => {
   console.log(

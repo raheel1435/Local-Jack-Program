@@ -98,8 +98,13 @@ export interface PdfRenderHandle {
   destroy(): Promise<void>;
 }
 
-/** Opens a fresh pdfjs document for rendering pages to canvas in PresentStage. Caller must call `.destroy()` on unmount. */
-export async function openPdfForRender(file: File): Promise<PdfRenderHandle> {
+/**
+ * Opens a fresh pdfjs document for rendering pages to canvas in PresentStage.
+ * Caller must call `.destroy()` on unmount. Accepts any Blob, not just a
+ * File -- a PPTX-origin PDF converted server-side (see jackApi.convertPptxToPdf)
+ * renders through this exact same path as a native PDF upload.
+ */
+export async function openPdfForRender(file: Blob): Promise<PdfRenderHandle> {
   const pdfjsLib = await loadPdfjs();
   const data = await file.arrayBuffer();
   const loadingTask = pdfjsLib.getDocument({ data });

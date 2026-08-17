@@ -121,9 +121,12 @@ export async function parsePptx(file: File): Promise<ParsedDocument> {
     });
   }
 
-  warnings.push(
-    "Original PowerPoint formatting, images, and layout are not fully preserved — slide text and speaker notes are shown in a simplified reading view.",
-  );
+  // No unconditional fallback warning here anymore -- this parser only ever
+  // produces the semantic (Jack-context) reading, never the audience-facing
+  // visual. PresentStage attempts a real PowerPoint-COM PPTX -> PDF
+  // conversion for the visual and only shows a "simplified reading view"
+  // warning if that conversion is actually unavailable or fails, so the
+  // warning is never shown once real visual fidelity is working.
 
   return {
     fileId: "",
