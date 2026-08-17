@@ -3,6 +3,7 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { OpenAIRealtimeWebRTC, RealtimeAgent, RealtimeSession, type RealtimeItem } from "@openai/agents-realtime";
 import { useLocalRecorder, type LocalRecorderState } from "../hooks/useLocalRecorder";
+import { useSpeech, type UseSpeechResult } from "../hooks/useSpeech";
 import { jackApi, type JackHealth, type JackIntentAction } from "../lib/jackApi";
 import { summarizeDocuments } from "./documentContext";
 import { buildInstructions } from "./instructions";
@@ -15,6 +16,7 @@ import { unsupportedController, type PresentationController } from "./presentati
 import { resolveSlideTarget } from "./slideTargetResolver";
 import { createPresentationTools } from "./tools";
 import { createWakeWordService } from "./wakeWordService";
+import { DEFAULT_VOICE_ID } from "./voiceSettings";
 import { useSession } from "../session/SessionContext";
 import type {
   AudienceQuestionPolicy,
@@ -71,6 +73,55 @@ interface WebkitAudioContextWindow {
   webkitAudioContext?: typeof AudioContext;
 }
 
+/**
+ * Session-persisted presentation preferences (Phase 21 of the persona/voice
+ * milestone): language, voice, captions, and browser-voice-fallback opt-in.
+ * localStorage only, no backend/account persistence -- deliberately out of
+ * scope for this milestone.
+ */
+const PRESENT_SETTINGS_STORAGE_KEY = "jack:presentSettings";
+
+interface PersistedPresentSettings {
+  language: string;
+  voice: string;
+  captionsEnabled: boolean;
+  browserFallbackEnabled: boolean;
+}
+
+const DEFAULT_PRESENT_SETTINGS: PersistedPresentSettings = {
+  language: "English",
+  voice: DEFAULT_VOICE_ID,
+  captionsEnabled: false,
+  browserFallbackEnabled: false,
+};
+
+function loadPresentSettings(): PersistedPresentSettings {
+  if (typeof window === "undefined") return DEFAULT_PRESENT_SETTINGS;
+  try {
+    const raw = window.localStorage.getItem(PRESENT_SETTINGS_STORAGE_KEY);
+    if (!raw) return DEFAULT_PRESENT_SETTINGS;
+    const parsed = JSON.parse(raw) as Partial<PersistedPresentSettings>;
+    return {
+      language: typeof parsed.language === "string" ? parsed.language : DEFAULT_PRESENT_SETTINGS.language,
+      voice: typeof parsed.voice === "string" ? parsed.voice : DEFAULT_PRESENT_SETTINGS.voice,
+      captionsEnabled: typeof parsed.captionsEnabled === "boolean" ? parsed.captionsEnabled : DEFAULT_PRESENT_SETTINGS.captionsEnabled,
+      browserFallbackEnabled:
+        typeof parsed.browserFallbackEnabled === "boolean" ? parsed.browserFallbackEnabled : DEFAULT_PRESENT_SETTINGS.browserFallbackEnabled,
+    };
+  } catch {
+    return DEFAULT_PRESENT_SETTINGS;
+  }
+}
+
+function savePresentSettings(settings: PersistedPresentSettings) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(PRESENT_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  } catch {
+    // Storage unavailable (private browsing, quota) -- settings just won't survive reload.
+  }
+}
+
 function transportEventType(event: unknown): string | undefined {
   if (event && typeof event === "object" && "type" in event) {
     const value = (event as { type: unknown }).type;
@@ -112,6 +163,22 @@ export interface JackContextValue {
   audienceQuestionPolicy: AudienceQuestionPolicy;
   humourEnabled: boolean;
   language: string;
+  /** Kokoro voice id (Phase 8) -- the single source of truth for every Jack-voiced utterance. */
+  voice: string;
+  /** Default OFF (Phase 3/26): narration/Q&A/acknowledgement text is heard, not shown, unless explicitly enabled. */
+  captionsEnabled: boolean;
+  /** Default OFF (Phase 10): browser speechSynthesis may only ever be used when explicitly enabled AND Kokoro is unreachable -- never a silent substitute for Jack's real voice. */
+  browserFallbackEnabled: boolean;
+  setVoice(voice: string): void;
+  setCaptionsEnabled(enabled: boolean): void;
+  setBrowserFallbackEnabled(enabled: boolean): void;
+  /**
+   * The ONE authoritative "Read this slide" path (Phase 9/11/17): Kokoro with
+   * the selected voice, falling back to the browser's speechSynthesis only if
+   * browserFallbackEnabled is on AND the Kokoro request itself fails. Reads
+   * once and stops -- no auto-advance, no persona change.
+   */
+  readCurrentSlide(text: string): Promise<void>;
   questions: QueuedQuestion[];
   wakeWordMode: "local-wake-word" | "push-to-talk";
   wakeWordAvailable: boolean;
@@ -222,12 +289,55 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const [controlMode, setControlModeState] = useState<ControlMode>("presenterLeads");
   const [audienceQuestionPolicy, setAudienceQuestionPolicyState] = useState<AudienceQuestionPolicy>("askPresenterFirst");
   const [humourEnabled, setHumourEnabledState] = useState(true);
-  const [language, setLanguageState] = useState("English");
+  // Each lazy initializer runs loadPresentSettings() once, only on mount --
+  // cheap (a tiny localStorage JSON.parse), and avoids the ref-during-render
+  // pattern React's rules disallow.
+  const [language, setLanguageState] = useState(() => loadPresentSettings().language);
+  const [voice, setVoiceState] = useState(() => loadPresentSettings().voice);
+  const [captionsEnabled, setCaptionsEnabledState] = useState(() => loadPresentSettings().captionsEnabled);
+  const [browserFallbackEnabled, setBrowserFallbackEnabledState] = useState(() => loadPresentSettings().browserFallbackEnabled);
+  const persistPresentSettings = useCallback((partial: Partial<PersistedPresentSettings>) => {
+    const next = { ...loadPresentSettings(), ...partial };
+    savePresentSettings(next);
+  }, []);
+  const setLanguage = useCallback(
+    (next: string) => {
+      setLanguageState(next);
+      persistPresentSettings({ language: next });
+    },
+    [persistPresentSettings],
+  );
+  const setVoice = useCallback(
+    (next: string) => {
+      setVoiceState(next);
+      persistPresentSettings({ voice: next });
+    },
+    [persistPresentSettings],
+  );
+  const setCaptionsEnabled = useCallback(
+    (next: boolean) => {
+      setCaptionsEnabledState(next);
+      persistPresentSettings({ captionsEnabled: next });
+    },
+    [persistPresentSettings],
+  );
+  const setBrowserFallbackEnabled = useCallback(
+    (next: boolean) => {
+      setBrowserFallbackEnabledState(next);
+      persistPresentSettings({ browserFallbackEnabled: next });
+    },
+    [persistPresentSettings],
+  );
   const [questions] = useState<QueuedQuestion[]>([]);
   const [presenterControl, setPresenterControl] = useState<ControlOwner>("presenter");
   const [jackLocalHealth, setJackLocalHealth] = useState<JackHealth | null>(null);
   const [isPresentingAutonomously, setIsPresentingAutonomously] = useState(false);
   const localRecorder = useLocalRecorder();
+  const offlineSpeech: UseSpeechResult = useSpeech();
+  // Destructured (not accessed as offlineSpeech.foo inline) so useCallback
+  // deps below can name exactly what they use, per this codebase's stricter
+  // react-hooks lint rules.
+  const { speak: speakOffline, supported: offlineSpeechSupported } = offlineSpeech;
   const presenterControlRef = useRef(presenterControl);
   useEffect(() => {
     presenterControlRef.current = presenterControl;
@@ -283,6 +393,10 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // (defined later, since they depend on the speech player/narration deps).
   const cancelAutonomousPresentingRef = useRef<() => void>(() => {});
   const startAutonomousPresentingRef = useRef<() => void>(() => {});
+  // Same forward-reference pattern, for pause()/interrupt()'s short spoken
+  // acknowledgement (Phase 14) -- speakThroughPlayer is defined later since
+  // it depends on speechPlayer/voice.
+  const speakThroughPlayerRef = useRef<(text: string) => Promise<void>>(async () => {});
 
   const realtimeSessionRef = useRef<RealtimeSession | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -532,8 +646,9 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const pause = useCallback(() => {
     realtimeSessionRef.current?.interrupt();
     controllerRef.current.controller.pausePresentation();
-    cancelAutonomousPresentingRef.current(); // manual Pause button must also stop Jack's own narration loop
+    cancelAutonomousPresentingRef.current(); // manual Pause button must also stop Jack's own narration loop -- audio is already cancelled before the line below fires
     dispatchEvent({ type: "PAUSE" });
+    void speakThroughPlayerRef.current("Of course. I'll pause here.");
   }, [dispatchEvent]);
 
   const resume = useCallback(() => {
@@ -544,7 +659,8 @@ export function JackProvider({ children }: { children: ReactNode }) {
 
   const interrupt = useCallback(() => {
     realtimeSessionRef.current?.interrupt();
-    cancelAutonomousPresentingRef.current(); // manual Stop must also cancel local narration + pending advance
+    cancelAutonomousPresentingRef.current(); // manual Stop must also cancel local narration + pending advance -- audio is already cancelled before the acknowledgement below fires
+    void speakThroughPlayerRef.current("Sure. I'll stop here.");
   }, []);
 
   const sendText = useCallback((text: string) => {
@@ -588,18 +704,65 @@ export function JackProvider({ children }: { children: ReactNode }) {
     speechPlayer.stop();
   }, [speechPlayer]);
 
-  /** Fetches Kokoro audio and plays it through the single shared player, with real completion (not a timer) driving AUDIO_START/AUDIO_STOPPED. Failures are swallowed -- the caller's text response already landed. */
+  /**
+   * The ONE authoritative path for every Kokoro-voiced Jack utterance --
+   * narration, Q&A, explain/summarize, and acknowledgements all funnel
+   * through this (Phase 9). Always uses the currently selected voice.
+   * Sets currentCaption to exactly what's being spoken, so the optional
+   * captions toggle (default off, Phase 3) never drifts from actual audio.
+   * Fetches Kokoro audio and plays it through the single shared player, with
+   * real completion (not a timer) driving AUDIO_START/AUDIO_STOPPED.
+   * Failures are swallowed -- the caller's text response already landed via
+   * currentCaption, and this is not the "Read this slide" path (which needs
+   * to distinguish failure for its own explicit fallback -- see
+   * readCurrentSlide below).
+   */
   const speakThroughPlayer = useCallback(
     async (text: string) => {
+      setCurrentCaption(text);
       try {
-        const audio = await jackApi.speak(text);
+        const audio = await jackApi.speak(text, voice);
         dispatchEvent({ type: "AUDIO_START" });
         speechPlayer.play(audio, () => dispatchEvent({ type: "AUDIO_STOPPED" }));
       } catch {
         // Kokoro unavailable -- text already shown via currentCaption; speech is best-effort.
       }
     },
-    [dispatchEvent, speechPlayer],
+    [dispatchEvent, speechPlayer, voice],
+  );
+
+  useEffect(() => {
+    speakThroughPlayerRef.current = speakThroughPlayer;
+  }, [speakThroughPlayer]);
+
+  /**
+   * The ONE authoritative "Read this slide" path (Phase 9/11/17): same
+   * Kokoro voice as everything else, reads once and stops -- no auto-advance,
+   * no persona change. Browser speechSynthesis is used ONLY if
+   * browserFallbackEnabled is on AND the Kokoro request itself fails (Phase
+   * 10) -- never a silent substitute for Jack's real voice.
+   */
+  const readCurrentSlide = useCallback(
+    async (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed) return;
+      cancelAutonomousPresentingRef.current(); // stop whatever Jack was doing; reading a slide takes over cleanly, no resume-after
+      setCurrentCaption(trimmed);
+      try {
+        const audio = await jackApi.speak(trimmed, voice);
+        dispatchEvent({ type: "AUDIO_START" });
+        speechPlayer.play(audio, () => dispatchEvent({ type: "AUDIO_STOPPED" }));
+      } catch (err) {
+        if (browserFallbackEnabled && offlineSpeechSupported) {
+          speakOffline(trimmed);
+        } else {
+          setLastError(
+            err instanceof Error ? `Jack's voice is unavailable right now (${err.message}).` : "Jack's voice is unavailable right now.",
+          );
+        }
+      }
+    },
+    [dispatchEvent, speechPlayer, voice, browserFallbackEnabled, offlineSpeechSupported, speakOffline],
   );
 
   // --- Barge-in capture teardown ------------------------------------------
@@ -879,9 +1042,8 @@ export function JackProvider({ children }: { children: ReactNode }) {
             Object.values(parsedDocs),
             activeFileId,
           );
-          setCurrentCaption(answer);
           dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
-          void speakThroughPlayer(answer);
+          void speakThroughPlayer(answer); // sets currentCaption itself
           return finish({ source: intent.source, ok: true, message: answer });
         }
 
@@ -896,9 +1058,8 @@ export function JackProvider({ children }: { children: ReactNode }) {
               : "Summarize this slide in one or two sentences.";
           const prompt = ctx ? `${formatContextForPrompt(ctx)}\n\n${instruction}` : instruction;
           const chat = await jackApi.chat([{ role: "user", content: prompt }], { maxTokens: 150 });
-          setCurrentCaption(chat.content);
           dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
-          void speakThroughPlayer(chat.content);
+          void speakThroughPlayer(chat.content); // sets currentCaption itself
           return finish({ source: intent.source, action, ok: true, message: chat.content });
         }
 
@@ -935,8 +1096,9 @@ export function JackProvider({ children }: { children: ReactNode }) {
             break;
           }
           case "pause_presentation":
-            cancelAutonomousPresenting();
+            cancelAutonomousPresenting(); // stops current audio/narration before the acknowledgement below fires
             result = controller.pausePresentation();
+            if (result.success) void speakThroughPlayer("Of course. I'll pause here.");
             break;
           case "resume_presentation":
             result = controller.resumePresentation();
@@ -946,9 +1108,12 @@ export function JackProvider({ children }: { children: ReactNode }) {
             }
             break;
           case "handoff_to_presenter":
-            cancelAutonomousPresenting();
+            cancelAutonomousPresenting(); // stops current audio/narration before the acknowledgement below fires
             result = controller.handControlToPresenter();
-            if (result.success) setPresenterControl("presenter");
+            if (result.success) {
+              setPresenterControl("presenter");
+              void speakThroughPlayer("Of course. It's yours.");
+            }
             break;
           case "stop_presentation":
             cancelAutonomousPresenting();
@@ -1086,6 +1251,13 @@ export function JackProvider({ children }: { children: ReactNode }) {
     audienceQuestionPolicy,
     humourEnabled,
     language,
+    voice,
+    captionsEnabled,
+    browserFallbackEnabled,
+    setVoice,
+    setCaptionsEnabled,
+    setBrowserFallbackEnabled,
+    readCurrentSlide,
     questions,
     wakeWordMode: wakeWordService.mode,
     wakeWordAvailable: wakeWordService.available,
@@ -1104,7 +1276,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     setControlMode: setControlModeState,
     setAudienceQuestionPolicy: setAudienceQuestionPolicyState,
     setHumourEnabled: setHumourEnabledState,
-    setLanguage: setLanguageState,
+    setLanguage,
     registerController,
     unregisterController,
     endSession,

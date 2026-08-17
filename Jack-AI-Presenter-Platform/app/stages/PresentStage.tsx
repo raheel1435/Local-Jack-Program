@@ -3,10 +3,10 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { JackOrb } from "../JackOrb";
 import { JackStatusBar } from "../components/JackStatusBar";
+import { PresentSettingsPopover } from "../components/PresentSettingsPopover";
 import { PresentSetup } from "../components/PresentSetup";
 import { useAutoHideControls } from "../hooks/useAutoHideControls";
 import { useFullscreen } from "../hooks/useFullscreen";
-import { useSpeech } from "../hooks/useSpeech";
 import { useJack } from "../jack/JackProvider";
 import { searchDocuments } from "../jack/documentContext";
 import { fail, ok, type PresentationController } from "../jack/presentationController";
@@ -78,23 +78,23 @@ function PresentSession({
   const [pdfHandle, setPdfHandle] = useState<PdfRenderHandle | null>(null);
   const [presentationStatus, setPresentationStatus] = useState<PresentationStatus>("presenting");
   const paused = presentationStatus === "paused";
-  const [offlineVoiceEnabled, setOfflineVoiceEnabled] = useState(false);
   const [commandPanelOpen, setCommandPanelOpen] = useState(false);
   const [commandInput, setCommandInput] = useState("");
   const [commandBusy, setCommandBusy] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
-  const offlineSpeech = useSpeech();
   // Shared visibility model for BOTH the top status bar and the bottom
   // controls -- one set of mouse/keyboard/touch listeners, one fade timer,
   // so they always show and hide together rather than as two independently
   // behaving strips. Exceptions below keep chrome visible whenever hiding it
   // would make state genuinely hard to recover or understand: an open
-  // command input, active listening, the notes panel, or an error that
-  // needs the user's attention.
+  // command input, open settings, active listening, the notes panel, or an
+  // error that needs the user's attention.
   const controlsVisible = useAutoHideControls(3500);
   const chromeVisible =
     controlsVisible ||
     commandPanelOpen ||
+    settingsOpen ||
     jack.localMicState === "listening" ||
     jack.localMicState === "requesting" ||
     jack.localMicState === "initializing" ||
@@ -382,6 +382,11 @@ function PresentSession({
     else startListening(); // idle, or barge-in currently owns it -- either way, take over cleanly
   }
 
+  // Acoustic diagnostics gate (Phase 23): dev build AND an explicit ?dev=1
+  // opt-in, never both a normal dev-server session and a normal viewer.
+  const devDiagnosticsEnabled =
+    Boolean(import.meta.env?.DEV) && typeof window !== "undefined" && new URLSearchParams(window.location.search).get("dev") === "1";
+
   const localHealth: "checking" | "connected" | "offline" =
     jack.jackLocalHealth === null ? "checking" : localUnavailable ? "offline" : "connected";
   // The shared recorder reads "listening" whenever EITHER push-to-talk or
@@ -445,7 +450,9 @@ function PresentSession({
       {doc.warnings.length > 0 && <p className="present-warning">{doc.warnings[0]}</p>}
       {paused && <p className="present-warning">Paused · Say &ldquo;Jack, continue&rdquo;</p>}
 
-      {jack.currentCaption && jack.attentionState !== "sleeping" && jack.attentionState !== "disconnected" && (
+      {/* Captions default OFF (Phase 3/26): audience hears Jack, doesn't see the
+          full narration/Q&A/acknowledgement paragraph, unless explicitly enabled. */}
+      {jack.captionsEnabled && jack.currentCaption && jack.attentionState !== "sleeping" && jack.attentionState !== "disconnected" && (
         <p className="present-subtitle-line" aria-live="polite">{jack.currentCaption}</p>
       )}
       {jack.lastError && <p className="speech-error present-subtitle-line" role="alert">{jack.lastError}</p>}
@@ -454,7 +461,9 @@ function PresentSession({
         <p className="present-warning">Jack Local AI is unavailable. Manual presentation is still available.</p>
       )}
 
-      {jack.presenterControl === "jack" && jack.bargeInPhase !== "idle" && (
+      {/* Acoustic diagnostics (Phase 23): dev-only, never shown to an audience by
+          default -- requires BOTH a dev build and an explicit ?dev=1 opt-in. */}
+      {devDiagnosticsEnabled && jack.presenterControl === "jack" && jack.bargeInPhase !== "idle" && (
         <p className="jack-mic-diagnostic" title="Barge-in listening diagnostics -- for real-hardware interruption testing">
           mic: {jack.bargeInPhase} · lvl {jack.localMicLevel.toFixed(2)}
           {(jack.bargeInPhase === "armed" || jack.bargeInPhase === "capturing") &&
@@ -497,12 +506,7 @@ function PresentSession({
         </form>
       )}
 
-      {offlineVoiceEnabled && offlineSpeech.supported && (
-        <div className="jack-voice-fallback-controls">
-          <button type="button" className="speech-btn" onClick={() => currentSection && offlineSpeech.speak(currentSection.text)}>▶ Read this slide</button>
-          {offlineSpeech.isSpeaking && <button type="button" className="speech-btn" onClick={offlineSpeech.stop}>■ Stop</button>}
-        </div>
-      )}
+      {settingsOpen && <PresentSettingsPopover onClose={() => setSettingsOpen(false)} />}
 
       {showNotes && (
         <aside className="notes-panel">
@@ -576,13 +580,23 @@ function PresentSession({
           </button>
           <button
             type="button"
-            className={`jack-voice-fallback-btn ${offlineVoiceEnabled ? "active" : ""}`}
-            onClick={() => setOfflineVoiceEnabled((v) => !v)}
-            aria-pressed={offlineVoiceEnabled}
-            aria-label="Browser voice fallback"
-            title="Use the browser's built-in speech voice if Jack's local voice service is unavailable"
+            className="jack-voice-fallback-btn"
+            onClick={() => currentSection && void jack.readCurrentSlide(currentSection.text)}
+            disabled={!currentSection}
+            aria-label="Read this slide"
+            title="Read this slide aloud, once, with Jack's voice"
           >
-            🔊
+            ▶
+          </button>
+          <button
+            type="button"
+            className={`jack-voice-fallback-btn ${settingsOpen ? "active" : ""}`}
+            onClick={() => setSettingsOpen((v) => !v)}
+            aria-pressed={settingsOpen}
+            aria-label="Presentation settings"
+            title="Language, voice, captions, and fallback settings"
+          >
+            ⚙
           </button>
         </span>
 

@@ -136,6 +136,16 @@
 .jack-command-popover button{background:rgba(0,217,245,.1);border:1px solid rgba(0,217,245,.3);border-radius:8px;color:var(--cyan);padding:8px 12px;font-size:12px;cursor:pointer}
 .jack-command-popover button:disabled{opacity:.4;cursor:not-allowed}
 
+/* Compact presentation settings sheet (Phase 18) -- language/voice/captions/fallback, opened from the ⚙ control */
+.jack-settings-popover{display:flex;flex-direction:column;gap:8px;margin:0 24px 8px;padding:12px 14px;background:rgba(6,12,26,.9);border:1px solid var(--line);border-radius:10px;max-width:420px;margin-left:auto;margin-right:auto}
+.jack-settings-row{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.jack-settings-label{font-size:12px;color:#c3dcea}
+.jack-settings-static{font-size:12px;color:var(--cyan);font-weight:600}
+.jack-settings-row select{background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:8px;color:var(--text);padding:6px 10px;font-size:12px}
+.jack-settings-checkbox{cursor:pointer}
+.jack-settings-note{font-size:10px;color:#8aa0c0;margin:0;line-height:1.5}
+.jack-settings-close{align-self:flex-end;background:rgba(0,217,245,.1);border:1px solid rgba(0,217,245,.3);border-radius:8px;color:var(--cyan);padding:6px 14px;font-size:12px;cursor:pointer;margin-top:2px}
+
 /* Compact Jack control cluster (mic / typed-command toggle / browser-voice fallback) -- lives inline in present-controls */
 .jack-controls-cluster{display:inline-flex;gap:6px;padding:0 4px;border-left:1px solid var(--line);border-right:1px solid var(--line);margin:0 2px}
 .jack-mic-btn,.jack-command-toggle-btn,.jack-voice-fallback-btn{background:rgba(0,217,245,.06);border:1px solid rgba(0,217,245,.25);border-radius:8px;color:var(--text);padding:8px 12px;font-size:14px;line-height:1;cursor:pointer}
@@ -198,6 +208,7 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{ou
 .setup-grid select:focus-visible,.setup-grid input:focus-visible{outline:2px solid var(--cyan);outline-offset:1px}
 .setup-checkbox{display:flex;align-items:center;gap:8px;font-size:12px;color:#c3dcea;cursor:pointer}
 .setup-checkbox input{accent-color:var(--cyan)}
+.setup-static{font-size:13px;color:var(--cyan);font-weight:600;margin:0}
 .setup-actions{display:grid;gap:10px;justify-items:center;margin-top:8px}
 .setup-note{font-size:11px;color:#5f7e95;text-align:center;max-width:480px;margin:0}
 
