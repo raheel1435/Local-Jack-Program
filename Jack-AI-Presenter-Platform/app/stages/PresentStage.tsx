@@ -96,6 +96,8 @@ function PresentSession({
     controlsVisible ||
     commandPanelOpen ||
     jack.localMicState === "listening" ||
+    jack.localMicState === "requesting" ||
+    jack.localMicState === "initializing" ||
     showNotes ||
     Boolean(jack.lastError);
   const fullscreen = useFullscreen(stageRef);
@@ -342,10 +344,12 @@ function PresentSession({
   }
 
   function startListening() {
+    console.log("[mic] startListening() (PresentStage) invoked");
     localListenStoppingRef.current = false;
     void (async () => {
       await jack.startLocalListening();
       const startedAt = Date.now();
+      console.log("[mic] auto-stop interval armed", { startedAt });
       let heardSpeech = false;
       let silenceStart: number | null = null;
       localListenIntervalRef.current = setInterval(() => {
@@ -359,20 +363,41 @@ function PresentSession({
         }
         const sustainedSilence = heardSpeech && silenceStart !== null && now - silenceStart > LOCAL_LISTEN_SILENCE_MS;
         const hardCap = now - startedAt > LOCAL_LISTEN_MAX_MS;
-        if (sustainedSilence || hardCap) void stopAndProcess();
+        if (sustainedSilence || hardCap) {
+          console.log("[mic] auto-stop firing", { sustainedSilence, hardCap, elapsedMs: now - startedAt });
+          void stopAndProcess();
+        }
       }, 150);
     })();
   }
 
   function handleLocalMicClick() {
-    if (jack.localMicState === "listening") void stopAndProcess();
-    else startListening();
+    // See pushToTalkOwnsRecorder above: clicking while barge-in owns the
+    // recorder previously got misread as "stop push-to-talk" (since the
+    // shared recorder was already "listening"), immediately finalizing/
+    // hijacking barge-in's in-progress capture instead of cleanly starting
+    // a fresh push-to-talk one -- confirmed live, produced a short, garbled
+    // transcript from whatever partial audio barge-in happened to have.
+    if (pushToTalkOwnsRecorder) void stopAndProcess();
+    else startListening(); // idle, or barge-in currently owns it -- either way, take over cleanly
   }
 
   const localHealth: "checking" | "connected" | "offline" =
     jack.jackLocalHealth === null ? "checking" : localUnavailable ? "offline" : "connected";
-  const presentMicLabel: "off" | "listening" | "processing" =
-    jack.localMicState === "listening" ? "listening" : commandBusy ? "processing" : "off";
+  // The shared recorder reads "listening" whenever EITHER push-to-talk or
+  // barge-in owns the current capture -- bargeInPhase is the actual
+  // ownership signal. Only true when THIS button's own click started (and
+  // still owns) the current session, so its icon/label/click-behavior stay
+  // truthful even while barge-in is ambiently listening in the background.
+  const pushToTalkOwnsRecorder = jack.localMicState === "listening" && jack.bargeInPhase === "idle";
+  const presentMicLabel: "off" | "preparing" | "listening" | "processing" =
+    jack.localMicState === "listening"
+      ? "listening"
+      : jack.localMicState === "requesting" || jack.localMicState === "initializing"
+        ? "preparing"
+        : commandBusy
+          ? "processing"
+          : "off";
 
   // Single compact feedback line, driven by the ONE shared lastCommand* state
   // in JackProvider -- whichever call (typed, voice, or an interruption) most
@@ -437,7 +462,10 @@ function PresentSession({
         </p>
       )}
 
-      {jack.localMicState === "listening" && (
+      {(jack.localMicState === "requesting" || jack.localMicState === "initializing") && jack.bargeInPhase === "idle" && (
+        <p className="jack-mic-feedback" aria-live="polite">Preparing… (wait for &ldquo;Listening&rdquo; before speaking)</p>
+      )}
+      {pushToTalkOwnsRecorder && (
         <p className="jack-mic-feedback" aria-live="polite">Listening… (stops automatically when you pause, or press ⏹)</p>
       )}
       {jack.localMicError && <p className="jack-mic-feedback speech-error">{jack.localMicError}</p>}
@@ -510,20 +538,31 @@ function PresentSession({
         <span className="jack-controls-cluster">
           <button
             type="button"
-            className={`jack-mic-btn state-${jack.localMicState}`}
+            className={`jack-mic-btn state-${pushToTalkOwnsRecorder ? "listening" : jack.localMicState === "listening" ? "idle" : jack.localMicState}`}
             onClick={handleLocalMicClick}
-            disabled={commandBusy || whisperUnavailable || jack.localMicState === "requesting"}
-            aria-pressed={jack.localMicState === "listening"}
-            aria-label={jack.localMicState === "listening" ? "Stop listening and send" : "Talk to Jack"}
+            disabled={
+              commandBusy ||
+              whisperUnavailable ||
+              jack.localMicState === "requesting" ||
+              jack.localMicState === "initializing"
+            }
+            aria-pressed={pushToTalkOwnsRecorder}
+            aria-label={pushToTalkOwnsRecorder ? "Stop listening and send" : "Talk to Jack"}
             title={
               whisperUnavailable
                 ? "Local Whisper transcription is unavailable"
-                : jack.localMicState === "listening"
+                : pushToTalkOwnsRecorder
                   ? "Stop listening and send"
-                  : "Talk to Jack"
+                  : jack.localMicState === "requesting" || jack.localMicState === "initializing"
+                    ? "Preparing the microphone…"
+                    : "Talk to Jack"
             }
           >
-            {jack.localMicState === "listening" ? "⏹" : jack.localMicState === "requesting" ? "…" : "🎤"}
+            {pushToTalkOwnsRecorder
+              ? "⏹"
+              : jack.localMicState === "requesting" || jack.localMicState === "initializing"
+                ? "…"
+                : "🎤"}
           </button>
           <button
             type="button"

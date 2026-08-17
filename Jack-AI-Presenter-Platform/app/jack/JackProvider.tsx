@@ -636,6 +636,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       setBargeInPhaseBoth("idle");
       clearBargeInArmTimers();
       clearBargeInCaptureTimeout();
+      console.log("[mic] stop() called from: cancelAutonomousPresenting");
       void localRecorder.stop(); // discard whatever was captured -- cancellation, not a command
     }
   }, [stopJackAudio, clearBargeInArmTimers, clearBargeInCaptureTimeout, localRecorder, setBargeInPhaseBoth]);
@@ -711,6 +712,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const finishBargeInCapture = useCallback(async () => {
     setBargeInPhaseBoth("idle");
     clearBargeInCaptureTimeout();
+    console.log("[mic] stop() called from: finishBargeInCapture");
     const audio = await localRecorder.stop();
     if (!audio) {
       dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
@@ -788,6 +790,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     if (shouldArm && bargeInPhaseRef.current === "idle") {
       setBargeInPhaseBoth("guarding");
       bargeInLoudTicksRef.current = 0;
+      console.log("[mic] start() called from: arm effect (armed)", { attentionState, presenterControl });
       void localRecorder.start();
       bargeInArmGuardTimeoutRef.current = setTimeout(() => {
         if (bargeInPhaseRef.current !== "guarding") return; // disarmed/interrupted during the guard window
@@ -814,6 +817,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       // detected interruption -- disarm and discard.
       setBargeInPhaseBoth("idle");
       clearBargeInArmTimers();
+      console.log("[mic] stop() called from: disarm effect", { attentionState, presenterControl });
       void localRecorder.stop();
     }
     // "capturing" is left alone here; handleBargeInDetected/finishBargeInCapture own that transition.
@@ -860,7 +864,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
         // below, no matter what the model happened to put in `action`.
         if (intent.type === "unknown") {
           dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
-          return finish({ source: intent.source, ok: false, message: "I didn't catch a presentation command there." });
+          return finish({ source: intent.source, ok: false, message: "I only heard part of that. Please try again." });
         }
 
         if (intent.type === "conversation") {
@@ -980,11 +984,46 @@ export function JackProvider({ children }: { children: ReactNode }) {
 
   const startLocalListening = useCallback(async () => {
     setLastError(null);
-    await localRecorder.start();
+    // Recorder ownership: an explicit push-to-talk click always wins over
+    // barge-in's ambient monitoring AND over Jack's autonomous narration
+    // loop -- not just barge-in's listening phase. An earlier version of
+    // this fix only cleared bargeInPhaseRef, which left the narration loop
+    // running; if Jack's current utterance then finished naturally, its
+    // onEnded callback (never invalidated) would advance and start a new
+    // narration step, dispatch AUDIO_START, re-arm barge-in (since
+    // presenterControl was still "jack"), and barge-in's own arm effect
+    // would call localRecorder.start() again -- which, via this hook's
+    // defensive teardown-before-start, tore down push-to-talk's still-
+    // recording session out from under it mid-capture. Confirmed live: this
+    // produced a genuine short/garbled transcript purely from the handoff
+    // race, not from anything the user actually said. cancelAutonomousPresenting
+    // stops the audio, invalidates the generation counter so no orphaned
+    // step can restart it, AND disarms barge-in -- the complete cleanup,
+    // not a partial one.
+    //
+    // Still not quite enough on its own: cancelAutonomousPresenting resets
+    // bargeInPhaseRef to "idle" but does NOT change attentionState, which
+    // stays "speaking" until something dispatches an event that moves it.
+    // The barge-in arm effect's condition is `shouldArm = attentionState
+    // === "speaking" && presenterControl === "jack"` -- if a render happens
+    // in the gap between the reset above and localRecorder.start() actually
+    // opening a new session, shouldArm is STILL true (attentionState hasn't
+    // caught up) and bargeInPhaseRef.current IS "idle" again, so the arm
+    // effect immediately re-arms and calls localRecorder.start() a SECOND
+    // time, racing this function's own start() call. Dispatching
+    // LOCAL_MIC_START *before* starting the recorder (not after, as it read
+    // previously) flips attentionState to "listening" in the same
+    // synchronous batch as cancelAutonomousPresenting's updates, so
+    // shouldArm is already false by the time anything re-renders -- closes
+    // the window instead of just narrowing it.
+    cancelAutonomousPresenting();
     dispatchEvent({ type: "LOCAL_MIC_START" });
-  }, [localRecorder, dispatchEvent]);
+    console.log("[mic] start() called from: startLocalListening (push-to-talk)");
+    await localRecorder.start();
+  }, [localRecorder, dispatchEvent, cancelAutonomousPresenting]);
 
   const stopLocalListening = useCallback(async (): Promise<{ transcript: string; outcome: LocalCommandOutcome } | null> => {
+    console.log("[mic] stop() called from: stopLocalListening (push-to-talk)");
     const audio = await localRecorder.stop();
     if (!audio) {
       dispatchEvent({ type: "LOCAL_COMMAND_DONE" });

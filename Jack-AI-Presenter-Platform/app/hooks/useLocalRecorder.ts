@@ -10,7 +10,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
  * raw PCM via Web Audio and hand-encoding a WAV header sidesteps that
  * entirely and needs no new dependency.
  */
-export type LocalRecorderState = "idle" | "requesting" | "listening" | "error";
+export type LocalRecorderState = "idle" | "requesting" | "initializing" | "listening" | "error";
 
 export interface UseLocalRecorderResult {
   state: LocalRecorderState;
@@ -23,6 +23,25 @@ export interface UseLocalRecorderResult {
 
 interface WebkitAudioContextWindow {
   webkitAudioContext?: typeof AudioContext;
+}
+
+// Real hardware (echoCancellation/noiseSuppression/autoGainControl warm-up,
+// getUserMedia device negotiation) can add real, variable latency before
+// audio genuinely starts flowing -- observed as a user's first word being
+// clipped when the UI said "Listening" before samples were actually being
+// captured. If the very first buffer hasn't arrived within this long,
+// something is unusually slow; proceed rather than hang the mic button
+// forever, but this should be rare in practice.
+const FIRST_BUFFER_TIMEOUT_MS = 2000;
+
+function mark(label: string, extra?: Record<string, unknown>) {
+  // Always-on, not gated behind a flag: this is a local-only dev/diagnostic
+  // tool, and these timestamps are exactly what's needed to interpret a real
+  // microphone test (see the milestone's Phase 3/10/11 real-hardware ask) --
+  // filter the console on "[mic]" to follow one recording session.
+  const t = Math.round(performance.now());
+  if (extra) console.log(`[mic] t=${t}ms ${label}`, extra);
+  else console.log(`[mic] t=${t}ms ${label}`);
 }
 
 function encodeWav(samples: Float32Array, sampleRate: number): Blob {
@@ -132,6 +151,18 @@ export function useLocalRecorder(): UseLocalRecorderResult {
   }, [stopLevelLoop]);
 
   const start = useCallback(async () => {
+    // Defensive: if something (barge-in's ambient arm, or a previous
+    // push-to-talk session) left the recorder active, tear it down first
+    // instead of silently leaking the old MediaStream/AudioContext and
+    // fighting over the same refs. Whichever caller invokes start() next
+    // cleanly takes ownership -- see the "recorder ownership" note in
+    // JackProvider.tsx for the barge-in side of this.
+    if (audioContextRef.current || streamRef.current) {
+      mark("start() called while already active -- tearing down previous session first");
+      teardown();
+    }
+
+    mark("mic click / start() invoked");
     setState("requesting");
     setError(null);
     chunksRef.current = [];
@@ -143,12 +174,20 @@ export function useLocalRecorder(): UseLocalRecorderResult {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
+      mark("getUserMedia resolved");
       streamRef.current = stream;
+      setState("initializing");
 
       const AudioContextCtor = window.AudioContext ?? (window as unknown as WebkitAudioContextWindow).webkitAudioContext;
       if (!AudioContextCtor) throw new Error("This browser doesn't support the Web Audio API.");
       const audioContext = new AudioContextCtor();
       audioContextRef.current = audioContext;
+      // Some browsers can hand back a freshly-created context in "suspended"
+      // state even after a user gesture; resume() is a no-op if it's already
+      // running, but skipping it risks silently losing audio until something
+      // else happens to resume the context later.
+      await audioContext.resume();
+      mark("AudioContext running", { sampleRate: audioContext.sampleRate, state: audioContext.state });
 
       const source = audioContext.createMediaStreamSource(stream);
       sourceRef.current = source;
@@ -161,10 +200,24 @@ export function useLocalRecorder(): UseLocalRecorderResult {
 
       // ScriptProcessorNode is deprecated but universally supported and
       // avoids shipping a separate AudioWorklet module for this milestone's
-      // short push-to-talk captures.
-      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+      // short push-to-talk captures. Buffer size reduced from the previous
+      // 4096 (~85ms at 48kHz) to 1024 (~21ms) -- this is ScriptProcessorNode's
+      // own inherent "time until the first callback can possibly fire" floor,
+      // and smaller buffers mean less of a user's first word can be lost to
+      // it while still being comfortably cheap to process.
+      const processor = audioContext.createScriptProcessor(1024, 1, 1);
+      let firstBufferSeen = false;
+      let resolveFirstBuffer: (() => void) | null = null;
+      const firstBufferPromise = new Promise<void>((resolve) => {
+        resolveFirstBuffer = resolve;
+      });
       processor.onaudioprocess = (event) => {
         chunksRef.current.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+        if (!firstBufferSeen) {
+          firstBufferSeen = true;
+          mark("first audio buffer received -- genuinely capturing now");
+          resolveFirstBuffer?.();
+        }
       };
       source.connect(processor);
       // A ScriptProcessorNode only fires onaudioprocess while it has a path
@@ -173,7 +226,22 @@ export function useLocalRecorder(): UseLocalRecorderResult {
       processor.connect(audioContext.destination);
       processorRef.current = processor;
 
+      // Don't tell the UI (and the auto-stop-on-silence timer that starts
+      // once this resolves) that we're "Listening" until audio is actually
+      // flowing -- otherwise a user who starts speaking the instant they see
+      // "Listening" can lose their first word to setup latency that already
+      // happened invisibly. Falls back to proceeding anyway after a timeout
+      // so a genuinely stalled first callback can't hang the mic button.
+      await Promise.race([
+        firstBufferPromise,
+        new Promise<void>((resolve) => setTimeout(resolve, FIRST_BUFFER_TIMEOUT_MS)),
+      ]);
+      if (!firstBufferSeen) {
+        mark("WARNING: first buffer did not arrive within timeout -- proceeding anyway");
+      }
+
       setState("listening");
+      mark("Listening shown to user");
     } catch (err) {
       teardown();
       if (err instanceof DOMException && err.name === "NotAllowedError") {
@@ -188,6 +256,7 @@ export function useLocalRecorder(): UseLocalRecorderResult {
   }, [runLevelLoop, teardown]);
 
   const stop = useCallback(async (): Promise<Blob | null> => {
+    mark("recording stopped");
     const sampleRate = audioContextRef.current?.sampleRate ?? 48000;
     const chunks = chunksRef.current;
     chunksRef.current = [];
@@ -196,6 +265,7 @@ export function useLocalRecorder(): UseLocalRecorderResult {
     if (chunks.length === 0) return null;
     const samples = concatFloat32(chunks);
     if (samples.length === 0) return null;
+    mark("WAV encoded, ready to send", { durationMs: Math.round((samples.length / sampleRate) * 1000) });
     return encodeWav(samples, sampleRate);
   }, [teardown]);
 

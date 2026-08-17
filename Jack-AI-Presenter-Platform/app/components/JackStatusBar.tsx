@@ -4,7 +4,7 @@ import { JACK_STATES, type JackState } from "../JackOrb";
 import type { ControlOwner } from "../jack/types";
 
 export type LocalHealthLabel = "checking" | "connected" | "offline";
-export type PresentMicLabel = "off" | "listening" | "processing";
+export type PresentMicLabel = "off" | "preparing" | "listening" | "processing";
 
 export interface JackStatusBarProps {
   jackState: JackState;
@@ -37,6 +37,7 @@ const LOCAL_HEALTH_TITLE: Record<LocalHealthLabel, string> = {
 
 const MIC_LABEL: Record<PresentMicLabel, string> = {
   off: "Off",
+  preparing: "Preparing…",
   listening: "Listening",
   processing: "Processing",
 };

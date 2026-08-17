@@ -117,14 +117,38 @@ const CONVERSATION_RULES: ConversationRule[] = [
 ];
 
 /**
+ * A single bare word that didn't match any action or conversation pattern
+ * above is very likely a clipped microphone fragment ("you.", "the.",
+ * "jack.", "from.") rather than a real command or question -- confirmed
+ * live: a real "Jack take over from here." recording that lost its first
+ * syllables produced exactly this shape of transcript, which the LLM then
+ * classified as "conversation" and Jack "answered" with "That isn't covered
+ * in this presentation" -- a deeply confusing response to what was actually
+ * a failed recording. Legitimate one-word commands ("Next.", "Pause.",
+ * "Continue.", "Back.", "Wait.", "Stop.") never reach this check at all --
+ * they already matched an ACTION_RULES pattern above and returned early.
+ * Multi-word fragments are deliberately NOT covered here: there's no
+ * reliable way to distinguish a clipped multi-word command from a
+ * genuinely short real question without guessing, whereas an isolated
+ * single word is the concrete, evidenced failure mode.
+ */
+function isBareWordFragment(normalized: string): boolean {
+  const words = normalized.replace(/[.?!]+$/, "").split(/\s+/).filter(Boolean);
+  return words.length === 1;
+}
+
+/**
  * Bypasses the LLM entirely for short, unambiguous presentation commands
  * and for common conversational filler that must never be allowed to
  * mutate presentation state. Everything else -- questions, explanations,
  * ambiguous phrasing, or anything not matching exactly -- returns null and
- * falls through to the LLM's type/action classifier.
+ * falls through to the LLM's type/action classifier, EXCEPT a single bare
+ * word (see isBareWordFragment), which fails safe to "unknown" without
+ * ever reaching the LLM's more permissive "conversation" guess.
  */
 export function matchDeterministicCommand(text: string): DeterministicMatch | null {
   const normalized = text.trim().toLowerCase();
+  if (!normalized) return { type: "unknown" };
 
   for (const rule of ACTION_RULES) {
     if (rule.patterns.some((p) => p.test(normalized))) {
@@ -135,6 +159,9 @@ export function matchDeterministicCommand(text: string): DeterministicMatch | nu
     if (rule.patterns.some((p) => p.test(normalized))) {
       return { type: "conversation" };
     }
+  }
+  if (isBareWordFragment(normalized)) {
+    return { type: "unknown" };
   }
   return null;
 }
