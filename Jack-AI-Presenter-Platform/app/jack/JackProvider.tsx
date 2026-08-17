@@ -122,6 +122,33 @@ function savePresentSettings(settings: PersistedPresentSettings) {
   }
 }
 
+// Wake greetings (Phase 3/4 of the activation milestone): short, warm,
+// human -- spoken through the same Kokoro voice path as everything else.
+// Several variants each so back-to-back wake cycles don't repeat verbatim.
+const HUMOROUS_GREETINGS = [
+  "Hey, I'm here. Ready when you are.",
+  "Alright, I'm awake. No coffee required -- what are we presenting?",
+  "Jack reporting for duty. I promise not to steal the whole presentation.",
+  "Ready. You lead, or I can take it from here.",
+];
+const PROFESSIONAL_GREETINGS = [
+  "I'm ready. How would you like to continue?",
+  "Jack is ready whenever you are.",
+  "Ready to begin whenever you are.",
+];
+
+function pickGreeting(humourEnabled: boolean): string {
+  const bank = humourEnabled ? HUMOROUS_GREETINGS : PROFESSIONAL_GREETINGS;
+  return bank[Math.floor(Math.random() * bank.length)];
+}
+
+// Brief takeover acknowledgements (Phase 10) -- confirms the command landed
+// before narration starts, so the user isn't left wondering whether it worked.
+const TAKEOVER_ACKS = ["Got it. I'll take it from here.", "Absolutely. I'll take over.", "Sure -- I've got the next part."];
+function pickTakeoverAck(): string {
+  return TAKEOVER_ACKS[Math.floor(Math.random() * TAKEOVER_ACKS.length)];
+}
+
 function transportEventType(event: unknown): string | undefined {
   if (event && typeof event === "object" && "type" in event) {
     const value = (event as { type: unknown }).type;
@@ -179,6 +206,12 @@ export interface JackContextValue {
    * once and stops -- no auto-advance, no persona change.
    */
   readCurrentSlide(text: string): Promise<void>;
+  /** True once Jack has been explicitly activated for this local-pipeline session (Phase 1/2) -- independent of attentionState's sleeping/standby, which belongs to the unused OpenAI Realtime path in Present mode. */
+  jackAwake: boolean;
+  /** The ONE authoritative activation function (Phase 2) -- idempotent, greets once per sleeping->awake transition (Phase 5). */
+  wakeJackLocal(): Promise<void>;
+  /** Explicit local sleep -- stops any current speech/narration and resets the wake guard so the next wake greets again. */
+  sleepJackLocal(): void;
   questions: QueuedQuestion[];
   wakeWordMode: "local-wake-word" | "push-to-talk";
   wakeWordAvailable: boolean;
@@ -332,6 +365,15 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const [presenterControl, setPresenterControl] = useState<ControlOwner>("presenter");
   const [jackLocalHealth, setJackLocalHealth] = useState<JackHealth | null>(null);
   const [isPresentingAutonomously, setIsPresentingAutonomously] = useState(false);
+  // Local-pipeline activation lifecycle (Phase 1/2 of the activation
+  // milestone) -- deliberately separate from attentionState's
+  // sleeping/standby, which is wired to the OpenAI Realtime connection this
+  // mode never uses (Present mode's typed/voice commands go through the
+  // local gateway, not wake()/RealtimeSession). jackAwakeRef is the
+  // authoritative synchronous guard against a double greeting; jackAwake is
+  // its reactive mirror for the UI.
+  const jackAwakeRef = useRef(false);
+  const [jackAwake, setJackAwake] = useState(false);
   const localRecorder = useLocalRecorder();
   const offlineSpeech: UseSpeechResult = useSpeech();
   // Destructured (not accessed as offlineSpeech.foo inline) so useCallback
@@ -644,24 +686,27 @@ export function JackProvider({ children }: { children: ReactNode }) {
   }, [dispatchEvent]);
 
   const pause = useCallback(() => {
+    speechPlayer.unlock(); // must run synchronously inside this click -- see jackSpeechPlayer.ts
     realtimeSessionRef.current?.interrupt();
     controllerRef.current.controller.pausePresentation();
     cancelAutonomousPresentingRef.current(); // manual Pause button must also stop Jack's own narration loop -- audio is already cancelled before the line below fires
     dispatchEvent({ type: "PAUSE" });
     void speakThroughPlayerRef.current("Of course. I'll pause here.");
-  }, [dispatchEvent]);
+  }, [dispatchEvent, speechPlayer]);
 
   const resume = useCallback(() => {
+    speechPlayer.unlock();
     controllerRef.current.controller.resumePresentation();
     if (presenterControlRef.current === "jack") startAutonomousPresentingRef.current();
     dispatchEvent({ type: "RESUME" });
-  }, [dispatchEvent]);
+  }, [dispatchEvent, speechPlayer]);
 
   const interrupt = useCallback(() => {
+    speechPlayer.unlock();
     realtimeSessionRef.current?.interrupt();
     cancelAutonomousPresentingRef.current(); // manual Stop must also cancel local narration + pending advance -- audio is already cancelled before the acknowledgement below fires
     void speakThroughPlayerRef.current("Sure. I'll stop here.");
-  }, []);
+  }, [speechPlayer]);
 
   const sendText = useCallback((text: string) => {
     realtimeSessionRef.current?.sendMessage(text);
@@ -736,6 +781,32 @@ export function JackProvider({ children }: { children: ReactNode }) {
   }, [speakThroughPlayer]);
 
   /**
+   * Like speakThroughPlayer, but resolves only once playback has actually
+   * FINISHED (or failed) -- not just once it started. Used wherever a caller
+   * needs to sequence something after Jack finishes talking, so two
+   * utterances never talk over each other (Phase 21): waking with a
+   * greeting, then acknowledging a takeover, then only THEN starting slide
+   * narration.
+   */
+  const speakAndWait = useCallback(
+    (text: string): Promise<void> =>
+      new Promise((resolve) => {
+        setCurrentCaption(text);
+        jackApi
+          .speak(text, voice)
+          .then((audio) => {
+            dispatchEvent({ type: "AUDIO_START" });
+            speechPlayer.play(audio, () => {
+              dispatchEvent({ type: "AUDIO_STOPPED" });
+              resolve();
+            });
+          })
+          .catch(() => resolve()); // Kokoro unavailable -- don't block the caller's continuation
+      }),
+    [dispatchEvent, speechPlayer, voice],
+  );
+
+  /**
    * The ONE authoritative "Read this slide" path (Phase 9/11/17): same
    * Kokoro voice as everything else, reads once and stops -- no auto-advance,
    * no persona change. Browser speechSynthesis is used ONLY if
@@ -746,6 +817,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     async (text: string) => {
       const trimmed = text.trim();
       if (!trimmed) return;
+      speechPlayer.unlock(); // must run synchronously inside this click -- see jackSpeechPlayer.ts
       cancelAutonomousPresentingRef.current(); // stop whatever Jack was doing; reading a slide takes over cleanly, no resume-after
       setCurrentCaption(trimmed);
       try {
@@ -764,6 +836,30 @@ export function JackProvider({ children }: { children: ReactNode }) {
     },
     [dispatchEvent, speechPlayer, voice, browserFallbackEnabled, offlineSpeechSupported, speakOffline],
   );
+
+  /**
+   * The ONE authoritative activation function (Phase 2). Idempotent: calling
+   * it while already awake just re-unlocks audio and does nothing else --
+   * no duplicate greeting (Phase 5). Greets once per sleeping->awake
+   * transition, through the same Kokoro voice as everything else (Phase 6),
+   * varying by humourEnabled (Phase 3/4). jackAwakeRef (not just the state)
+   * guards the check so two rapid wake calls in the same tick can't both
+   * observe "not yet awake" and both greet.
+   */
+  const wakeJackLocal = useCallback(async () => {
+    speechPlayer.unlock(); // must run synchronously inside the originating gesture
+    if (jackAwakeRef.current) return;
+    jackAwakeRef.current = true;
+    setJackAwake(true);
+    await speakAndWait(pickGreeting(humourEnabled));
+  }, [speechPlayer, speakAndWait, humourEnabled]);
+
+  /** Sleep is explicit and local -- stops any current speech/narration and resets the wake guard so the next wake greets again. */
+  const sleepJackLocal = useCallback(() => {
+    cancelAutonomousPresentingRef.current();
+    jackAwakeRef.current = false;
+    setJackAwake(false);
+  }, []);
 
   // --- Barge-in capture teardown ------------------------------------------
   const clearBargeInCaptureTimeout = useCallback(() => {
@@ -830,7 +926,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
 
       let audio: Blob;
       try {
-        audio = await jackApi.speak(narrationText);
+        audio = await jackApi.speak(narrationText, voice);
       } catch (err) {
         // Phase 17: Kokoro failure -- show the text, stop autonomy, hand control back safely.
         setCurrentCaption(narrationText);
@@ -855,7 +951,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
         void runNarrationStep(generation);
       });
     },
-    [cancelAutonomousPresenting, dispatchEvent, speechPlayer],
+    [cancelAutonomousPresenting, dispatchEvent, speechPlayer, voice],
   );
 
   const startAutonomousPresenting = useCallback(() => {
@@ -1016,6 +1112,11 @@ export function JackProvider({ children }: { children: ReactNode }) {
         return outcome;
       };
 
+      // Typed submission is a real user gesture -- must unlock synchronously
+      // within it (see jackSpeechPlayer.ts). Voice-triggered calls are
+      // already covered by the mic button's own unlock(), so this is
+      // harmless, idempotent reinforcement there.
+      speechPlayer.unlock();
       dispatchEvent({ type: "LOCAL_COMMAND_START" });
       const controller = controllerRef.current.controller;
       try {
@@ -1069,7 +1170,17 @@ export function JackProvider({ children }: { children: ReactNode }) {
             result = controller.startPresentation();
             if (result.success) {
               setPresenterControl("jack");
-              startAutonomousPresenting();
+              // Wake (with greeting) first if Jack was still asleep -- Phase
+              // 2's "starting Jack presentation if currently sleeping" wake
+              // trigger -- then a brief takeover acknowledgement (Phase 10),
+              // and only once THAT finishes does narration begin (Phase 21:
+              // never talk over the previous utterance). Already-awake is
+              // the common case and skips straight to the acknowledgement.
+              void (async () => {
+                if (!jackAwakeRef.current) await wakeJackLocal();
+                await speakAndWait(pickTakeoverAck());
+                startAutonomousPresenting();
+              })();
             }
             break;
           case "next_slide":
@@ -1112,7 +1223,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
             result = controller.handControlToPresenter();
             if (result.success) {
               setPresenterControl("presenter");
-              void speakThroughPlayer("Of course. It's yours.");
+              void speakThroughPlayer("Absolutely. It's yours.");
             }
             break;
           case "stop_presentation":
@@ -1140,7 +1251,16 @@ export function JackProvider({ children }: { children: ReactNode }) {
         });
       }
     },
-    [dispatchEvent, cancelAutonomousPresenting, startAutonomousPresenting, speakThroughPlayer, recordCommandOutcome],
+    [
+      dispatchEvent,
+      cancelAutonomousPresenting,
+      startAutonomousPresenting,
+      speakThroughPlayer,
+      recordCommandOutcome,
+      speechPlayer,
+      wakeJackLocal,
+      speakAndWait,
+    ],
   );
 
   useEffect(() => {
@@ -1181,11 +1301,12 @@ export function JackProvider({ children }: { children: ReactNode }) {
     // synchronous batch as cancelAutonomousPresenting's updates, so
     // shouldArm is already false by the time anything re-renders -- closes
     // the window instead of just narrowing it.
+    speechPlayer.unlock(); // real user gesture -- covers any Jack speech triggered by the command this capture produces
     cancelAutonomousPresenting();
     dispatchEvent({ type: "LOCAL_MIC_START" });
     console.log("[mic] start() called from: startLocalListening (push-to-talk)");
     await localRecorder.start();
-  }, [localRecorder, dispatchEvent, cancelAutonomousPresenting]);
+  }, [localRecorder, dispatchEvent, cancelAutonomousPresenting, speechPlayer]);
 
   const stopLocalListening = useCallback(async (): Promise<{ transcript: string; outcome: LocalCommandOutcome } | null> => {
     console.log("[mic] stop() called from: stopLocalListening (push-to-talk)");
@@ -1258,6 +1379,9 @@ export function JackProvider({ children }: { children: ReactNode }) {
     setCaptionsEnabled,
     setBrowserFallbackEnabled,
     readCurrentSlide,
+    jackAwake,
+    wakeJackLocal,
+    sleepJackLocal,
     questions,
     wakeWordMode: wakeWordService.mode,
     wakeWordAvailable: wakeWordService.available,

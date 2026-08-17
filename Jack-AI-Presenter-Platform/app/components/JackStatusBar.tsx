@@ -21,6 +21,10 @@ export interface JackStatusBarProps {
   followMode: "auto" | "manual";
   onToggleFollowMode: () => void;
   onSync: () => void;
+  /** Local-pipeline activation lifecycle (Phase 1/2/22) -- independent of jackState's OpenAI-Realtime-oriented sleeping/standby. */
+  jackAwake: boolean;
+  onWake: () => void;
+  onSleep: () => void;
 }
 
 const LOCAL_HEALTH_LABEL: Record<LocalHealthLabel, string> = {
@@ -42,6 +46,14 @@ const MIC_LABEL: Record<PresentMicLabel, string> = {
   processing: "Processing",
 };
 
+/** Compact presence label (Phase 22): Sleeping/Ready/Listening/Presenting -- never a giant panel, just this one pill. */
+function presenceLabel(jackAwake: boolean, micLabel: PresentMicLabel, isPresentingAutonomously: boolean): string {
+  if (!jackAwake) return "Sleeping";
+  if (isPresentingAutonomously) return "Presenting";
+  if (micLabel === "listening") return "Listening";
+  return "Ready";
+}
+
 export function JackStatusBar({
   jackState,
   jackLabel,
@@ -54,12 +66,24 @@ export function JackStatusBar({
   followMode,
   onToggleFollowMode,
   onSync,
+  jackAwake,
+  onWake,
+  onSleep,
 }: JackStatusBarProps) {
   return (
     <div className="sync-bar" role="status">
-      <span className="sync-item">
+      <button
+        type="button"
+        className={`sync-item sync-presence ${jackAwake ? "awake" : "sleeping"}`}
+        onClick={jackAwake ? onSleep : onWake}
+        aria-label={jackAwake ? "Put Jack to sleep" : "Wake Jack"}
+        title={jackAwake ? "Click to put Jack to sleep" : "Click to wake Jack -- Jack will greet you"}
+      >
         <i className={`sync-dot state-${jackState}`} aria-hidden="true" />
-        Jack: {jackLabel || JACK_STATES[jackState].label}
+        Jack &middot; {presenceLabel(jackAwake, micLabel, isPresentingAutonomously)}
+      </button>
+      <span className="sync-item" title={jackLabel || JACK_STATES[jackState].label}>
+        {jackLabel || JACK_STATES[jackState].label}
       </span>
       <span className={`sync-item connection-${localHealth}`} title={LOCAL_HEALTH_TITLE[localHealth]}>
         {LOCAL_HEALTH_LABEL[localHealth]}

@@ -32,7 +32,7 @@ const ACTION_RULES: ActionRule[] = [
       // "take ?over" (space optional): whisper.cpp reproducibly transcribes
       // this exact phrase as the compound word "takeover" -- observed live
       // during real-hardware voice testing, not a hypothetical.
-      /^jack,?\s+(take ?over|you (take it|present this)|please present)( now)?\.?$/,
+      /^jack,?\s+(take ?over|you (take it|present this|take ?over|handle it)|please present)( now)?\.?$/,
       // Realistic phrasing variants, all still addressed TO Jack (subject is
       // "you"/"Jack", never "I"/"I'll") -- confirmed live that without these,
       // "Jack take over from here." fell through to the LLM, which
@@ -43,6 +43,14 @@ const ACTION_RULES: ActionRule[] = [
       /^you (can )?take it from (here|there)\.?$/,
       /^jack,?\s+you present( this)?( now)?\.?$/,
       /^jack,?\s+continue( the presentation)?\.?$/,
+      // "Jack, present this." (no "you"), "Take over, Jack." (name trails,
+      // not leads), "You can present from here." -- confirmed live via
+      // direct /jack/intent calls that the LLM fallback either inverted
+      // these (returned handoff_to_presenter, the opposite meaning) or
+      // classified them as non-actionable "conversation".
+      /^jack,?\s+present( this)?( now)?\.?$/,
+      /^take ?over,?\s*jack\.?$/,
+      /^you (can )?present( this)? from (here|there)\.?$/,
     ],
   },
   {
@@ -79,8 +87,14 @@ const ACTION_RULES: ActionRule[] = [
     patterns: [
       /^i('| wi)ll take ?over( now)?\.?$/,
       /^i('| wi)ll take it from (here|there)\.?$/,
-      /^i('| wi)ll continue\.?$/,
+      // Optional "Jack," prefix -- confirmed live the LLM fallback
+      // misclassified "Jack, I'll continue." as start_presentation (backwards)
+      // when it fell through un-anchored by "jack,".
+      /^(jack,?\s+)?i('| wi)ll continue\.?$/,
       /^(give|hand)( me| back)? (the )?control( back)?\.?$/,
+      // "Give it back to me." -- confirmed live the LLM fallback returned a
+      // bare "conversation" with no action at all for this phrasing.
+      /^give it back( to me)?\.?$/,
       /^let me (take ?over|continue)\.?$/,
       /^i('| ha)ve (got|got it|it)\.?$/,
     ],

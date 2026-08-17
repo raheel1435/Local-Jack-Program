@@ -43,8 +43,15 @@ export interface RecorderMetrics {
   frameMessageCount: number;
   pcmSampleCount: number;
   durationMs: number;
+  /** Peak/RMS of the final captured PCM (worklet/WAV stage). */
   peakAmplitude: number;
   rmsAmplitude: number;
+  /** Peak/session-average RMS from the separate AnalyserNode, over the same
+   * session -- compared against peakAmplitude/rmsAmplitude above to isolate
+   * whether a zero-signal capture is lost before or after the
+   * AudioWorkletNode (Phase 16 of the activation milestone). */
+  analyserPeak: number;
+  analyserAvgRms: number;
   wavBytes: number;
 }
 
@@ -74,6 +81,13 @@ const WORKLET_NODE_NAME = "pcm-recorder-processor";
 // something is unusually slow; proceed rather than hang the mic button
 // forever, but this should be rare in practice.
 const FIRST_FRAME_TIMEOUT_MS = 2000;
+
+// Silent-PCM safety (Phase 13): int16 quantization/analog noise floor is
+// never exactly zero, but real speech peaks far above this -- a captured
+// peak below it means the microphone signal was effectively lost somewhere
+// in the pipeline (device, permission-granted-but-muted, wrong device),
+// not that the user spoke quietly.
+const SILENT_PEAK_THRESHOLD = 0.005;
 
 function mark(label: string, extra?: Record<string, unknown>) {
   // Always-on, not gated behind a flag: this is a local-only dev/diagnostic
@@ -162,10 +176,18 @@ export function useLocalRecorder(): UseLocalRecorderResult {
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
+  const silentGainNodeRef = useRef<GainNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const rafRef = useRef<number | null>(null);
   const chunksRef = useRef<Float32Array[]>([]);
   const frameMessageCountRef = useRef(0);
+  // Analyser-stage peak/RMS across the whole session, for direct comparison
+  // against the worklet/PCM-stage peak/RMS at stop() -- Phase 16 of the
+  // activation milestone: isolate whether a zero-signal capture is lost
+  // before or after the AudioWorkletNode.
+  const analyserPeakRef = useRef(0);
+  const analyserRmsSumRef = useRef(0);
+  const analyserRmsCountRef = useRef(0);
 
   const clickedAtRef = useRef(0);
   const workletLoadedAtRef = useRef<number | null>(null);
@@ -187,11 +209,18 @@ export function useLocalRecorder(): UseLocalRecorderResult {
       if (!analyserRef.current) return;
       analyserRef.current.getByteTimeDomainData(data);
       let sumSquares = 0;
+      let peak = 0;
       for (let i = 0; i < data.length; i++) {
         const normalized = (data[i] - 128) / 128;
         sumSquares += normalized * normalized;
+        const abs = Math.abs(normalized);
+        if (abs > peak) peak = abs;
       }
-      setLevel(Math.min(1, Math.sqrt(sumSquares / data.length) * 4));
+      const rms = Math.sqrt(sumSquares / data.length);
+      if (peak > analyserPeakRef.current) analyserPeakRef.current = peak;
+      analyserRmsSumRef.current += rms;
+      analyserRmsCountRef.current += 1;
+      setLevel(Math.min(1, rms * 4));
       rafRef.current = requestAnimationFrame(tick);
     };
     rafRef.current = requestAnimationFrame(tick);
@@ -209,6 +238,10 @@ export function useLocalRecorder(): UseLocalRecorderResult {
       workletNodeRef.current.port.onmessage = null;
       workletNodeRef.current.disconnect();
       workletNodeRef.current = null;
+    }
+    if (silentGainNodeRef.current) {
+      silentGainNodeRef.current.disconnect();
+      silentGainNodeRef.current = null;
     }
     if (sourceRef.current) {
       sourceRef.current.disconnect();
@@ -242,6 +275,9 @@ export function useLocalRecorder(): UseLocalRecorderResult {
     firstFrameAtRef.current = null;
     listeningAtRef.current = null;
     frameMessageCountRef.current = 0;
+    analyserPeakRef.current = 0;
+    analyserRmsSumRef.current = 0;
+    analyserRmsCountRef.current = 0;
 
     mark("mic click / start() invoked");
     setState("requesting");
@@ -259,12 +295,16 @@ export function useLocalRecorder(): UseLocalRecorderResult {
       streamRef.current = stream;
       setState("initializing");
 
-      // Device audit (Phase 20): confirm which physical input and which
-      // browser-applied processing is actually in effect on this hardware.
-      // deviceId is masked here too -- it's a diagnostic console log, not UI.
+      // Device audit (Phase 12/14/20): confirm which physical input, which
+      // browser-applied processing, and what actual track STATE is in effect
+      // -- deviceId is masked here too, it's a diagnostic console log, not UI.
       const track = stream.getAudioTracks()[0];
       const settings = track?.getSettings();
       mark("microphone track settings", {
+        label: track?.label || "(no label -- permission not yet fully granted, or browser policy)",
+        enabled: track?.enabled,
+        muted: track?.muted,
+        readyState: track?.readyState,
         deviceId: maskDeviceId(settings?.deviceId),
         sampleRate: settings?.sampleRate,
         channelCount: settings?.channelCount,
@@ -272,6 +312,16 @@ export function useLocalRecorder(): UseLocalRecorderResult {
         noiseSuppression: settings?.noiseSuppression,
         autoGainControl: settings?.autoGainControl,
       });
+      // How many audio-input devices Windows/the browser sees -- confirms
+      // whether a wrong-device selection is even a plausible cause before
+      // adding a selector UI for it (Phase 14/15: only add one with evidence).
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const audioInputs = devices.filter((d) => d.kind === "audioinput");
+        mark("audio input devices available", { count: audioInputs.length });
+      } catch {
+        // enumerateDevices can fail/be restricted in some contexts -- non-fatal, just skip this diagnostic
+      }
 
       const AudioContextCtor = window.AudioContext ?? (window as unknown as WebkitAudioContextWindow).webkitAudioContext;
       if (!AudioContextCtor) throw new Error("This browser doesn't support the Web Audio API.");
@@ -301,17 +351,27 @@ export function useLocalRecorder(): UseLocalRecorderResult {
       analyserRef.current = analyser;
       runLevelLoop();
 
-      // numberOfOutputs: 0 -- this node is never connected to
-      // audioContext.destination, so the microphone is never audible. Per
-      // the Web Audio spec, a zero-output node stays active as long as it
-      // has an input connection, so it keeps processing without needing a
-      // destination path (unlike ScriptProcessorNode, which required one).
+      // numberOfOutputs: 1, routed through a GainNode pinned to 0 and INTO
+      // destination -- not numberOfOutputs: 0 left disconnected. Per spec, a
+      // zero-output node should stay active purely from its input
+      // connection, but that relies on the browser's graph-liveness
+      // heuristics treating an output-less node as still worth pulling on
+      // every render quantum -- exactly the kind of edge case that can
+      // behave inconsistently in practice (Phase 17 of the activation
+      // milestone). Explicitly connecting into an active destination-reaching
+      // path guarantees the graph is pulled every quantum regardless of that
+      // heuristic, while gain=0 keeps the microphone completely inaudible --
+      // the worklet's own process() never writes to its output buffer
+      // either, so it's silent twice over.
       const workletNode = new AudioWorkletNode(audioContext, WORKLET_NODE_NAME, {
         numberOfInputs: 1,
-        numberOfOutputs: 0,
+        numberOfOutputs: 1,
         channelCount: 1,
         channelCountMode: "explicit",
       });
+      const silentGain = audioContext.createGain();
+      silentGain.gain.value = 0;
+      silentGainNodeRef.current = silentGain;
 
       let firstFrameSeen = false;
       let resolveFirstFrame: (() => void) | null = null;
@@ -331,6 +391,8 @@ export function useLocalRecorder(): UseLocalRecorderResult {
         }
       };
       source.connect(workletNode);
+      workletNode.connect(silentGain);
+      silentGain.connect(audioContext.destination);
       workletNodeRef.current = workletNode;
 
       // Don't tell the UI (and the auto-stop-on-silence timer that starts
@@ -371,6 +433,10 @@ export function useLocalRecorder(): UseLocalRecorderResult {
     chunksRef.current = [];
     const frameMessageCount = frameMessageCountRef.current;
     const stoppedAt = performance.now();
+    const analyserPeak = Number(analyserPeakRef.current.toFixed(4));
+    const analyserAvgRms = Number(
+      (analyserRmsCountRef.current > 0 ? analyserRmsSumRef.current / analyserRmsCountRef.current : 0).toFixed(4),
+    );
     teardown();
     setState("idle");
     if (chunks.length === 0) {
@@ -387,9 +453,11 @@ export function useLocalRecorder(): UseLocalRecorderResult {
         durationMs: 0,
         peakAmplitude: 0,
         rmsAmplitude: 0,
+        analyserPeak,
+        analyserAvgRms,
         wavBytes: 0,
       });
-      mark("stop() resolved with no captured audio");
+      mark("stop() resolved with no captured audio", { analyserPeak, analyserAvgRms });
       return null;
     }
     const samples = concatFloat32(chunks);
@@ -410,6 +478,8 @@ export function useLocalRecorder(): UseLocalRecorderResult {
       pcmSampleCount: samples.length,
       durationMs,
       peakAmplitude: Number(peak.toFixed(4)),
+      analyserPeak,
+      analyserAvgRms,
       rmsAmplitude: Number(rms.toFixed(4)),
       wavBytes: wav.size,
     };
@@ -421,6 +491,17 @@ export function useLocalRecorder(): UseLocalRecorderResult {
     // shipping a doomed transcription request.
     if (durationMs < 700) {
       mark("WARNING: captured audio is very short -- possible clipped/failed capture", { durationMs });
+    }
+    // Silent-PCM safety (Phase 13): a real quantization/analog noise floor
+    // is never exactly zero, but effectively-silent capture (wrong/muted
+    // device, permission granted but no signal reaching the track) sits far
+    // below any real speech peak. Sending that to Whisper is exactly how a
+    // "you." hallucination happens on genuinely empty input -- refuse
+    // instead of guessing.
+    if (peak < SILENT_PEAK_THRESHOLD) {
+      mark("WARNING: captured audio is effectively silent -- refusing to send to Whisper", { peak, rms });
+      setError("No microphone audio was detected. Check your microphone input.");
+      return null;
     }
     return wav;
   }, [teardown]);

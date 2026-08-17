@@ -4,11 +4,13 @@
 // quantum regardless of any main-thread activity, which is what
 // ScriptProcessorNode could not guarantee.
 //
-// This node is created with numberOfOutputs: 0. Per the Web Audio spec, a
-// node with zero outputs is kept alive and processed as long as it has an
-// active input connection, even though it is not reachable from
-// AudioContext.destination -- so the microphone is never connected to
-// speakers and there is no monitoring/feedback path.
+// This node is created with numberOfOutputs: 1, connected through a GainNode
+// pinned to 0 into AudioContext.destination (see useLocalRecorder.ts) --
+// guaranteeing the graph is pulled every render quantum regardless of a
+// zero-output node's active-graph heuristics, while process() below never
+// writes to `outputs`, so the buffer stays silent (all zeros) and the
+// downstream gain=0 mutes it a second time over. The microphone is never
+// actually audible.
 class PcmRecorderProcessor extends AudioWorkletProcessor {
   constructor() {
     super();

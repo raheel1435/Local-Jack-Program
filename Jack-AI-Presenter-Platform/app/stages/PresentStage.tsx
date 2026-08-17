@@ -292,6 +292,7 @@ function PresentSession({
   useEffect(() => {
     return () => {
       jack.sleep();
+      jack.sleepJackLocal(); // leaving Present mode resets local activation -- re-entering starts asleep again
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -430,6 +431,9 @@ function PresentSession({
           followMode={followMode}
           onToggleFollowMode={() => setFollowMode((m) => (m === "auto" ? "manual" : "auto"))}
           onSync={syncJackToThisSlide}
+          jackAwake={jack.jackAwake}
+          onWake={() => void jack.wakeJackLocal()}
+          onSleep={jack.sleepJackLocal}
         />
       </div>
 
