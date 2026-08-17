@@ -54,6 +54,17 @@ function presenceLabel(jackAwake: boolean, micLabel: PresentMicLabel, isPresenti
   return "Ready";
 }
 
+/**
+ * Phase 23 of the slide-sync milestone: the presence pill above already
+ * says Sleeping/Ready/Listening/Presenting -- showing jackState's own label
+ * for those same states too ("Jack is available", "Jack is sleeping") is
+ * exactly the redundant "Jack · Presenting" + "Jack is thinking" + "Control:
+ * Jack" + "● Jack is presenting" pile-up the milestone flagged. Only the
+ * genuinely transient states the pill doesn't already cover (actively
+ * thinking/speaking/acting, or something's wrong) get their own line.
+ */
+const TRANSIENT_JACK_STATES: ReadonlySet<JackState> = new Set(["thinking", "speaking", "acting", "alert"]);
+
 export function JackStatusBar({
   jackState,
   jackLabel,
@@ -82,16 +93,17 @@ export function JackStatusBar({
         <i className={`sync-dot state-${jackState}`} aria-hidden="true" />
         Jack &middot; {presenceLabel(jackAwake, micLabel, isPresentingAutonomously)}
       </button>
-      <span className="sync-item" title={jackLabel || JACK_STATES[jackState].label}>
-        {jackLabel || JACK_STATES[jackState].label}
-      </span>
+      {TRANSIENT_JACK_STATES.has(jackState) && (
+        <span className="sync-item" title={jackLabel || JACK_STATES[jackState].label}>
+          {jackLabel || JACK_STATES[jackState].label}
+        </span>
+      )}
       <span className={`sync-item connection-${localHealth}`} title={LOCAL_HEALTH_TITLE[localHealth]}>
         {LOCAL_HEALTH_LABEL[localHealth]}
       </span>
       <span className="sync-item">
         Control: <strong>{presenterControl === "jack" ? "Jack" : "Presenter"}</strong>
       </span>
-      {isPresentingAutonomously && <span className="sync-item sync-autonomous">● Jack is presenting</span>}
       <span className={`sync-item mic-${micLabel}`}>Mic: {MIC_LABEL[micLabel]}</span>
       <span className="sync-item">Slide: <strong>{slideText}</strong></span>
       <button

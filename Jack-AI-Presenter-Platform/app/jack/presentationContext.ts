@@ -21,10 +21,25 @@ export interface PresentationContext {
   nextSlideTitle?: string;
 }
 
-export function buildPresentationContext(controller: PresentationController): PresentationContext | null {
+/**
+ * `explicitSlideIndex` (0-based) overrides whatever the controller reports as
+ * "current" -- required for the auto-advance narration loop, which calls
+ * goToNextSlide() and must narrate the slide THAT CALL just moved to, not
+ * whatever a still-not-yet-refreshed "current slide" ref happens to say a
+ * moment later. React state updates (and the ref mirrors some callers use to
+ * read them synchronously) are not visible until after the next render, so
+ * querying "current" again immediately after changing it is a real race, not
+ * a hypothetical one -- confirmed live as the cause of Jack narrating "slide
+ * 2" while slide 3 was already on screen. goToNextSlide()/goToPreviousSlide()/
+ * goToSlide() already return the authoritative new index in their result;
+ * callers that just changed the slide must pass THAT value here rather than
+ * letting this function re-derive "current" from the controller.
+ */
+export function buildPresentationContext(controller: PresentationController, explicitSlideIndex?: number): PresentationContext | null {
   const ctx = controller.getPresentationContext();
   if (!ctx.success) return null;
-  const { title, totalSlides, currentSlideIndex } = ctx.data;
+  const { title, totalSlides } = ctx.data;
+  const currentSlideIndex = explicitSlideIndex ?? ctx.data.currentSlideIndex;
 
   const current = controller.getSlideContent(currentSlideIndex);
   const notes = controller.getSpeakerNotes(currentSlideIndex);

@@ -293,6 +293,7 @@ function PresentSession({
     return () => {
       jack.sleep();
       jack.sleepJackLocal(); // leaving Present mode resets local activation -- re-entering starts asleep again
+      jack.resetPresentationOpening(); // leaving Present mode is a genuinely new session next time (Phase 18)
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

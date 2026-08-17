@@ -149,6 +149,27 @@ function pickTakeoverAck(): string {
   return TAKEOVER_ACKS[Math.floor(Math.random() * TAKEOVER_ACKS.length)];
 }
 
+// Short continuity lines for "Continue" after a pause (Phase 13/14) --
+// explicitly NOT the presentation opening. Resuming mid-presentation should
+// feel like picking a conversation back up, not restarting it.
+const RESUME_LINES_HUMOROUS = [
+  "Back to it -- the slides didn't run away.",
+  "Alright, where were we? Ah, yes.",
+  "Let's continue -- I'll behave this time.",
+];
+const RESUME_LINES_PROFESSIONAL = ["Alright -- let's continue.", "Okay, picking up where we left off.", "Let's continue."];
+function pickResumeLine(humourEnabled: boolean): string {
+  const bank = humourEnabled ? RESUME_LINES_HUMOROUS : RESUME_LINES_PROFESSIONAL;
+  return bank[Math.floor(Math.random() * bank.length)];
+}
+
+// "Jack take over again" within the same session (Phase 17) -- distinct from
+// the full first-takeover acknowledgement/opening.
+const TAKEOVER_AGAIN_ACKS = ["Absolutely -- I've got it.", "Sure, I'm back on it.", "Got it -- taking over again."];
+function pickTakeoverAgainAck(): string {
+  return TAKEOVER_AGAIN_ACKS[Math.floor(Math.random() * TAKEOVER_AGAIN_ACKS.length)];
+}
+
 function transportEventType(event: unknown): string | undefined {
   if (event && typeof event === "object" && "type" in event) {
     const value = (event as { type: unknown }).type;
@@ -212,6 +233,8 @@ export interface JackContextValue {
   wakeJackLocal(): Promise<void>;
   /** Explicit local sleep -- stops any current speech/narration and resets the wake guard so the next wake greets again. */
   sleepJackLocal(): void;
+  /** Marks the presentation-opening intro not-yet-delivered (Phase 18) -- call when a presentation session genuinely ends (leaving Present mode), not on every sleep. */
+  resetPresentationOpening(): void;
   questions: QueuedQuestion[];
   wakeWordMode: "local-wake-word" | "push-to-talk";
   wakeWordAvailable: boolean;
@@ -388,6 +411,15 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const [speechPlayer] = useState(() => createJackSpeechPlayer());
   const narrationGenerationRef = useRef(0);
   const narrationActiveRef = useRef(false);
+  // Distinct from jackAwake (Phase 8): waking Jack up is a private moment
+  // with the presenter; delivering the audience-facing opening happens once
+  // per presentation session, the first time Jack actually starts
+  // presenting. Pause -> Continue, Q&A -> Continue, a temporary human
+  // handoff -> "Jack take over again", next/previous slide -- none of these
+  // reset it. Only endSession() (Exit presentation) and leaving Present mode
+  // entirely reset it, since those are the closest thing this app has to "a
+  // genuinely new session" (see resetPresentationOpening below).
+  const presentationOpeningDeliveredRef = useRef(false);
   // "idle": not listening. "guarding": mic recording started but Jack just
   // began speaking -- too early to trust levels (playback-start transient).
   // "calibrating": sampling ambient level to set an effective threshold for
@@ -439,6 +471,9 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // acknowledgement (Phase 14) -- speakThroughPlayer is defined later since
   // it depends on speechPlayer/voice.
   const speakThroughPlayerRef = useRef<(text: string) => Promise<void>>(async () => {});
+  // Same pattern, for resume()'s short continuity line (Phase 13/14) --
+  // speakAndWait is defined later since it depends on speechPlayer/voice.
+  const speakAndWaitRef = useRef<(text: string) => Promise<void>>(async () => {});
 
   const realtimeSessionRef = useRef<RealtimeSession | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -697,9 +732,16 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const resume = useCallback(() => {
     speechPlayer.unlock();
     controllerRef.current.controller.resumePresentation();
-    if (presenterControlRef.current === "jack") startAutonomousPresentingRef.current();
     dispatchEvent({ type: "RESUME" });
-  }, [dispatchEvent, speechPlayer]);
+    if (presenterControlRef.current === "jack") {
+      // Short continuity line, not the full opening (Phase 13/14) -- narration
+      // only starts once it's actually finished, so they never overlap.
+      void (async () => {
+        await speakAndWaitRef.current(pickResumeLine(humourEnabled));
+        startAutonomousPresentingRef.current();
+      })();
+    }
+  }, [dispatchEvent, speechPlayer, humourEnabled]);
 
   const interrupt = useCallback(() => {
     speechPlayer.unlock();
@@ -741,6 +783,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     setCurrentCaption("");
     humourUsedRef.current = false;
     openingPendingRef.current = false;
+    presentationOpeningDeliveredRef.current = false; // Phase 18: ending the presentation is a genuinely new session next time
     dispatchEvent({ type: "DISCONNECTED" });
   }, [teardownMic, dispatchEvent, wakeWordService]);
 
@@ -806,6 +849,10 @@ export function JackProvider({ children }: { children: ReactNode }) {
     [dispatchEvent, speechPlayer, voice],
   );
 
+  useEffect(() => {
+    speakAndWaitRef.current = speakAndWait;
+  }, [speakAndWait]);
+
   /**
    * The ONE authoritative "Read this slide" path (Phase 9/11/17): same
    * Kokoro voice as everything else, reads once and stops -- no auto-advance,
@@ -861,6 +908,17 @@ export function JackProvider({ children }: { children: ReactNode }) {
     setJackAwake(false);
   }, []);
 
+  /**
+   * Marks the presentation-opening intro as not-yet-delivered (Phase 18) --
+   * a genuinely new presentation session may hear it again. Deliberately NOT
+   * called from sleepJackLocal(): putting Jack to sleep mid-presentation and
+   * waking him again later is still the SAME session (Phase 17), so the
+   * opening must not replay just because Jack briefly slept.
+   */
+  const resetPresentationOpening = useCallback(() => {
+    presentationOpeningDeliveredRef.current = false;
+  }, []);
+
   // --- Barge-in capture teardown ------------------------------------------
   const clearBargeInCaptureTimeout = useCallback(() => {
     if (bargeInCaptureTimeoutRef.current !== null) {
@@ -891,6 +949,12 @@ export function JackProvider({ children }: { children: ReactNode }) {
     narrationActiveRef.current = false;
     setIsPresentingAutonomously(false);
     stopJackAudio();
+    // Phase 22: a caption left over from whatever Jack last said (a
+    // different slide, possibly) must not linger once that narration/audio
+    // is cancelled -- callers that immediately speak something new (pause's
+    // acknowledgement, readCurrentSlide, etc.) set their own caption right
+    // after this runs, so this only ever clears a caption nothing replaces.
+    setCurrentCaption("");
     if (bargeInPhaseRef.current !== "idle") {
       setBargeInPhaseBoth("idle");
       clearBargeInArmTimers();
@@ -901,21 +965,34 @@ export function JackProvider({ children }: { children: ReactNode }) {
   }, [stopJackAudio, clearBargeInArmTimers, clearBargeInCaptureTimeout, localRecorder, setBargeInPhaseBoth]);
 
   const runNarrationStep = useCallback(
-    async (generation: number) => {
+    // slideIndex (0-based), when given, is the AUTHORITATIVE slide to
+    // narrate -- required for the auto-advance call below, which just moved
+    // the slide forward and must not re-query "current" a moment later (see
+    // buildPresentationContext's doc comment for why that's a real race,
+    // confirmed live as the cause of Jack narrating "slide 2" on slide 3).
+    // Omitted only for the very first step of a takeover, where reading
+    // "current" is safe -- nothing just changed it in this same tick.
+    async (generation: number, slideIndex?: number) => {
       const stillCurrent = () => narrationGenerationRef.current === generation && narrationActiveRef.current;
       if (!stillCurrent()) return;
 
       const controller = controllerRef.current.controller;
-      const context: PresentationContext | null = buildPresentationContext(controller);
+      const context: PresentationContext | null = buildPresentationContext(controller, slideIndex);
       if (!context) {
         cancelAutonomousPresenting();
         return;
       }
 
       dispatchEvent({ type: "LOCAL_COMMAND_START" }); // -> thinking
+      // Decided (not just checked) here, before generation: the model is
+      // about to be told "this is the opening" or "you already opened" one
+      // way or the other, so the flag must reflect that choice from this
+      // point on, even if this specific narration attempt later fails.
+      const isOpening = !presentationOpeningDeliveredRef.current;
+      presentationOpeningDeliveredRef.current = true;
       let narrationText: string;
       try {
-        narrationText = await generateSlideNarration(context);
+        narrationText = await generateSlideNarration(context, isOpening, humourEnabled);
       } catch (err) {
         // Phase 17: LLM failure during autonomy -- stop, don't guess, stay put.
         cancelAutonomousPresenting();
@@ -948,10 +1025,12 @@ export function JackProvider({ children }: { children: ReactNode }) {
           cancelAutonomousPresenting();
           return;
         }
-        void runNarrationStep(generation);
+        // Pass the index goToNextSlide() just returned, not "whatever
+        // current looks like now" -- see runNarrationStep's param comment.
+        void runNarrationStep(generation, advance.data.index);
       });
     },
-    [cancelAutonomousPresenting, dispatchEvent, speechPlayer, voice],
+    [cancelAutonomousPresenting, dispatchEvent, speechPlayer, voice, humourEnabled],
   );
 
   const startAutonomousPresenting = useCallback(() => {
@@ -1176,9 +1255,15 @@ export function JackProvider({ children }: { children: ReactNode }) {
               // and only once THAT finishes does narration begin (Phase 21:
               // never talk over the previous utterance). Already-awake is
               // the common case and skips straight to the acknowledgement.
+              // Phase 17: a repeat takeover in the SAME session (opening
+              // already delivered at some earlier point) gets the short
+              // "taking over again" ack, never the first-takeover one --
+              // the opening flag itself is what runNarrationStep uses to
+              // decide whether to actually deliver the audience intro.
+              const ack = presentationOpeningDeliveredRef.current ? pickTakeoverAgainAck() : pickTakeoverAck();
               void (async () => {
                 if (!jackAwakeRef.current) await wakeJackLocal();
-                await speakAndWait(pickTakeoverAck());
+                await speakAndWait(ack);
                 startAutonomousPresenting();
               })();
             }
@@ -1214,8 +1299,14 @@ export function JackProvider({ children }: { children: ReactNode }) {
           case "resume_presentation":
             result = controller.resumePresentation();
             if (result.success && presenterControlRef.current === "jack") {
-              // Phase 10: regenerate/restart narration for the CURRENT slide -- never skip ahead.
-              startAutonomousPresenting();
+              // Phase 13/14: short continuity line, NOT the full opening --
+              // narration only starts once it's actually finished speaking,
+              // so they never overlap. Regenerates for the CURRENT slide,
+              // never skips ahead.
+              void (async () => {
+                await speakAndWait(pickResumeLine(humourEnabled));
+                startAutonomousPresenting();
+              })();
             }
             break;
           case "handoff_to_presenter":
@@ -1260,6 +1351,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       speechPlayer,
       wakeJackLocal,
       speakAndWait,
+      humourEnabled,
     ],
   );
 
@@ -1382,6 +1474,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     jackAwake,
     wakeJackLocal,
     sleepJackLocal,
+    resetPresentationOpening,
     questions,
     wakeWordMode: wakeWordService.mode,
     wakeWordAvailable: wakeWordService.available,
