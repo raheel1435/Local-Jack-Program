@@ -9,13 +9,51 @@ import { useCallback, useEffect, useRef, useState } from "react";
  * (miniaudio + stb_vorbis; no ffmpeg on this machine) cannot read. Capturing
  * raw PCM via Web Audio and hand-encoding a WAV header sidesteps that
  * entirely and needs no new dependency.
+ *
+ * Capture core: AudioWorkletNode (public/audio-worklet/pcm-recorder-processor.js),
+ * not ScriptProcessorNode. ScriptProcessorNode passed the user's real
+ * microphone test (fee60b7) in automated/fake-mic testing but failed on real
+ * hardware -- the user got "you." for a full sentence. ScriptProcessorNode
+ * runs on the main thread and only guarantees delivery once per full buffer
+ * (1024 samples => ~21ms floor at 48kHz, worse under any main-thread
+ * contention); AudioWorkletNode runs on the audio rendering thread and is
+ * called every 128-sample quantum regardless of main-thread load.
  */
-export type LocalRecorderState = "idle" | "requesting" | "initializing" | "listening" | "error";
+export type LocalRecorderState =
+  | "idle"
+  | "requesting"
+  | "initializing"
+  | "listening"
+  | "processing"
+  | "error";
+
+/** Dev-only diagnostics for the most recently completed recording. Never
+ * includes the actual audio samples -- see Phase 10/11 of the AudioWorklet
+ * migration milestone. Exists to make a defective capture (e.g. a "you."
+ * transcript from a real multi-word utterance) diagnosable from timestamps
+ * and levels alone, without saving audio. */
+export interface RecorderMetrics {
+  sampleRate: number;
+  workletLoadedAt: number | null;
+  firstFrameAt: number | null;
+  listeningAt: number | null;
+  stoppedAt: number;
+  /** ms from click (start() invoked) to the first real PCM frame arriving. */
+  captureStartLatencyMs: number | null;
+  frameMessageCount: number;
+  pcmSampleCount: number;
+  durationMs: number;
+  peakAmplitude: number;
+  rmsAmplitude: number;
+  wavBytes: number;
+}
 
 export interface UseLocalRecorderResult {
   state: LocalRecorderState;
   level: number;
   error: string | null;
+  /** Diagnostics for the most recently completed (stop()-resolved) recording. */
+  metrics: RecorderMetrics | null;
   start(): Promise<void>;
   /** Stops capture and resolves with a WAV blob, or null if nothing was captured. */
   stop(): Promise<Blob | null>;
@@ -25,14 +63,17 @@ interface WebkitAudioContextWindow {
   webkitAudioContext?: typeof AudioContext;
 }
 
+const WORKLET_URL = "/audio-worklet/pcm-recorder-processor.js";
+const WORKLET_NODE_NAME = "pcm-recorder-processor";
+
 // Real hardware (echoCancellation/noiseSuppression/autoGainControl warm-up,
 // getUserMedia device negotiation) can add real, variable latency before
 // audio genuinely starts flowing -- observed as a user's first word being
 // clipped when the UI said "Listening" before samples were actually being
-// captured. If the very first buffer hasn't arrived within this long,
+// captured. If the very first frame hasn't arrived within this long,
 // something is unusually slow; proceed rather than hang the mic button
 // forever, but this should be rare in practice.
-const FIRST_BUFFER_TIMEOUT_MS = 2000;
+const FIRST_FRAME_TIMEOUT_MS = 2000;
 
 function mark(label: string, extra?: Record<string, unknown>) {
   // Always-on, not gated behind a flag: this is a local-only dev/diagnostic
@@ -62,6 +103,11 @@ function encodeWav(samples: Float32Array, sampleRate: number): Blob {
   view.setUint32(16, 16, true);
   view.setUint16(20, 1, true); // PCM
   view.setUint16(22, 1, true); // mono
+  // Real device/AudioContext sample rate (typically 44.1kHz or 48kHz), never
+  // a hardcoded 16kHz -- whisper.cpp's miniaudio-based decoder resamples to
+  // its required 16kHz internally from whatever rate the WAV header
+  // declares, so the header must state the truth (see LOCAL_JACK_RUNTIME.md
+  // / whisper.cpp's common-whisper.cpp ma_decoder_config_init call).
   view.setUint32(24, sampleRate, true);
   view.setUint32(28, sampleRate * blockAlign, true);
   view.setUint16(32, blockAlign, true);
@@ -89,18 +135,42 @@ function concatFloat32(chunks: Float32Array[]): Float32Array {
   return out;
 }
 
+function computePeakAndRms(samples: Float32Array): { peak: number; rms: number } {
+  let peak = 0;
+  let sumSquares = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const abs = Math.abs(samples[i]);
+    if (abs > peak) peak = abs;
+    sumSquares += samples[i] * samples[i];
+  }
+  return { peak, rms: samples.length > 0 ? Math.sqrt(sumSquares / samples.length) : 0 };
+}
+
+/** Masks a device id for logs -- diagnostic, never shown in UI (Phase 20). */
+function maskDeviceId(id: string | undefined): string {
+  if (!id) return "(none)";
+  return id.length <= 8 ? "***" : `${id.slice(0, 8)}…`;
+}
+
 export function useLocalRecorder(): UseLocalRecorderResult {
   const [state, setState] = useState<LocalRecorderState>("idle");
   const [level, setLevel] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [metrics, setMetrics] = useState<RecorderMetrics | null>(null);
 
   const streamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const rafRef = useRef<number | null>(null);
   const chunksRef = useRef<Float32Array[]>([]);
+  const frameMessageCountRef = useRef(0);
+
+  const clickedAtRef = useRef(0);
+  const workletLoadedAtRef = useRef<number | null>(null);
+  const firstFrameAtRef = useRef<number | null>(null);
+  const listeningAtRef = useRef<number | null>(null);
 
   const stopLevelLoop = useCallback(() => {
     if (rafRef.current !== null) {
@@ -130,10 +200,15 @@ export function useLocalRecorder(): UseLocalRecorderResult {
   const teardown = useCallback(() => {
     stopLevelLoop();
     setLevel(0);
-    if (processorRef.current) {
-      processorRef.current.onaudioprocess = null;
-      processorRef.current.disconnect();
-      processorRef.current = null;
+    if (workletNodeRef.current) {
+      try {
+        workletNodeRef.current.port.postMessage("stop");
+      } catch {
+        // context/port may already be gone
+      }
+      workletNodeRef.current.port.onmessage = null;
+      workletNodeRef.current.disconnect();
+      workletNodeRef.current = null;
     }
     if (sourceRef.current) {
       sourceRef.current.disconnect();
@@ -162,6 +237,12 @@ export function useLocalRecorder(): UseLocalRecorderResult {
       teardown();
     }
 
+    clickedAtRef.current = performance.now();
+    workletLoadedAtRef.current = null;
+    firstFrameAtRef.current = null;
+    listeningAtRef.current = null;
+    frameMessageCountRef.current = 0;
+
     mark("mic click / start() invoked");
     setState("requesting");
     setError(null);
@@ -178,6 +259,20 @@ export function useLocalRecorder(): UseLocalRecorderResult {
       streamRef.current = stream;
       setState("initializing");
 
+      // Device audit (Phase 20): confirm which physical input and which
+      // browser-applied processing is actually in effect on this hardware.
+      // deviceId is masked here too -- it's a diagnostic console log, not UI.
+      const track = stream.getAudioTracks()[0];
+      const settings = track?.getSettings();
+      mark("microphone track settings", {
+        deviceId: maskDeviceId(settings?.deviceId),
+        sampleRate: settings?.sampleRate,
+        channelCount: settings?.channelCount,
+        echoCancellation: settings?.echoCancellation,
+        noiseSuppression: settings?.noiseSuppression,
+        autoGainControl: settings?.autoGainControl,
+      });
+
       const AudioContextCtor = window.AudioContext ?? (window as unknown as WebkitAudioContextWindow).webkitAudioContext;
       if (!AudioContextCtor) throw new Error("This browser doesn't support the Web Audio API.");
       const audioContext = new AudioContextCtor();
@@ -189,6 +284,14 @@ export function useLocalRecorder(): UseLocalRecorderResult {
       await audioContext.resume();
       mark("AudioContext running", { sampleRate: audioContext.sampleRate, state: audioContext.state });
 
+      // addModule is per-AudioContext-instance (worklet modules aren't
+      // globally shared across contexts), so this re-registers on every
+      // start() -- the browser's HTTP cache makes the actual fetch cheap
+      // after the first load.
+      await audioContext.audioWorklet.addModule(WORKLET_URL);
+      workletLoadedAtRef.current = performance.now();
+      mark("AudioWorklet module loaded");
+
       const source = audioContext.createMediaStreamSource(stream);
       sourceRef.current = source;
 
@@ -198,33 +301,37 @@ export function useLocalRecorder(): UseLocalRecorderResult {
       analyserRef.current = analyser;
       runLevelLoop();
 
-      // ScriptProcessorNode is deprecated but universally supported and
-      // avoids shipping a separate AudioWorklet module for this milestone's
-      // short push-to-talk captures. Buffer size reduced from the previous
-      // 4096 (~85ms at 48kHz) to 1024 (~21ms) -- this is ScriptProcessorNode's
-      // own inherent "time until the first callback can possibly fire" floor,
-      // and smaller buffers mean less of a user's first word can be lost to
-      // it while still being comfortably cheap to process.
-      const processor = audioContext.createScriptProcessor(1024, 1, 1);
-      let firstBufferSeen = false;
-      let resolveFirstBuffer: (() => void) | null = null;
-      const firstBufferPromise = new Promise<void>((resolve) => {
-        resolveFirstBuffer = resolve;
+      // numberOfOutputs: 0 -- this node is never connected to
+      // audioContext.destination, so the microphone is never audible. Per
+      // the Web Audio spec, a zero-output node stays active as long as it
+      // has an input connection, so it keeps processing without needing a
+      // destination path (unlike ScriptProcessorNode, which required one).
+      const workletNode = new AudioWorkletNode(audioContext, WORKLET_NODE_NAME, {
+        numberOfInputs: 1,
+        numberOfOutputs: 0,
+        channelCount: 1,
+        channelCountMode: "explicit",
       });
-      processor.onaudioprocess = (event) => {
-        chunksRef.current.push(new Float32Array(event.inputBuffer.getChannelData(0)));
-        if (!firstBufferSeen) {
-          firstBufferSeen = true;
-          mark("first audio buffer received -- genuinely capturing now");
-          resolveFirstBuffer?.();
+
+      let firstFrameSeen = false;
+      let resolveFirstFrame: (() => void) | null = null;
+      const firstFramePromise = new Promise<void>((resolve) => {
+        resolveFirstFrame = resolve;
+      });
+      workletNode.port.onmessage = (event: MessageEvent<Float32Array>) => {
+        chunksRef.current.push(event.data);
+        frameMessageCountRef.current += 1;
+        if (!firstFrameSeen) {
+          firstFrameSeen = true;
+          firstFrameAtRef.current = performance.now();
+          mark("first PCM frame received -- genuinely capturing now", {
+            captureStartLatencyMs: Math.round(firstFrameAtRef.current - clickedAtRef.current),
+          });
+          resolveFirstFrame?.();
         }
       };
-      source.connect(processor);
-      // A ScriptProcessorNode only fires onaudioprocess while it has a path
-      // to the destination. Silent, not a feedback loop: onaudioprocess
-      // below never writes to event.outputBuffer, so it stays all-zero.
-      processor.connect(audioContext.destination);
-      processorRef.current = processor;
+      source.connect(workletNode);
+      workletNodeRef.current = workletNode;
 
       // Don't tell the UI (and the auto-stop-on-silence timer that starts
       // once this resolves) that we're "Listening" until audio is actually
@@ -233,13 +340,14 @@ export function useLocalRecorder(): UseLocalRecorderResult {
       // happened invisibly. Falls back to proceeding anyway after a timeout
       // so a genuinely stalled first callback can't hang the mic button.
       await Promise.race([
-        firstBufferPromise,
-        new Promise<void>((resolve) => setTimeout(resolve, FIRST_BUFFER_TIMEOUT_MS)),
+        firstFramePromise,
+        new Promise<void>((resolve) => setTimeout(resolve, FIRST_FRAME_TIMEOUT_MS)),
       ]);
-      if (!firstBufferSeen) {
-        mark("WARNING: first buffer did not arrive within timeout -- proceeding anyway");
+      if (!firstFrameSeen) {
+        mark("WARNING: first PCM frame did not arrive within timeout -- proceeding anyway");
       }
 
+      listeningAtRef.current = performance.now();
       setState("listening");
       mark("Listening shown to user");
     } catch (err) {
@@ -257,19 +365,67 @@ export function useLocalRecorder(): UseLocalRecorderResult {
 
   const stop = useCallback(async (): Promise<Blob | null> => {
     mark("recording stopped");
+    setState("processing");
     const sampleRate = audioContextRef.current?.sampleRate ?? 48000;
     const chunks = chunksRef.current;
     chunksRef.current = [];
+    const frameMessageCount = frameMessageCountRef.current;
+    const stoppedAt = performance.now();
     teardown();
     setState("idle");
-    if (chunks.length === 0) return null;
+    if (chunks.length === 0) {
+      setMetrics({
+        sampleRate,
+        workletLoadedAt: workletLoadedAtRef.current,
+        firstFrameAt: firstFrameAtRef.current,
+        listeningAt: listeningAtRef.current,
+        stoppedAt,
+        captureStartLatencyMs:
+          firstFrameAtRef.current !== null ? Math.round(firstFrameAtRef.current - clickedAtRef.current) : null,
+        frameMessageCount,
+        pcmSampleCount: 0,
+        durationMs: 0,
+        peakAmplitude: 0,
+        rmsAmplitude: 0,
+        wavBytes: 0,
+      });
+      mark("stop() resolved with no captured audio");
+      return null;
+    }
     const samples = concatFloat32(chunks);
     if (samples.length === 0) return null;
-    mark("WAV encoded, ready to send", { durationMs: Math.round((samples.length / sampleRate) * 1000) });
-    return encodeWav(samples, sampleRate);
+    const { peak, rms } = computePeakAndRms(samples);
+    const durationMs = Math.round((samples.length / sampleRate) * 1000);
+    const wav = encodeWav(samples, sampleRate);
+
+    const recorderMetrics: RecorderMetrics = {
+      sampleRate,
+      workletLoadedAt: workletLoadedAtRef.current,
+      firstFrameAt: firstFrameAtRef.current,
+      listeningAt: listeningAtRef.current,
+      stoppedAt,
+      captureStartLatencyMs:
+        firstFrameAtRef.current !== null ? Math.round(firstFrameAtRef.current - clickedAtRef.current) : null,
+      frameMessageCount,
+      pcmSampleCount: samples.length,
+      durationMs,
+      peakAmplitude: Number(peak.toFixed(4)),
+      rmsAmplitude: Number(rms.toFixed(4)),
+      wavBytes: wav.size,
+    };
+    setMetrics(recorderMetrics);
+    mark("WAV encoded, ready to send", recorderMetrics as unknown as Record<string, unknown>);
+    // A clearly multi-word utterance producing a very short WAV (a few
+    // hundred ms) is the concrete real-hardware failure signature this
+    // migration exists to fix -- flag it loudly rather than silently
+    // shipping a doomed transcription request.
+    if (durationMs < 700) {
+      mark("WARNING: captured audio is very short -- possible clipped/failed capture", { durationMs });
+    }
+    return wav;
   }, [teardown]);
 
   useEffect(() => teardown, [teardown]);
 
-  return { state, level, error, start, stop };
+  return { state, level, error, metrics, start, stop };
 }
