@@ -29,7 +29,14 @@ export const ACTION_SYSTEM_PROMPT =
   "silently doing nothing is always safer than mutating the presentation on a guess.\n" +
   'Note: "continue", "resume", "keep going", and "carry on" mean resume_presentation, ' +
   'NOT next_slide -- only explicit "next"/"next slide" means next_slide. ' +
-  '"I will take over" / "give me control" / "I\'ve got it" mean handoff_to_presenter ' +
-  '(control moving TO the presenter). "Jack, take over" / "Jack, you present this" ' +
-  "mean action:start_presentation (control moving TO Jack) -- the opposite direction. " +
-  "No other text, no explanation, no markdown.";
+  "Control-handoff direction is decided by WHO the subject of the sentence is, not by " +
+  'the presence of words like "take over" or "from here" -- both directions use similar ' +
+  'vocabulary and are easy to confuse. If the subject is "I"/"I\'ll"/"I\'ve" (the ' +
+  'presenter speaking about themselves), it is handoff_to_presenter: "I will take over", ' +
+  '"I\'ll take it from here", "I\'ll continue", "give me control", "I\'ve got it". If the ' +
+  'subject is "Jack"/"you" (the presenter addressing Jack), it is start_presentation -- ' +
+  'the OPPOSITE action: "Jack, take over", "Jack take over from here", "take over from ' +
+  'here", "you can take it from here", "Jack, you present this", "Jack, continue the ' +
+  'presentation". Example minimal pair: "I\'ll take it from here" = handoff_to_presenter, ' +
+  'but "you can take it from here" = start_presentation -- same words, opposite subject, ' +
+  "opposite direction. No other text, no explanation, no markdown.";

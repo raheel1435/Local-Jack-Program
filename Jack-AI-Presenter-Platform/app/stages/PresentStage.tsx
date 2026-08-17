@@ -7,7 +7,7 @@ import { PresentSetup } from "../components/PresentSetup";
 import { useAutoHideControls } from "../hooks/useAutoHideControls";
 import { useFullscreen } from "../hooks/useFullscreen";
 import { useSpeech } from "../hooks/useSpeech";
-import { useJack, type LocalCommandOutcome } from "../jack/JackProvider";
+import { useJack } from "../jack/JackProvider";
 import { searchDocuments } from "../jack/documentContext";
 import { fail, ok, type PresentationController } from "../jack/presentationController";
 import { openPdfForRender, type PdfRenderHandle } from "../lib/parsers/pdf";
@@ -82,11 +82,22 @@ function PresentSession({
   const [commandPanelOpen, setCommandPanelOpen] = useState(false);
   const [commandInput, setCommandInput] = useState("");
   const [commandBusy, setCommandBusy] = useState(false);
-  const [lastCommandResult, setLastCommandResult] = useState<LocalCommandOutcome | null>(null);
-  const [lastTranscript, setLastTranscript] = useState<string | null>(null);
 
   const offlineSpeech = useSpeech();
+  // Shared visibility model for BOTH the top status bar and the bottom
+  // controls -- one set of mouse/keyboard/touch listeners, one fade timer,
+  // so they always show and hide together rather than as two independently
+  // behaving strips. Exceptions below keep chrome visible whenever hiding it
+  // would make state genuinely hard to recover or understand: an open
+  // command input, active listening, the notes panel, or an error that
+  // needs the user's attention.
   const controlsVisible = useAutoHideControls(3500);
+  const chromeVisible =
+    controlsVisible ||
+    commandPanelOpen ||
+    jack.localMicState === "listening" ||
+    showNotes ||
+    Boolean(jack.lastError);
   const fullscreen = useFullscreen(stageRef);
 
   // Auto-stop-on-silence bookkeeping for push-to-talk (see constants above).
@@ -295,10 +306,11 @@ function PresentSession({
     if (!text || commandBusy) return;
     setCommandBusy(true);
     setCommandInput("");
-    setLastTranscript(null);
     try {
-      const outcome = await jack.runLocalCommand(text);
-      setLastCommandResult(outcome);
+      // runLocalCommand itself records the outcome into jack.lastCommand* --
+      // nothing to track locally, which is exactly what avoids the stale-
+      // feedback bug this replaced (see the interface comment in JackProvider).
+      await jack.runLocalCommand(text, "typed");
     } finally {
       setCommandBusy(false);
     }
@@ -311,41 +323,25 @@ function PresentSession({
     }
   }
 
-  /** Stops the recording (however it was triggered -- manual click or auto-silence) and
-   * surfaces exactly one of the three required feedback states: heard+result, "couldn't
-   * understand", or "Jack Local AI unavailable". Guarded against the manual-click and
-   * auto-stop-timer paths both firing (whichever gets here first wins; see startListening). */
+  /** Stops the recording (however it was triggered -- manual click or auto-silence).
+   * stopLocalListening/runLocalCommand already record the outcome into
+   * jack.lastCommand* for every one of their exit paths (no audio, empty
+   * transcript, transcription failure, or a real result) -- this function
+   * only needs to guard against the manual-click and auto-stop-timer paths
+   * both firing (whichever gets here first wins; see startListening). */
   async function stopAndProcess() {
     if (localListenStoppingRef.current) return;
     localListenStoppingRef.current = true;
     clearLocalListenTimer();
     setCommandBusy(true);
     try {
-      const result = await jack.stopLocalListening();
-      if (result && result.transcript) {
-        setLastTranscript(result.transcript);
-        setLastCommandResult(result.outcome);
-      } else if (result && !result.transcript) {
-        // stopLocalListening's catch path -- a real transcription request failure, not just silence.
-        setLastTranscript(null);
-        setLastCommandResult({
-          source: result.outcome.source,
-          ok: false,
-          message: whisperUnavailable ? "Jack Local AI unavailable." : "Couldn't understand that.",
-        });
-      } else {
-        // No audio captured, or transcript came back empty -- genuinely nothing to work with.
-        setLastTranscript(null);
-        setLastCommandResult({ source: "deterministic", ok: false, message: "Couldn't understand that." });
-      }
+      await jack.stopLocalListening();
     } finally {
       setCommandBusy(false);
     }
   }
 
   function startListening() {
-    setLastTranscript(null);
-    setLastCommandResult(null);
     localListenStoppingRef.current = false;
     void (async () => {
       await jack.startLocalListening();
@@ -378,34 +374,34 @@ function PresentSession({
   const presentMicLabel: "off" | "listening" | "processing" =
     jack.localMicState === "listening" ? "listening" : commandBusy ? "processing" : "off";
 
-  // Single compact feedback line -- an interruption result (event-driven, during
-  // autonomous narration) takes priority over a push-to-talk result, since it's
-  // the more recent/urgent of the two when both could theoretically be set.
-  const feedback = jack.lastLocalCommandOutcome
+  // Single compact feedback line, driven by the ONE shared lastCommand* state
+  // in JackProvider -- whichever call (typed, voice, or an interruption) most
+  // recently ran is what shows here, never a stale result from an earlier one.
+  const feedback = jack.lastCommandOutcome
     ? {
-        prefix: "Interruption",
-        heard: jack.lastBargeInTranscript,
-        outcome: jack.lastLocalCommandOutcome,
+        prefix: jack.lastCommandKind === "interruption" ? "Interruption" : null,
+        heard: jack.lastCommandTranscript,
+        outcome: jack.lastCommandOutcome,
       }
-    : lastCommandResult
-      ? { prefix: null, heard: lastTranscript, outcome: lastCommandResult }
-      : null;
+    : null;
 
   return (
     <div ref={stageRef} className="present-stage-root">
-      <JackStatusBar
-        jackState={jack.orb.orbState}
-        jackLabel={jack.orb.label}
-        localHealth={localHealth}
-        presenterControl={jack.presenterControl}
-        isPresentingAutonomously={jack.isPresentingAutonomously}
-        micLabel={presentMicLabel}
-        slideText={`${sectionIndex + 1} / ${sections.length}`}
-        inSync={inSync}
-        followMode={followMode}
-        onToggleFollowMode={() => setFollowMode((m) => (m === "auto" ? "manual" : "auto"))}
-        onSync={syncJackToThisSlide}
-      />
+      <div className={`present-topbar ${chromeVisible ? "" : "controls-hidden"}`}>
+        <JackStatusBar
+          jackState={jack.orb.orbState}
+          jackLabel={jack.orb.label}
+          localHealth={localHealth}
+          presenterControl={jack.presenterControl}
+          isPresentingAutonomously={jack.isPresentingAutonomously}
+          micLabel={presentMicLabel}
+          slideText={`${sectionIndex + 1} / ${sections.length}`}
+          inSync={inSync}
+          followMode={followMode}
+          onToggleFollowMode={() => setFollowMode((m) => (m === "auto" ? "manual" : "auto"))}
+          onSync={syncJackToThisSlide}
+        />
+      </div>
 
       <div className="present-content">
         {doc.format === "pdf" ? (
@@ -487,7 +483,7 @@ function PresentSession({
         </aside>
       )}
 
-      <div className={`present-controls ${controlsVisible ? "" : "controls-hidden"}`}>
+      <div className={`present-controls ${chromeVisible ? "" : "controls-hidden"}`}>
         <button type="button" onClick={() => goTo(sectionIndex - 1)} disabled={sectionIndex === 0} aria-label="Previous slide">‹ Prev</button>
         <span className="present-position">{sectionIndex + 1} / {sections.length}</span>
         <div className="present-progress"><i style={{ width: `${((sectionIndex + 1) / sections.length) * 100}%` }} /></div>

@@ -33,6 +33,16 @@ const ACTION_RULES: ActionRule[] = [
       // this exact phrase as the compound word "takeover" -- observed live
       // during real-hardware voice testing, not a hypothetical.
       /^jack,?\s+(take ?over|you (take it|present this)|please present)( now)?\.?$/,
+      // Realistic phrasing variants, all still addressed TO Jack (subject is
+      // "you"/"Jack", never "I"/"I'll") -- confirmed live that without these,
+      // "Jack take over from here." fell through to the LLM, which
+      // misclassified it as handoff_to_presenter (the OPPOSITE of what it
+      // means) by pattern-matching on "take it/take over from here" too
+      // loosely against "I'll take it from here" below.
+      /^(jack,?\s+)?take ?over from (here|there)\.?$/,
+      /^you (can )?take it from (here|there)\.?$/,
+      /^jack,?\s+you present( this)?( now)?\.?$/,
+      /^jack,?\s+continue( the presentation)?\.?$/,
     ],
   },
   {
@@ -69,6 +79,7 @@ const ACTION_RULES: ActionRule[] = [
     patterns: [
       /^i('| wi)ll take ?over( now)?\.?$/,
       /^i('| wi)ll take it from (here|there)\.?$/,
+      /^i('| wi)ll continue\.?$/,
       /^(give|hand)( me| back)? (the )?control( back)?\.?$/,
       /^let me (take ?over|continue)\.?$/,
       /^i('| ha)ve (got|got it|it)\.?$/,

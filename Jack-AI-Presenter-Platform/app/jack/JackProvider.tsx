@@ -146,7 +146,7 @@ export interface JackContextValue {
    * This is the local-brain equivalent of the OpenAI tool-calling path --
    * both ultimately drive the same controller, never raw UI state.
    */
-  runLocalCommand(text: string): Promise<LocalCommandOutcome>;
+  runLocalCommand(text: string, kind?: "typed" | "voice" | "interruption"): Promise<LocalCommandOutcome>;
 
   /** Push-to-talk capture -> whisper.cpp -> runLocalCommand, entirely local (no OpenAI). */
   localMicState: LocalRecorderState;
@@ -158,9 +158,21 @@ export interface JackContextValue {
   /** True while Jack's autonomous narrate-then-advance loop is running (presenterControl === "jack" and not paused/interrupted). */
   isPresentingAutonomously: boolean;
 
-  /** Set only by barge-in (typed/push-to-talk callers already get this as runLocalCommand's/stopLocalListening's return value). */
-  lastBargeInTranscript: string | null;
-  lastLocalCommandOutcome: LocalCommandOutcome | null;
+  /**
+   * The single most recent local-command result, regardless of whether it
+   * came from a typed command, push-to-talk, or a barge-in interruption --
+   * all three ultimately go through runLocalCommand, which is the only place
+   * that sets these. Deliberately NOT split into per-source state: an
+   * earlier design tracked barge-in and typed/voice outcomes separately and
+   * let the UI prioritize barge-in unconditionally, which meant one stray
+   * interruption could permanently shadow every later command's feedback
+   * with a stale message, no matter how much more recently the later command
+   * ran. A single source of truth, updated at the one place that handles
+   * every call, cannot go stale like that.
+   */
+  lastCommandTranscript: string | null;
+  lastCommandOutcome: LocalCommandOutcome | null;
+  lastCommandKind: "typed" | "voice" | "interruption" | null;
 
   /** Barge-in ambient-listening phase -- for a subtle dev/status indicator only (Phase 13), not part of the main presentation UI. */
   bargeInPhase: "idle" | "guarding" | "calibrating" | "armed" | "capturing";
@@ -195,8 +207,17 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const [micLevel, setMicLevel] = useState(0);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [currentCaption, setCurrentCaption] = useState("");
-  const [lastLocalCommandOutcome, setLastLocalCommandOutcome] = useState<LocalCommandOutcome | null>(null);
-  const [lastBargeInTranscript, setLastBargeInTranscript] = useState<string | null>(null);
+  const [lastCommandOutcome, setLastCommandOutcome] = useState<LocalCommandOutcome | null>(null);
+  const [lastCommandTranscript, setLastCommandTranscript] = useState<string | null>(null);
+  const [lastCommandKind, setLastCommandKind] = useState<"typed" | "voice" | "interruption" | null>(null);
+  const recordCommandOutcome = useCallback(
+    (transcript: string, outcome: LocalCommandOutcome, kind: "typed" | "voice" | "interruption") => {
+      setLastCommandTranscript(transcript || null);
+      setLastCommandOutcome(outcome);
+      setLastCommandKind(kind);
+    },
+    [],
+  );
   const [lastError, setLastError] = useState<string | null>(null);
   const [controlMode, setControlModeState] = useState<ControlMode>("presenterLeads");
   const [audienceQuestionPolicy, setAudienceQuestionPolicyState] = useState<AudienceQuestionPolicy>("askPresenterFirst");
@@ -254,7 +275,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // Lets finishBargeInCapture (defined before runLocalCommand, since
   // runLocalCommand itself needs the barge-in machinery) call the latest
   // runLocalCommand without a circular useCallback dependency.
-  const runLocalCommandRef = useRef<(text: string) => Promise<LocalCommandOutcome>>(
+  const runLocalCommandRef = useRef<(text: string, kind?: "typed" | "voice" | "interruption") => Promise<LocalCommandOutcome>>(
     async () => ({ source: "deterministic", ok: false, message: "Jack isn't ready yet." }),
   );
   // Same forward-reference pattern for pause()/resume() (defined earlier,
@@ -704,13 +725,11 @@ export function JackProvider({ children }: { children: ReactNode }) {
         return;
       }
       // Reuses the exact same intent-routing path as typed/push-to-talk
-      // input -- interruption is just another way text reaches Jack. The
-      // outcome is captured here (unlike typed/mic-button input, nothing
-      // else is listening for this call's return value) so the UI can show
-      // what an interruption actually resulted in.
-      setLastBargeInTranscript(transcript);
-      const outcome = await runLocalCommandRef.current(transcript);
-      setLastLocalCommandOutcome(outcome);
+      // input -- interruption is just another way text reaches Jack.
+      // runLocalCommand itself records the outcome (kind: "interruption")
+      // into the single shared lastCommand* state -- no separate tracking
+      // needed here, and nothing about to become stale later.
+      await runLocalCommandRef.current(transcript, "interruption");
     } catch (err) {
       dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
       setLastError(err instanceof Error ? err.message : "Transcription failed.");
@@ -821,7 +840,15 @@ export function JackProvider({ children }: { children: ReactNode }) {
   }, [localRecorder.level, handleBargeInDetected]);
 
   const runLocalCommand = useCallback(
-    async (text: string): Promise<LocalCommandOutcome> => {
+    async (text: string, kind: "typed" | "voice" | "interruption" = "typed"): Promise<LocalCommandOutcome> => {
+      // Every exit path funnels through here so lastCommand* always reflects
+      // whichever call to runLocalCommand most recently finished -- see the
+      // comment on lastCommandOutcome in the context interface above.
+      const finish = (outcome: LocalCommandOutcome) => {
+        recordCommandOutcome(text, outcome, kind);
+        return outcome;
+      };
+
       dispatchEvent({ type: "LOCAL_COMMAND_START" });
       const controller = controllerRef.current.controller;
       try {
@@ -833,7 +860,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
         // below, no matter what the model happened to put in `action`.
         if (intent.type === "unknown") {
           dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
-          return { source: intent.source, ok: false, message: "I didn't catch a presentation command there." };
+          return finish({ source: intent.source, ok: false, message: "I didn't catch a presentation command there." });
         }
 
         if (intent.type === "conversation") {
@@ -851,7 +878,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
           setCurrentCaption(answer);
           dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
           void speakThroughPlayer(answer);
-          return { source: intent.source, ok: true, message: answer };
+          return finish({ source: intent.source, ok: true, message: answer });
         }
 
         const action = intent.action as JackIntentAction | undefined;
@@ -868,7 +895,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
           setCurrentCaption(chat.content);
           dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
           void speakThroughPlayer(chat.content);
-          return { source: intent.source, action, ok: true, message: chat.content };
+          return finish({ source: intent.source, action, ok: true, message: chat.content });
         }
 
         let result: { success: boolean; error?: string } | null = null;
@@ -929,22 +956,22 @@ export function JackProvider({ children }: { children: ReactNode }) {
         }
 
         dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
-        return {
+        return finish({
           source: intent.source,
           action,
           ok: result?.success ?? false,
           message: result?.success ? undefined : result?.error,
-        };
+        });
       } catch (err) {
         dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
-        return {
+        return finish({
           source: "llm",
           ok: false,
           message: err instanceof Error ? err.message : "Local Jack request failed.",
-        };
+        });
       }
     },
-    [dispatchEvent, cancelAutonomousPresenting, startAutonomousPresenting, speakThroughPlayer],
+    [dispatchEvent, cancelAutonomousPresenting, startAutonomousPresenting, speakThroughPlayer, recordCommandOutcome],
   );
 
   useEffect(() => {
@@ -961,6 +988,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     const audio = await localRecorder.stop();
     if (!audio) {
       dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
+      recordCommandOutcome("", { source: "deterministic", ok: false, message: "Couldn't understand that." }, "voice");
       return null;
     }
     dispatchEvent({ type: "LOCAL_COMMAND_START" });
@@ -969,18 +997,19 @@ export function JackProvider({ children }: { children: ReactNode }) {
       const transcript = text.trim();
       if (!transcript) {
         dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
-        setLastError("Didn't catch any speech -- try again.");
+        recordCommandOutcome("", { source: "deterministic", ok: false, message: "Couldn't understand that." }, "voice");
         return null;
       }
-      const outcome = await runLocalCommand(transcript);
+      const outcome = await runLocalCommand(transcript, "voice");
       return { transcript, outcome };
-    } catch (err) {
+    } catch {
       dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
-      const message = err instanceof Error ? err.message : "Transcription failed.";
-      setLastError(message);
+      const whisperUnavailable = jackLocalHealth?.whisper === "unavailable";
+      const message = whisperUnavailable ? "Jack Local AI unavailable." : "Couldn't understand that.";
+      recordCommandOutcome("", { source: "deterministic", ok: false, message }, "voice");
       return { transcript: "", outcome: { source: "deterministic", ok: false, message } };
     }
-  }, [localRecorder, dispatchEvent, runLocalCommand]);
+  }, [localRecorder, dispatchEvent, runLocalCommand, recordCommandOutcome, jackLocalHealth]);
 
   // Push updated instructions to a live session whenever behavior-affecting settings change.
   useEffect(() => {
@@ -1047,8 +1076,9 @@ export function JackProvider({ children }: { children: ReactNode }) {
     startLocalListening,
     stopLocalListening,
     isPresentingAutonomously,
-    lastBargeInTranscript,
-    lastLocalCommandOutcome,
+    lastCommandTranscript,
+    lastCommandOutcome,
+    lastCommandKind,
     bargeInPhase,
     bargeInNoiseFloor,
     bargeInThreshold,
