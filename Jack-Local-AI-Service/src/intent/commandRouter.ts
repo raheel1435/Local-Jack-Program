@@ -32,7 +32,12 @@ const ACTION_RULES: ActionRule[] = [
       // "take ?over" (space optional): whisper.cpp reproducibly transcribes
       // this exact phrase as the compound word "takeover" -- observed live
       // during real-hardware voice testing, not a hypothetical.
-      /^jack,?\s+(take ?over|you (take it|present this|take ?over|handle it)|please present)( now)?\.?$/,
+      /^jack,?\s+(take ?over|you (take it|present this|take ?over|handle it)|please present)( now| again)?\.?$/,
+      // "again" specifically -- confirmed live the LLM fallback inverted
+      // "Jack take over again." to handoff_to_presenter (the OPPOSITE
+      // meaning) when it fell through un-anchored by an explicit pattern;
+      // this is the same repeat-takeover-in-one-session case as Phase 14/17.
+      /^take ?over again,?\s*jack\.?$/,
       // Realistic phrasing variants, all still addressed TO Jack (subject is
       // "you"/"Jack", never "I"/"I'll") -- confirmed live that without these,
       // "Jack take over from here." fell through to the LLM, which
@@ -152,6 +157,25 @@ function isBareWordFragment(normalized: string): boolean {
 }
 
 /**
+ * Whisper commonly emits bracketed non-speech annotations for ambient noise
+ * with no real speech present -- "(screams)", "(indistinct chatter)",
+ * "[Music]", "(laughing)" -- rather than an empty transcript. Confirmed live
+ * via barge-in picking up real room ambience during testing:
+ * "(screams) (screams) (screams)" reached the LLM classifier, which
+ * returned stop_presentation and ended the entire presentation from nothing
+ * but background noise -- multi-word, so the bare-word-fragment check above
+ * never saw it. A transcript that, once every bracketed annotation is
+ * stripped out, has no real words left is exactly this failure mode, not a
+ * real command -- fails safe to "unknown" the same as a bare-word fragment,
+ * never reaching the LLM's more permissive classifier.
+ */
+function isNonSpeechArtifact(normalized: string): boolean {
+  if (!/[([]/.test(normalized)) return false;
+  const stripped = normalized.replace(/[([][^)\]]*[)\]]/g, "").replace(/[.?!,]/g, "").trim();
+  return stripped.length === 0;
+}
+
+/**
  * Bypasses the LLM entirely for short, unambiguous presentation commands
  * and for common conversational filler that must never be allowed to
  * mutate presentation state. Everything else -- questions, explanations,
@@ -174,7 +198,7 @@ export function matchDeterministicCommand(text: string): DeterministicMatch | nu
       return { type: "conversation" };
     }
   }
-  if (isBareWordFragment(normalized)) {
+  if (isBareWordFragment(normalized) || isNonSpeechArtifact(normalized)) {
     return { type: "unknown" };
   }
   return null;

@@ -784,6 +784,12 @@ export function JackProvider({ children }: { children: ReactNode }) {
     humourUsedRef.current = false;
     openingPendingRef.current = false;
     presentationOpeningDeliveredRef.current = false; // Phase 18: ending the presentation is a genuinely new session next time
+    // Confirmed live via MCP testing: without this, exiting and starting a
+    // brand-new presentation still showed "Control: Jack" left over from the
+    // previous session, even though nothing in the new session had asked
+    // Jack to take over yet -- cosmetic, but a genuinely new session should
+    // start with the presenter in control, same as the very first one does.
+    setPresenterControl("presenter");
     dispatchEvent({ type: "DISCONNECTED" });
   }, [teardownMic, dispatchEvent, wakeWordService]);
 
