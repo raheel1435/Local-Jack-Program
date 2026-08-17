@@ -164,6 +164,9 @@ export interface JackContextValue {
 
   /** Barge-in ambient-listening phase -- for a subtle dev/status indicator only (Phase 13), not part of the main presentation UI. */
   bargeInPhase: "idle" | "guarding" | "calibrating" | "armed" | "capturing";
+  /** Calibrated ambient level and effective trigger threshold for the current/last utterance -- dev diagnostics only. */
+  bargeInNoiseFloor: number;
+  bargeInThreshold: number;
 }
 
 const JackContext = createContext<JackContextValue | null>(null);
@@ -236,6 +239,12 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // Effective trigger threshold for the CURRENT utterance -- BARGE_IN_LEVEL
   // floor, raised if the calibrated ambient level is already elevated.
   const bargeInEffectiveThresholdRef = useRef(BARGE_IN_LEVEL);
+  // Reactive mirrors of the calibrated floor/threshold, for the dev status
+  // indicator only (Phase 2 of the real-hardware milestone) -- lets a real
+  // tester see exactly what the mic measured and what it was compared
+  // against, not just the pass/fail outcome.
+  const [bargeInNoiseFloor, setBargeInNoiseFloor] = useState(0);
+  const [bargeInThreshold, setBargeInThreshold] = useState(BARGE_IN_LEVEL);
   // Kept in sync with localRecorder.level so the interval-based silence
   // poll below can read the CURRENT level without depending on a React
   // effect re-running -- level settling at an exactly-constant value (e.g.
@@ -773,7 +782,10 @@ export function JackProvider({ children }: { children: ReactNode }) {
           clearBargeInArmTimers();
           const samples = bargeInCalibrationSamplesRef.current;
           const floor = samples.length > 0 ? samples.reduce((a, b) => a + b, 0) / samples.length : 0;
-          bargeInEffectiveThresholdRef.current = Math.max(BARGE_IN_LEVEL, floor + BARGE_IN_FLOOR_MARGIN);
+          const threshold = Math.max(BARGE_IN_LEVEL, floor + BARGE_IN_FLOOR_MARGIN);
+          bargeInEffectiveThresholdRef.current = threshold;
+          setBargeInNoiseFloor(floor);
+          setBargeInThreshold(threshold);
           bargeInLoudTicksRef.current = 0;
           setBargeInPhaseBoth("armed");
         }, BARGE_IN_CALIBRATION_MS);
@@ -1038,6 +1050,8 @@ export function JackProvider({ children }: { children: ReactNode }) {
     lastBargeInTranscript,
     lastLocalCommandOutcome,
     bargeInPhase,
+    bargeInNoiseFloor,
+    bargeInThreshold,
   };
 
   return <JackContext.Provider value={value}>{children}</JackContext.Provider>;

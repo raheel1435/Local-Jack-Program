@@ -29,7 +29,10 @@ const ACTION_RULES: ActionRule[] = [
       /^(jack,?\s+)?(start|begin)( the)? presentation\.?$/,
       // "Jack, take over" hands presenting duties TO Jack -- distinct from
       // "I'll take over"/"give me control" below, which hand them back.
-      /^jack,?\s+(take over|you (take it|present this)|please present)( now)?\.?$/,
+      // "take ?over" (space optional): whisper.cpp reproducibly transcribes
+      // this exact phrase as the compound word "takeover" -- observed live
+      // during real-hardware voice testing, not a hypothetical.
+      /^jack,?\s+(take ?over|you (take it|present this)|please present)( now)?\.?$/,
     ],
   },
   {
@@ -64,10 +67,10 @@ const ACTION_RULES: ActionRule[] = [
     type: "action",
     action: "handoff_to_presenter",
     patterns: [
-      /^i('| wi)ll take over( now)?\.?$/,
+      /^i('| wi)ll take ?over( now)?\.?$/,
       /^i('| wi)ll take it from (here|there)\.?$/,
       /^(give|hand)( me| back)? (the )?control( back)?\.?$/,
-      /^let me (take over|continue)\.?$/,
+      /^let me (take ?over|continue)\.?$/,
       /^i('| ha)ve (got|got it|it)\.?$/,
     ],
   },

@@ -3,7 +3,6 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { JackOrb } from "../JackOrb";
 import { JackStatusBar } from "../components/JackStatusBar";
-import { MicButton } from "../components/MicButton";
 import { PresentSetup } from "../components/PresentSetup";
 import { useAutoHideControls } from "../hooks/useAutoHideControls";
 import { useFullscreen } from "../hooks/useFullscreen";
@@ -14,6 +13,15 @@ import { fail, ok, type PresentationController } from "../jack/presentationContr
 import { openPdfForRender, type PdfRenderHandle } from "../lib/parsers/pdf";
 import { useSession } from "../session/SessionContext";
 import type { ParsedDocument, PresentationStatus, SessionAction, UploadedFile } from "../session/types";
+
+// Auto-stop-on-silence for push-to-talk: reuses the same proven pattern as
+// barge-in's capture-silence poll (interval reading a ref, not a level-keyed
+// effect -- see JackProvider's handleBargeInDetected for why). Threshold is
+// slightly below barge-in's 0.12 since push-to-talk isn't fighting Jack's
+// own TTS output bleeding into the mic, only room noise.
+const LOCAL_LISTEN_LEVEL = 0.09;
+const LOCAL_LISTEN_SILENCE_MS = 1200;
+const LOCAL_LISTEN_MAX_MS = 12000;
 
 export function PresentStage() {
   const { session, dispatch } = useSession();
@@ -71,6 +79,7 @@ function PresentSession({
   const [presentationStatus, setPresentationStatus] = useState<PresentationStatus>("presenting");
   const paused = presentationStatus === "paused";
   const [offlineVoiceEnabled, setOfflineVoiceEnabled] = useState(false);
+  const [commandPanelOpen, setCommandPanelOpen] = useState(false);
   const [commandInput, setCommandInput] = useState("");
   const [commandBusy, setCommandBusy] = useState(false);
   const [lastCommandResult, setLastCommandResult] = useState<LocalCommandOutcome | null>(null);
@@ -80,9 +89,22 @@ function PresentSession({
   const controlsVisible = useAutoHideControls(3500);
   const fullscreen = useFullscreen(stageRef);
 
+  // Auto-stop-on-silence bookkeeping for push-to-talk (see constants above).
+  const localListenLevelRef = useRef(0);
+  const localListenIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const localListenStoppingRef = useRef(false);
+  useEffect(() => {
+    localListenLevelRef.current = jack.localMicLevel;
+  }, [jack.localMicLevel]);
+  useEffect(
+    () => () => {
+      if (localListenIntervalRef.current !== null) clearInterval(localListenIntervalRef.current);
+    },
+    [],
+  );
+
   const currentSection = sections[sectionIndex];
   const inSync = jackSectionIndex === null || jackSectionIndex === sectionIndex;
-  const isOffline = jack.connectionStatus !== "connected";
 
   // Load the PDF document proxy for canvas rendering.
   useEffect(() => {
@@ -261,11 +283,6 @@ function PresentSession({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function handleMicToggle() {
-    if (jack.micStatus === "listening") jack.mute();
-    else if (jack.micStatus === "muted") jack.unmute();
-  }
-
   const localUnavailable =
     jack.jackLocalHealth !== null &&
     jack.jackLocalHealth.llamacpp === "unavailable" &&
@@ -287,39 +304,107 @@ function PresentSession({
     }
   }
 
-  async function handleLocalMicClick() {
-    if (jack.localMicState === "listening") {
-      setCommandBusy(true);
-      try {
-        const result = await jack.stopLocalListening();
-        if (result) {
-          setLastTranscript(result.transcript || null);
-          setLastCommandResult(result.outcome);
-        }
-      } finally {
-        setCommandBusy(false);
-      }
-    } else {
-      setLastTranscript(null);
-      setLastCommandResult(null);
-      await jack.startLocalListening();
+  function clearLocalListenTimer() {
+    if (localListenIntervalRef.current !== null) {
+      clearInterval(localListenIntervalRef.current);
+      localListenIntervalRef.current = null;
     }
   }
+
+  /** Stops the recording (however it was triggered -- manual click or auto-silence) and
+   * surfaces exactly one of the three required feedback states: heard+result, "couldn't
+   * understand", or "Jack Local AI unavailable". Guarded against the manual-click and
+   * auto-stop-timer paths both firing (whichever gets here first wins; see startListening). */
+  async function stopAndProcess() {
+    if (localListenStoppingRef.current) return;
+    localListenStoppingRef.current = true;
+    clearLocalListenTimer();
+    setCommandBusy(true);
+    try {
+      const result = await jack.stopLocalListening();
+      if (result && result.transcript) {
+        setLastTranscript(result.transcript);
+        setLastCommandResult(result.outcome);
+      } else if (result && !result.transcript) {
+        // stopLocalListening's catch path -- a real transcription request failure, not just silence.
+        setLastTranscript(null);
+        setLastCommandResult({
+          source: result.outcome.source,
+          ok: false,
+          message: whisperUnavailable ? "Jack Local AI unavailable." : "Couldn't understand that.",
+        });
+      } else {
+        // No audio captured, or transcript came back empty -- genuinely nothing to work with.
+        setLastTranscript(null);
+        setLastCommandResult({ source: "deterministic", ok: false, message: "Couldn't understand that." });
+      }
+    } finally {
+      setCommandBusy(false);
+    }
+  }
+
+  function startListening() {
+    setLastTranscript(null);
+    setLastCommandResult(null);
+    localListenStoppingRef.current = false;
+    void (async () => {
+      await jack.startLocalListening();
+      const startedAt = Date.now();
+      let heardSpeech = false;
+      let silenceStart: number | null = null;
+      localListenIntervalRef.current = setInterval(() => {
+        const now = Date.now();
+        const level = localListenLevelRef.current;
+        if (level > LOCAL_LISTEN_LEVEL) {
+          heardSpeech = true;
+          silenceStart = null;
+        } else if (heardSpeech && silenceStart === null) {
+          silenceStart = now;
+        }
+        const sustainedSilence = heardSpeech && silenceStart !== null && now - silenceStart > LOCAL_LISTEN_SILENCE_MS;
+        const hardCap = now - startedAt > LOCAL_LISTEN_MAX_MS;
+        if (sustainedSilence || hardCap) void stopAndProcess();
+      }, 150);
+    })();
+  }
+
+  function handleLocalMicClick() {
+    if (jack.localMicState === "listening") void stopAndProcess();
+    else startListening();
+  }
+
+  const localHealth: "checking" | "connected" | "offline" =
+    jack.jackLocalHealth === null ? "checking" : localUnavailable ? "offline" : "connected";
+  const presentMicLabel: "off" | "listening" | "processing" =
+    jack.localMicState === "listening" ? "listening" : commandBusy ? "processing" : "off";
+
+  // Single compact feedback line -- an interruption result (event-driven, during
+  // autonomous narration) takes priority over a push-to-talk result, since it's
+  // the more recent/urgent of the two when both could theoretically be set.
+  const feedback = jack.lastLocalCommandOutcome
+    ? {
+        prefix: "Interruption",
+        heard: jack.lastBargeInTranscript,
+        outcome: jack.lastLocalCommandOutcome,
+      }
+    : lastCommandResult
+      ? { prefix: null, heard: lastTranscript, outcome: lastCommandResult }
+      : null;
 
   return (
     <div ref={stageRef} className="present-stage-root">
       <JackStatusBar
         jackState={jack.orb.orbState}
         jackLabel={jack.orb.label}
-        jackSectionLabel={jackSectionIndex !== null ? sections[jackSectionIndex]?.title ?? `Section ${jackSectionIndex + 1}` : null}
-        displayedSectionLabel={currentSection?.title ?? `Section ${sectionIndex + 1}`}
+        localHealth={localHealth}
+        presenterControl={jack.presenterControl}
+        isPresentingAutonomously={jack.isPresentingAutonomously}
+        micLabel={presentMicLabel}
+        slideText={`${sectionIndex + 1} / ${sections.length}`}
         inSync={inSync}
         followMode={followMode}
         onToggleFollowMode={() => setFollowMode((m) => (m === "auto" ? "manual" : "auto"))}
         onSync={syncJackToThisSlide}
-        connectionStatus={jack.connectionStatus}
-        micStatus={jack.micStatus}
-        sendingAudioToOpenAI={jack.sendingAudioToOpenAI}
       />
 
       <div className="present-content">
@@ -344,80 +429,54 @@ function PresentSession({
       )}
       {jack.lastError && <p className="speech-error present-subtitle-line" role="alert">{jack.lastError}</p>}
 
-      <div className="jack-local-panel">
-        <div className="jack-local-status">
-          <span className={`sync-item ${localUnavailable ? "sync-error" : ""}`}>
-            Jack Local AI: {jack.jackLocalHealth === null ? "checking…" : localUnavailable ? "unavailable" : "connected"}
-          </span>
-          <span className="sync-item">Control: <strong>{jack.presenterControl === "jack" ? "Jack" : "Presenter"}</strong></span>
-          {jack.isPresentingAutonomously && <span className="sync-item sync-autonomous">● Jack is presenting</span>}
-          {jack.presenterControl === "jack" && jack.bargeInPhase !== "idle" && (
-            <span className="sync-item sync-bargein" title="Barge-in listening state -- for real-hardware interruption testing">
-              mic: {jack.bargeInPhase} ({jack.localMicLevel.toFixed(2)})
-            </span>
-          )}
-        </div>
-        {localUnavailable && (
-          <p className="present-warning">
-            Jack Local AI is unavailable. Manual presentation is still available.
-          </p>
-        )}
-        <form className="jack-local-command-form" onSubmit={submitLocalCommand}>
-          <button
-            type="button"
-            className={`jack-local-mic state-${jack.localMicState}`}
-            onClick={handleLocalMicClick}
-            disabled={commandBusy || whisperUnavailable || jack.localMicState === "requesting"}
-            aria-pressed={jack.localMicState === "listening"}
-            aria-label={jack.localMicState === "listening" ? "Stop recording and send to Jack" : "Talk to Jack (local)"}
-            title={whisperUnavailable ? "Local Whisper transcription is unavailable" : undefined}
-          >
-            {jack.localMicState === "listening" ? "⏹" : jack.localMicState === "requesting" ? "…" : "🎤"}
-          </button>
+      {localUnavailable && (
+        <p className="present-warning">Jack Local AI is unavailable. Manual presentation is still available.</p>
+      )}
+
+      {jack.presenterControl === "jack" && jack.bargeInPhase !== "idle" && (
+        <p className="jack-mic-diagnostic" title="Barge-in listening diagnostics -- for real-hardware interruption testing">
+          mic: {jack.bargeInPhase} · lvl {jack.localMicLevel.toFixed(2)}
+          {(jack.bargeInPhase === "armed" || jack.bargeInPhase === "capturing") &&
+            ` · floor ${jack.bargeInNoiseFloor.toFixed(2)} · thr ${jack.bargeInThreshold.toFixed(2)}`}
+        </p>
+      )}
+
+      {jack.localMicState === "listening" && (
+        <p className="jack-mic-feedback" aria-live="polite">Listening… (stops automatically when you pause, or press ⏹)</p>
+      )}
+      {jack.localMicError && <p className="jack-mic-feedback speech-error">{jack.localMicError}</p>}
+      {feedback && (
+        <p className={`jack-mic-feedback ${feedback.outcome.ok ? "" : "speech-error"}`} aria-live="polite">
+          {feedback.prefix && `${feedback.prefix}: `}
+          {feedback.heard && `Heard: “${feedback.heard}.” `}
+          {feedback.outcome.ok ? feedback.outcome.message ?? "Done." : feedback.outcome.message}
+        </p>
+      )}
+
+      {commandPanelOpen && (
+        <form className="jack-command-popover" onSubmit={submitLocalCommand}>
           <input
             type="text"
             value={commandInput}
             onChange={(e) => setCommandInput(e.target.value)}
-            placeholder='Type or press 🎤 to talk, e.g. "Next slide." or "Summarize this slide."'
+            placeholder='Type a command, e.g. "Next slide." or "Summarize this slide."'
             aria-label="Type a command for Jack"
             disabled={commandBusy}
+            autoFocus
           />
           <button type="submit" disabled={commandBusy || !commandInput.trim()}>
             {commandBusy ? "…" : "Send"}
           </button>
+          <button type="button" onClick={() => setCommandPanelOpen(false)} aria-label="Close command input" title="Close command input">
+            ✕
+          </button>
         </form>
-        {jack.localMicState === "listening" && <p className="jack-local-result">Listening… press ⏹ when done.</p>}
-        {jack.localMicError && <p className="jack-local-result speech-error">{jack.localMicError}</p>}
-        {lastTranscript && <p className="jack-local-result">You said: &ldquo;{lastTranscript}&rdquo;</p>}
-        {lastCommandResult && (
-          <p className={`jack-local-result ${lastCommandResult.ok ? "" : "speech-error"}`} aria-live="polite">
-            [{lastCommandResult.source}{lastCommandResult.action ? ` · ${lastCommandResult.action}` : ""}]{" "}
-            {lastCommandResult.ok ? lastCommandResult.message ?? "Done." : lastCommandResult.message}
-          </p>
-        )}
-        {jack.lastBargeInTranscript && (
-          <p className="jack-local-result">Interruption heard: &ldquo;{jack.lastBargeInTranscript}&rdquo;</p>
-        )}
-        {jack.lastLocalCommandOutcome && (
-          <p className={`jack-local-result ${jack.lastLocalCommandOutcome.ok ? "" : "speech-error"}`} aria-live="polite">
-            [interruption · {jack.lastLocalCommandOutcome.source}{jack.lastLocalCommandOutcome.action ? ` · ${jack.lastLocalCommandOutcome.action}` : ""}]{" "}
-            {jack.lastLocalCommandOutcome.ok ? jack.lastLocalCommandOutcome.message ?? "Done." : jack.lastLocalCommandOutcome.message}
-          </p>
-        )}
-      </div>
+      )}
 
-      {isOffline && (
-        <div className="offline-voice-toggle">
-          <label className="setup-checkbox">
-            <input type="checkbox" checked={offlineVoiceEnabled} onChange={(e) => setOfflineVoiceEnabled(e.target.checked)} />
-            Use offline browser voice (not AI — Jack isn&rsquo;t connected)
-          </label>
-          {offlineVoiceEnabled && offlineSpeech.supported && (
-            <div className="offline-voice-controls">
-              <button type="button" className="speech-btn" onClick={() => currentSection && offlineSpeech.speak(currentSection.text)}>▶ Read this slide</button>
-              {offlineSpeech.isSpeaking && <button type="button" className="speech-btn" onClick={offlineSpeech.stop}>■ Stop</button>}
-            </div>
-          )}
+      {offlineVoiceEnabled && offlineSpeech.supported && (
+        <div className="jack-voice-fallback-controls">
+          <button type="button" className="speech-btn" onClick={() => currentSection && offlineSpeech.speak(currentSection.text)}>▶ Read this slide</button>
+          {offlineSpeech.isSpeaking && <button type="button" className="speech-btn" onClick={offlineSpeech.stop}>■ Stop</button>}
         </div>
       )}
 
@@ -434,17 +493,80 @@ function PresentSession({
         <div className="present-progress"><i style={{ width: `${((sectionIndex + 1) / sections.length) * 100}%` }} /></div>
         <button type="button" onClick={() => goTo(sectionIndex + 1)} disabled={sectionIndex === sections.length - 1} aria-label="Next slide">Next ›</button>
 
-        <button type="button" onClick={paused ? jack.resume : jack.pause} aria-label={paused ? "Resume" : "Pause Jack"}>
+        <button
+          type="button"
+          onClick={paused ? jack.resume : jack.pause}
+          aria-label={paused ? "Resume" : "Pause Jack"}
+          title={paused ? "Resume Jack's presentation" : "Pause Jack's presentation"}
+        >
           {paused ? "▶ Resume" : "❚❚ Pause"}
         </button>
-        <button type="button" onClick={jack.interrupt} disabled={jack.attentionState !== "speaking"} aria-label="Stop Jack speaking">■ Stop</button>
+        <button
+          type="button"
+          onClick={jack.interrupt}
+          disabled={jack.attentionState !== "speaking"}
+          aria-label="Stop Jack speaking"
+          title="Stop Jack speaking"
+        >
+          ■ Stop
+        </button>
 
-        <MicButton state={jack.micStatus} level={jack.micLevel} onStart={jack.wake} onStop={jack.sleep} onToggleMute={handleMicToggle} size="small" />
-        <button type="button" onClick={() => setShowNotes((v) => !v)} aria-pressed={showNotes} aria-label="Toggle speaker notes">
+        <span className="jack-controls-cluster">
+          <button
+            type="button"
+            className={`jack-mic-btn state-${jack.localMicState}`}
+            onClick={handleLocalMicClick}
+            disabled={commandBusy || whisperUnavailable || jack.localMicState === "requesting"}
+            aria-pressed={jack.localMicState === "listening"}
+            aria-label={jack.localMicState === "listening" ? "Stop listening and send" : "Talk to Jack"}
+            title={
+              whisperUnavailable
+                ? "Local Whisper transcription is unavailable"
+                : jack.localMicState === "listening"
+                  ? "Stop listening and send"
+                  : "Talk to Jack"
+            }
+          >
+            {jack.localMicState === "listening" ? "⏹" : jack.localMicState === "requesting" ? "…" : "🎤"}
+          </button>
+          <button
+            type="button"
+            className={`jack-command-toggle-btn ${commandPanelOpen ? "active" : ""}`}
+            onClick={() => setCommandPanelOpen((v) => !v)}
+            aria-pressed={commandPanelOpen}
+            aria-label="Type a command for Jack"
+            title="Type a command instead of speaking"
+          >
+            ⌨
+          </button>
+          <button
+            type="button"
+            className={`jack-voice-fallback-btn ${offlineVoiceEnabled ? "active" : ""}`}
+            onClick={() => setOfflineVoiceEnabled((v) => !v)}
+            aria-pressed={offlineVoiceEnabled}
+            aria-label="Browser voice fallback"
+            title="Use the browser's built-in speech voice if Jack's local voice service is unavailable"
+          >
+            🔊
+          </button>
+        </span>
+
+        <button
+          type="button"
+          onClick={() => setShowNotes((v) => !v)}
+          aria-pressed={showNotes}
+          aria-label="Toggle speaker notes"
+          title="Show speaker notes"
+        >
           Notes
         </button>
         {fullscreen.supported && (
-          <button type="button" onClick={fullscreen.toggle} aria-label={fullscreen.isFullscreen ? "Exit full screen" : "Enter full screen"}>
+          <button
+            type="button"
+            onClick={fullscreen.toggle}
+            aria-label={fullscreen.isFullscreen ? "Exit full screen" : "Enter full screen"}
+            title={fullscreen.isFullscreen ? "Exit full screen" : "Enter full screen"}
+          >
             {fullscreen.isFullscreen ? "⤢ Exit full screen" : "⤢ Full screen"}
           </button>
         )}
@@ -456,6 +578,7 @@ function PresentSession({
             dispatch({ type: "BACK_TO_MODE_SELECT" });
           }}
           aria-label="Exit presentation"
+          title="Exit presentation"
         >
           Exit
         </button>

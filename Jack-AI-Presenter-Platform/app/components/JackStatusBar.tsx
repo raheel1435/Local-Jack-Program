@@ -1,44 +1,58 @@
 "use client";
 
 import { JACK_STATES, type JackState } from "../JackOrb";
-import type { ConnectionStatus, MicPipelineStatus } from "../jack/types";
+import type { ControlOwner } from "../jack/types";
+
+export type LocalHealthLabel = "checking" | "connected" | "offline";
+export type PresentMicLabel = "off" | "listening" | "processing";
 
 export interface JackStatusBarProps {
   jackState: JackState;
   jackLabel: string;
-  jackSectionLabel: string | null;
-  displayedSectionLabel: string;
+  /** Jack Local AI gateway health -- the ONE authoritative connection truth for
+   * Present mode. Not the legacy OpenAI Realtime connection (that path isn't
+   * used here and was previously shown side-by-side, contradicting this). */
+  localHealth: LocalHealthLabel;
+  presenterControl: ControlOwner;
+  isPresentingAutonomously: boolean;
+  micLabel: PresentMicLabel;
+  slideText: string;
   inSync: boolean;
   followMode: "auto" | "manual";
   onToggleFollowMode: () => void;
   onSync: () => void;
-  connectionStatus: ConnectionStatus;
-  micStatus: MicPipelineStatus;
-  sendingAudioToOpenAI: boolean;
 }
 
-const MIC_LABEL: Record<MicPipelineStatus, string> = {
-  off: "Mic off",
-  requesting: "Requesting mic…",
-  listening: "Mic active",
-  muted: "Mic muted",
-  denied: "Mic permission denied",
-  unavailable: "Mic unavailable",
-  error: "Mic error",
+const LOCAL_HEALTH_LABEL: Record<LocalHealthLabel, string> = {
+  checking: "Checking…",
+  connected: "Connected",
+  offline: "Offline",
 };
 
-const CONNECTION_LABEL: Record<ConnectionStatus, string> = {
-  not_configured: "Not connected",
-  connecting: "Connecting…",
-  connected: "Connected to OpenAI",
-  reconnecting: "Reconnecting…",
-  disconnected: "Not connected",
-  error: "Connection error",
+const LOCAL_HEALTH_TITLE: Record<LocalHealthLabel, string> = {
+  checking: "Checking whether Jack Local AI is reachable…",
+  connected: "Jack Local AI is connected",
+  offline: "Jack Local AI is unavailable -- manual presentation controls still work",
+};
+
+const MIC_LABEL: Record<PresentMicLabel, string> = {
+  off: "Off",
+  listening: "Listening",
+  processing: "Processing",
 };
 
 export function JackStatusBar({
-  jackState, jackLabel, jackSectionLabel, displayedSectionLabel, inSync,
-  followMode, onToggleFollowMode, onSync, connectionStatus, micStatus, sendingAudioToOpenAI,
+  jackState,
+  jackLabel,
+  localHealth,
+  presenterControl,
+  isPresentingAutonomously,
+  micLabel,
+  slideText,
+  inSync,
+  followMode,
+  onToggleFollowMode,
+  onSync,
 }: JackStatusBarProps) {
   return (
     <div className="sync-bar" role="status">
@@ -46,20 +60,32 @@ export function JackStatusBar({
         <i className={`sync-dot state-${jackState}`} aria-hidden="true" />
         Jack: {jackLabel || JACK_STATES[jackState].label}
       </span>
-      <span className={`sync-item connection-${connectionStatus}`}>{CONNECTION_LABEL[connectionStatus]}</span>
-      <span className="sync-item">
-        Jack is on: <strong>{jackSectionLabel ?? "—"}</strong>
+      <span className={`sync-item connection-${localHealth}`} title={LOCAL_HEALTH_TITLE[localHealth]}>
+        {LOCAL_HEALTH_LABEL[localHealth]}
       </span>
       <span className="sync-item">
-        You&rsquo;re viewing: <strong>{displayedSectionLabel}</strong>
+        Control: <strong>{presenterControl === "jack" ? "Jack" : "Presenter"}</strong>
       </span>
-      <span className={`sync-item mic-${micStatus}`}>{MIC_LABEL[micStatus]}</span>
-      {sendingAudioToOpenAI && <span className="sync-item sync-sending">Sending audio to OpenAI</span>}
-      <button type="button" className="sync-follow-toggle" onClick={onToggleFollowMode}>
+      {isPresentingAutonomously && <span className="sync-item sync-autonomous">● Jack is presenting</span>}
+      <span className={`sync-item mic-${micLabel}`}>Mic: {MIC_LABEL[micLabel]}</span>
+      <span className="sync-item">Slide: <strong>{slideText}</strong></span>
+      <button
+        type="button"
+        className="sync-follow-toggle"
+        onClick={onToggleFollowMode}
+        title={followMode === "auto" ? "Jack follows your slide navigation automatically -- click to stop" : "Jack stays on its own slide until you sync -- click to auto-follow again"}
+        aria-label="Toggle whether Jack automatically follows the slide you're viewing"
+      >
         {followMode === "auto" ? "Auto-follow: on" : "Auto-follow: off"}
       </button>
       {!inSync && (
-        <button type="button" className="sync-action" onClick={onSync}>
+        <button
+          type="button"
+          className="sync-action"
+          onClick={onSync}
+          title="Jack is following a different slide than the one you're viewing -- click to bring Jack to this slide"
+          aria-label="Sync Jack to this slide"
+        >
           Sync Jack to this slide
         </button>
       )}
