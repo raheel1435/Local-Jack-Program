@@ -271,12 +271,21 @@ export interface JackContextValue {
    */
   runLocalCommand(text: string, kind?: "typed" | "voice" | "interruption"): Promise<LocalCommandOutcome>;
 
-  /** Push-to-talk capture -> whisper.cpp -> runLocalCommand, entirely local (no OpenAI). */
+  /** Shared local-recorder state -- reflects whichever of the two arm reasons
+   * below is currently holding it (see the arm/disarm effect's comment). */
   localMicState: LocalRecorderState;
   localMicLevel: number;
   localMicError: string | null;
-  startLocalListening(): Promise<void>;
-  stopLocalListening(): Promise<{ transcript: string; outcome: LocalCommandOutcome } | null>;
+  /**
+   * Manual ambient-listening override (Phase 26): true once the user has
+   * turned the mic on via the mic button. Persists regardless of who holds
+   * presentation control or what Jack is doing, until explicitly turned
+   * off -- capture -> whisper.cpp -> runLocalCommand happens automatically
+   * through the same barge-in pipeline, gated by isAddressedToJack so only
+   * remarks that actually name Jack ever reach a command.
+   */
+  ambientListeningEnabled: boolean;
+  setAmbientListeningEnabled(enabled: boolean): void;
 
   /** True while Jack's autonomous narrate-then-advance loop is running (presenterControl === "jack" and not paused/interrupted). */
   isPresentingAutonomously: boolean;
@@ -386,6 +395,18 @@ export function JackProvider({ children }: { children: ReactNode }) {
   );
   const [questions] = useState<QueuedQuestion[]>([]);
   const [presenterControl, setPresenterControl] = useState<ControlOwner>("presenter");
+  // Manual override for ambient listening (Phase 26): the mic button used to
+  // be push-to-talk (one click, one utterance, auto-stop on silence).
+  // Confirmed live that reads as "the mic keeps turning itself off" -- users
+  // expect a mic they turned on to STAY on until they turn it off, no matter
+  // who currently holds presentation control. Turning this on arms the exact
+  // same ambient VAD/name-gate pipeline barge-in already uses (see the arm
+  // effect's shouldArm below and isAddressedToJack in finishBargeInCapture)
+  // continuously, regardless of presenterControl/attentionState, until
+  // turned off again. It's additive, not a replacement for the existing
+  // automatic arm-while-Jack-presents behavior -- that keeps working
+  // unchanged even when this is off.
+  const [ambientListeningEnabled, setAmbientListeningEnabledState] = useState(false);
   const [jackLocalHealth, setJackLocalHealth] = useState<JackHealth | null>(null);
   const [isPresentingAutonomously, setIsPresentingAutonomously] = useState(false);
   // Local-pipeline activation lifecycle (Phase 1/2 of the activation
@@ -1127,24 +1148,24 @@ export function JackProvider({ children }: { children: ReactNode }) {
     }, 150);
   }, [stopJackAudio, dispatchEvent, clearBargeInArmTimers, clearBargeInCaptureTimeout, finishBargeInCapture]);
 
-  // Arm/disarm ambient listening for as long as Jack holds the floor
-  // (presenterControl === "jack") and is actually awake and reachable --
-  // not just the instant he's mid-utterance. Originally this only armed
-  // while attentionState === "speaking", which meant the mic went dead the
-  // moment Jack stopped talking (between narration steps, or -- confirmed
-  // live -- immediately after ANY failed command, since a failure's
-  // LOCAL_COMMAND_DONE lands on "standby" and nothing else was there to
-  // re-arm it). From the user's side that reads as "the mic keeps turning
-  // itself off". "standby" is Jack's normal idle-but-in-control state, so
-  // including it keeps ambient listening running continuously through the
-  // whole time Jack is presenting -- addressed remarks are still filtered by
-  // isAddressedToJack in finishBargeInCapture, so staying armed longer does
-  // not mean Jack reacts to more ambient noise, only that he's still
-  // listening for his own name. Explicitly excluded: "listening" (push-to-
-  // talk owns the mic then -- see startLocalListening's comment on recorder
-  // ownership), "thinking"/"acting" (a command is already in flight),
-  // "muted"/"sleeping"/"paused"/"disconnected"/"error" (Jack isn't available
-  // to be interrupted).
+  // Arm/disarm ambient listening. Two independent reasons to be armed:
+  // (1) automatic -- Jack holds the floor (presenterControl === "jack") and
+  //     is speaking or idle-but-in-control ("standby"); unchanged default
+  //     behavior so barge-in during Jack's own narration keeps working with
+  //     no button press needed.
+  // (2) manual -- ambientListeningEnabled is on (the mic button toggle).
+  //     This one is deliberately independent of presenterControl and of
+  //     attentionState's speaking/standby split: once the user turns the
+  //     mic on, it stays on regardless of who's presenting or what Jack is
+  //     doing at that instant, until they turn it off again. Confirmed live
+  //     that gating this the same way as (1) meant the mic still "turned
+  //     itself off" the moment control returned to the presenter.
+  // Either way, EVERY captured utterance still has to pass isAddressedToJack
+  // in finishBargeInCapture before it's treated as a command -- staying
+  // armed longer/wider never means Jack reacts to more ambient noise, only
+  // that he's still listening for his own name. Reachability guard applies
+  // to both: never armed while Jack is asleep/disconnected/muted/erroring,
+  // since there's nothing that could sensibly act on a capture then.
   //
   // Sequence once armed: start the recorder immediately (so there's no audio
   // gap), but hold off actually watching for a burst for
@@ -1154,8 +1175,13 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // level-keyed effect) for the same reason the capture-silence poll is --
   // see its comment.
   useEffect(() => {
-    const shouldArm =
-      presenterControl === "jack" && (attentionState === "speaking" || attentionState === "standby");
+    const jackReachable =
+      attentionState !== "sleeping" &&
+      attentionState !== "disconnected" &&
+      attentionState !== "muted" &&
+      attentionState !== "error";
+    const autoArmWhileJackPresents = presenterControl === "jack" && (attentionState === "speaking" || attentionState === "standby");
+    const shouldArm = jackReachable && (ambientListeningEnabled || autoArmWhileJackPresents);
     if (shouldArm && bargeInPhaseRef.current === "idle") {
       setBargeInPhaseBoth("guarding");
       bargeInLoudTicksRef.current = 0;
@@ -1190,7 +1216,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       void localRecorder.stop();
     }
     // "capturing" is left alone here; handleBargeInDetected/finishBargeInCapture own that transition.
-  }, [attentionState, presenterControl, localRecorder, clearBargeInArmTimers, setBargeInPhaseBoth]);
+  }, [attentionState, presenterControl, ambientListeningEnabled, localRecorder, clearBargeInArmTimers, setBargeInPhaseBoth]);
 
   // Watches mic level while armed for a sustained loud burst -> real
   // interruption, against this utterance's calibrated effective threshold
@@ -1402,74 +1428,29 @@ export function JackProvider({ children }: { children: ReactNode }) {
     runLocalCommandRef.current = runLocalCommand;
   }, [runLocalCommand]);
 
-  const startLocalListening = useCallback(async () => {
-    setLastError(null);
-    // Recorder ownership: an explicit push-to-talk click always wins over
-    // barge-in's ambient monitoring AND over Jack's autonomous narration
-    // loop -- not just barge-in's listening phase. An earlier version of
-    // this fix only cleared bargeInPhaseRef, which left the narration loop
-    // running; if Jack's current utterance then finished naturally, its
-    // onEnded callback (never invalidated) would advance and start a new
-    // narration step, dispatch AUDIO_START, re-arm barge-in (since
-    // presenterControl was still "jack"), and barge-in's own arm effect
-    // would call localRecorder.start() again -- which, via this hook's
-    // defensive teardown-before-start, tore down push-to-talk's still-
-    // recording session out from under it mid-capture. Confirmed live: this
-    // produced a genuine short/garbled transcript purely from the handoff
-    // race, not from anything the user actually said. cancelAutonomousPresenting
-    // stops the audio, invalidates the generation counter so no orphaned
-    // step can restart it, AND disarms barge-in -- the complete cleanup,
-    // not a partial one.
-    //
-    // Still not quite enough on its own: cancelAutonomousPresenting resets
-    // bargeInPhaseRef to "idle" but does NOT change attentionState, which
-    // stays "speaking" until something dispatches an event that moves it.
-    // The barge-in arm effect's condition is `shouldArm = attentionState
-    // === "speaking" && presenterControl === "jack"` -- if a render happens
-    // in the gap between the reset above and localRecorder.start() actually
-    // opening a new session, shouldArm is STILL true (attentionState hasn't
-    // caught up) and bargeInPhaseRef.current IS "idle" again, so the arm
-    // effect immediately re-arms and calls localRecorder.start() a SECOND
-    // time, racing this function's own start() call. Dispatching
-    // LOCAL_MIC_START *before* starting the recorder (not after, as it read
-    // previously) flips attentionState to "listening" in the same
-    // synchronous batch as cancelAutonomousPresenting's updates, so
-    // shouldArm is already false by the time anything re-renders -- closes
-    // the window instead of just narrowing it.
-    speechPlayer.unlock(); // real user gesture -- covers any Jack speech triggered by the command this capture produces
-    cancelAutonomousPresenting();
-    dispatchEvent({ type: "LOCAL_MIC_START" });
-    console.log("[mic] start() called from: startLocalListening (push-to-talk)");
-    await localRecorder.start();
-  }, [localRecorder, dispatchEvent, cancelAutonomousPresenting, speechPlayer]);
-
-  const stopLocalListening = useCallback(async (): Promise<{ transcript: string; outcome: LocalCommandOutcome } | null> => {
-    console.log("[mic] stop() called from: stopLocalListening (push-to-talk)");
-    const audio = await localRecorder.stop();
-    if (!audio) {
-      dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
-      recordCommandOutcome("", { source: "deterministic", ok: false, message: "Couldn't understand that." }, "voice");
-      return null;
-    }
-    dispatchEvent({ type: "LOCAL_COMMAND_START" });
-    try {
-      const { text } = await jackApi.transcribeAudio(audio);
-      const transcript = text.trim();
-      if (!transcript) {
-        dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
-        recordCommandOutcome("", { source: "deterministic", ok: false, message: "Couldn't understand that." }, "voice");
-        return null;
+  /**
+   * The mic button's ONE job now (Phase 26 -- replaced push-to-talk's
+   * single-shot-with-silence-cutoff semantics): flip the persistent ambient-
+   * listening toggle. All the actual capture/VAD/name-gate machinery is the
+   * arm/disarm effect and finishBargeInCapture above -- this function does
+   * not touch localRecorder directly at all, so there's no recorder-
+   * ownership race to manage here (unlike the old push-to-talk, which had to
+   * forcibly wrestle the shared recorder away from barge-in). Turning this
+   * on when Jack is already auto-armed (presenting) is a no-op arm-wise --
+   * shouldArm was already true; turning it off while Jack is still
+   * presenting is also a no-op -- the automatic reason to stay armed is
+   * untouched. It only matters at the moments those two reasons disagree.
+   */
+  const setAmbientListeningEnabled = useCallback(
+    (enabled: boolean) => {
+      if (enabled) {
+        setLastError(null);
+        speechPlayer.unlock(); // real user gesture -- covers any Jack speech triggered by a resulting command
       }
-      const outcome = await runLocalCommand(transcript, "voice");
-      return { transcript, outcome };
-    } catch {
-      dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
-      const whisperUnavailable = jackLocalHealth?.whisper === "unavailable";
-      const message = whisperUnavailable ? "Jack Local AI unavailable." : "Couldn't understand that.";
-      recordCommandOutcome("", { source: "deterministic", ok: false, message }, "voice");
-      return { transcript: "", outcome: { source: "deterministic", ok: false, message } };
-    }
-  }, [localRecorder, dispatchEvent, runLocalCommand, recordCommandOutcome, jackLocalHealth]);
+      setAmbientListeningEnabledState(enabled);
+    },
+    [speechPlayer],
+  );
 
   // Push updated instructions to a live session whenever behavior-affecting settings change.
   useEffect(() => {
@@ -1544,8 +1525,8 @@ export function JackProvider({ children }: { children: ReactNode }) {
     localMicState: localRecorder.state,
     localMicLevel: localRecorder.level,
     localMicError: localRecorder.error,
-    startLocalListening,
-    stopLocalListening,
+    ambientListeningEnabled,
+    setAmbientListeningEnabled,
     isPresentingAutonomously,
     lastCommandTranscript,
     lastCommandOutcome,

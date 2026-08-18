@@ -15,15 +15,6 @@ import { openPdfForRender, type PdfRenderHandle } from "../lib/parsers/pdf";
 import { useSession } from "../session/SessionContext";
 import type { ParsedDocument, PresentationStatus, SessionAction, UploadedFile } from "../session/types";
 
-// Auto-stop-on-silence for push-to-talk: reuses the same proven pattern as
-// barge-in's capture-silence poll (interval reading a ref, not a level-keyed
-// effect -- see JackProvider's handleBargeInDetected for why). Threshold is
-// slightly below barge-in's 0.12 since push-to-talk isn't fighting Jack's
-// own TTS output bleeding into the mic, only room noise.
-const LOCAL_LISTEN_LEVEL = 0.09;
-const LOCAL_LISTEN_SILENCE_MS = 1200;
-const LOCAL_LISTEN_MAX_MS = 12000;
-
 export function PresentStage() {
   const { session, dispatch } = useSession();
   const activeFile = session.files.find((f) => f.id === session.activeFileId) ?? session.files[0];
@@ -99,38 +90,39 @@ function PresentSession({
   const [commandBusy, setCommandBusy] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
+  const fullscreen = useFullscreen(stageRef);
+
   // Shared visibility model for BOTH the top status bar and the bottom
   // controls -- one set of mouse/keyboard/touch listeners, one fade timer,
   // so they always show and hide together rather than as two independently
   // behaving strips. Exceptions below keep chrome visible whenever hiding it
   // would make state genuinely hard to recover or understand: an open
-  // command input, open settings, active listening, the notes panel, or an
-  // error that needs the user's attention.
+  // command input, open settings, the notes panel, or an error that needs
+  // the user's attention.
+  //
+  // Deliberately NOT keyed on localMicState === "listening" (it used to be):
+  // ambient listening is now on for most of a presentation (see
+  // JackProvider's arm/disarm effect), so that condition meant the header/
+  // footer were pinned visible almost the entire time Jack was presenting --
+  // confirmed live as "whenever Jack speaks, the header and footer appear".
+  // In fullscreen specifically, chrome (and every secondary overlay below --
+  // captions, warnings, feedback lines, diagnostics) is hidden by default so
+  // only the slide and the corner orb show; mouse/keyboard activity still
+  // reveals it exactly like the windowed view always has. Outside fullscreen
+  // there's no "clean stage" expectation, so the mic-setup feedback
+  // (requesting/initializing permission) keeps showing there as before.
   const controlsVisible = useAutoHideControls(3500);
   const chromeVisible =
     controlsVisible ||
     commandPanelOpen ||
     settingsOpen ||
-    jack.localMicState === "listening" ||
-    jack.localMicState === "requesting" ||
-    jack.localMicState === "initializing" ||
     showNotes ||
-    Boolean(jack.lastError);
-  const fullscreen = useFullscreen(stageRef);
-
-  // Auto-stop-on-silence bookkeeping for push-to-talk (see constants above).
-  const localListenLevelRef = useRef(0);
-  const localListenIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const localListenStoppingRef = useRef(false);
-  useEffect(() => {
-    localListenLevelRef.current = jack.localMicLevel;
-  }, [jack.localMicLevel]);
-  useEffect(
-    () => () => {
-      if (localListenIntervalRef.current !== null) clearInterval(localListenIntervalRef.current);
-    },
-    [],
-  );
+    Boolean(jack.lastError) ||
+    (!fullscreen.isFullscreen && (jack.localMicState === "requesting" || jack.localMicState === "initializing"));
+  // Secondary overlays (captions, warnings, mic feedback, diagnostics) follow
+  // chromeVisible only while in fullscreen -- outside fullscreen they always
+  // show, unaffected, exactly as before.
+  const overlaysVisible = !fullscreen.isFullscreen || chromeVisible;
 
   const currentSection = sections[sectionIndex];
   const inSync = jackSectionIndex === null || jackSectionIndex === sectionIndex;
@@ -365,68 +357,12 @@ function PresentSession({
     }
   }
 
-  function clearLocalListenTimer() {
-    if (localListenIntervalRef.current !== null) {
-      clearInterval(localListenIntervalRef.current);
-      localListenIntervalRef.current = null;
-    }
-  }
-
-  /** Stops the recording (however it was triggered -- manual click or auto-silence).
-   * stopLocalListening/runLocalCommand already record the outcome into
-   * jack.lastCommand* for every one of their exit paths (no audio, empty
-   * transcript, transcription failure, or a real result) -- this function
-   * only needs to guard against the manual-click and auto-stop-timer paths
-   * both firing (whichever gets here first wins; see startListening). */
-  async function stopAndProcess() {
-    if (localListenStoppingRef.current) return;
-    localListenStoppingRef.current = true;
-    clearLocalListenTimer();
-    setCommandBusy(true);
-    try {
-      await jack.stopLocalListening();
-    } finally {
-      setCommandBusy(false);
-    }
-  }
-
-  function startListening() {
-    console.log("[mic] startListening() (PresentStage) invoked");
-    localListenStoppingRef.current = false;
-    void (async () => {
-      await jack.startLocalListening();
-      const startedAt = Date.now();
-      console.log("[mic] auto-stop interval armed", { startedAt });
-      let heardSpeech = false;
-      let silenceStart: number | null = null;
-      localListenIntervalRef.current = setInterval(() => {
-        const now = Date.now();
-        const level = localListenLevelRef.current;
-        if (level > LOCAL_LISTEN_LEVEL) {
-          heardSpeech = true;
-          silenceStart = null;
-        } else if (heardSpeech && silenceStart === null) {
-          silenceStart = now;
-        }
-        const sustainedSilence = heardSpeech && silenceStart !== null && now - silenceStart > LOCAL_LISTEN_SILENCE_MS;
-        const hardCap = now - startedAt > LOCAL_LISTEN_MAX_MS;
-        if (sustainedSilence || hardCap) {
-          console.log("[mic] auto-stop firing", { sustainedSilence, hardCap, elapsedMs: now - startedAt });
-          void stopAndProcess();
-        }
-      }, 150);
-    })();
-  }
-
+  /** The mic button is now a plain on/off toggle for ambient listening
+   * (Phase 26) -- JackProvider's barge-in pipeline owns all the actual
+   * capture/VAD/transcribe/name-gate/route machinery, continuously, for as
+   * long as it's on. Nothing left for this component to orchestrate. */
   function handleLocalMicClick() {
-    // See pushToTalkOwnsRecorder above: clicking while barge-in owns the
-    // recorder previously got misread as "stop push-to-talk" (since the
-    // shared recorder was already "listening"), immediately finalizing/
-    // hijacking barge-in's in-progress capture instead of cleanly starting
-    // a fresh push-to-talk one -- confirmed live, produced a short, garbled
-    // transcript from whatever partial audio barge-in happened to have.
-    if (pushToTalkOwnsRecorder) void stopAndProcess();
-    else startListening(); // idle, or barge-in currently owns it -- either way, take over cleanly
+    jack.setAmbientListeningEnabled(!jack.ambientListeningEnabled);
   }
 
   // Acoustic diagnostics gate (Phase 23): dev build AND an explicit ?dev=1
@@ -436,20 +372,23 @@ function PresentSession({
 
   const localHealth: "checking" | "connected" | "offline" =
     jack.jackLocalHealth === null ? "checking" : localUnavailable ? "offline" : "connected";
-  // The shared recorder reads "listening" whenever EITHER push-to-talk or
-  // barge-in owns the current capture -- bargeInPhase is the actual
-  // ownership signal. Only true when THIS button's own click started (and
-  // still owns) the current session, so its icon/label/click-behavior stay
-  // truthful even while barge-in is ambiently listening in the background.
-  const pushToTalkOwnsRecorder = jack.localMicState === "listening" && jack.bargeInPhase === "idle";
+  // Mic button/status now reflect the ambient-listening pipeline directly
+  // (Phase 26) -- there's no separate push-to-talk ownership concept left,
+  // just whichever bargeInPhase the shared recorder is actually in, plus
+  // whether the user has the persistent toggle on.
+  const micToggledOn = jack.ambientListeningEnabled;
   const presentMicLabel: "off" | "preparing" | "listening" | "processing" =
-    jack.localMicState === "listening"
-      ? "listening"
-      : jack.localMicState === "requesting" || jack.localMicState === "initializing"
-        ? "preparing"
-        : commandBusy
-          ? "processing"
-          : "off";
+    jack.bargeInPhase === "capturing"
+      ? "processing"
+      : jack.bargeInPhase === "armed"
+        ? "listening"
+        : jack.bargeInPhase === "guarding" || jack.bargeInPhase === "calibrating"
+          ? "preparing"
+          : jack.localMicState === "requesting" || jack.localMicState === "initializing"
+            ? "preparing"
+            : micToggledOn
+              ? "listening"
+              : "off";
 
   // Single compact feedback line, driven by the ONE shared lastCommand* state
   // in JackProvider -- whichever call (typed, voice, or an interruption) most
@@ -501,43 +440,49 @@ function PresentSession({
         </div>
       </div>
 
-      {doc.warnings.length > 0 && <p className="present-warning">{doc.warnings[0]}</p>}
-      {doc.format === "pptx" && pptxVisualStatus === "failed" && (
+      {overlaysVisible && doc.warnings.length > 0 && <p className="present-warning">{doc.warnings[0]}</p>}
+      {overlaysVisible && doc.format === "pptx" && pptxVisualStatus === "failed" && (
         <p className="present-warning" title={pptxVisualError ?? undefined}>
           Original PowerPoint formatting, images, and layout are not fully preserved — slide text and speaker notes are shown in a simplified reading view.
         </p>
       )}
-      {paused && <p className="present-warning">Paused · Say &ldquo;Jack, continue&rdquo;</p>}
+      {overlaysVisible && paused && <p className="present-warning">Paused · Say &ldquo;Jack, continue&rdquo;</p>}
 
       {/* Captions default OFF (Phase 3/26): audience hears Jack, doesn't see the
           full narration/Q&A/acknowledgement paragraph, unless explicitly enabled. */}
-      {jack.captionsEnabled && jack.currentCaption && jack.attentionState !== "sleeping" && jack.attentionState !== "disconnected" && (
-        <p className="present-subtitle-line" aria-live="polite">{jack.currentCaption}</p>
-      )}
-      {jack.lastError && <p className="speech-error present-subtitle-line" role="alert">{jack.lastError}</p>}
+      {overlaysVisible &&
+        jack.captionsEnabled &&
+        jack.currentCaption &&
+        jack.attentionState !== "sleeping" &&
+        jack.attentionState !== "disconnected" && (
+          <p className="present-subtitle-line" aria-live="polite">{jack.currentCaption}</p>
+        )}
+      {overlaysVisible && jack.lastError && <p className="speech-error present-subtitle-line" role="alert">{jack.lastError}</p>}
 
-      {localUnavailable && (
+      {overlaysVisible && localUnavailable && (
         <p className="present-warning">Jack Local AI is unavailable. Manual presentation is still available.</p>
       )}
 
       {/* Acoustic diagnostics (Phase 23): dev-only, never shown to an audience by
           default -- requires BOTH a dev build and an explicit ?dev=1 opt-in. */}
-      {devDiagnosticsEnabled && jack.presenterControl === "jack" && jack.bargeInPhase !== "idle" && (
-        <p className="jack-mic-diagnostic" title="Barge-in listening diagnostics -- for real-hardware interruption testing">
+      {overlaysVisible && devDiagnosticsEnabled && jack.bargeInPhase !== "idle" && (
+        <p className="jack-mic-diagnostic" title="Ambient listening diagnostics -- for real-hardware interruption testing">
           mic: {jack.bargeInPhase} · lvl {jack.localMicLevel.toFixed(2)}
           {(jack.bargeInPhase === "armed" || jack.bargeInPhase === "capturing") &&
             ` · floor ${jack.bargeInNoiseFloor.toFixed(2)} · thr ${jack.bargeInThreshold.toFixed(2)}`}
         </p>
       )}
 
-      {(jack.localMicState === "requesting" || jack.localMicState === "initializing") && jack.bargeInPhase === "idle" && (
-        <p className="jack-mic-feedback" aria-live="polite">Preparing… (wait for &ldquo;Listening&rdquo; before speaking)</p>
+      {overlaysVisible && (jack.localMicState === "requesting" || jack.localMicState === "initializing") && (
+        <p className="jack-mic-feedback" aria-live="polite">Preparing the microphone…</p>
       )}
-      {pushToTalkOwnsRecorder && (
-        <p className="jack-mic-feedback" aria-live="polite">Listening… (stops automatically when you pause, or press ⏹)</p>
+      {overlaysVisible && micToggledOn && jack.bargeInPhase === "idle" && (
+        <p className="jack-mic-feedback" aria-live="polite">
+          Mic on -- listening for &ldquo;Jack&rdquo;. Press 🎤 again to turn it off.
+        </p>
       )}
-      {jack.localMicError && <p className="jack-mic-feedback speech-error">{jack.localMicError}</p>}
-      {feedback && (
+      {overlaysVisible && jack.localMicError && <p className="jack-mic-feedback speech-error">{jack.localMicError}</p>}
+      {overlaysVisible && feedback && (
         <p className={`jack-mic-feedback ${feedback.outcome.ok ? "" : "speech-error"}`} aria-live="polite">
           {feedback.prefix && `${feedback.prefix}: `}
           {feedback.heard && `Heard: “${feedback.heard}.” `}
@@ -601,31 +546,20 @@ function PresentSession({
         <span className="jack-controls-cluster">
           <button
             type="button"
-            className={`jack-mic-btn state-${pushToTalkOwnsRecorder ? "listening" : jack.localMicState === "listening" ? "idle" : jack.localMicState}`}
+            className={`jack-mic-btn state-${micToggledOn ? presentMicLabel : "idle"}`}
             onClick={handleLocalMicClick}
-            disabled={
-              commandBusy ||
-              whisperUnavailable ||
-              jack.localMicState === "requesting" ||
-              jack.localMicState === "initializing"
-            }
-            aria-pressed={pushToTalkOwnsRecorder}
-            aria-label={pushToTalkOwnsRecorder ? "Stop listening and send" : "Talk to Jack"}
+            disabled={whisperUnavailable || jack.localMicState === "requesting" || jack.localMicState === "initializing"}
+            aria-pressed={micToggledOn}
+            aria-label={micToggledOn ? "Turn mic off" : "Turn mic on -- listens for “Jack” until you turn it off"}
             title={
               whisperUnavailable
                 ? "Local Whisper transcription is unavailable"
-                : pushToTalkOwnsRecorder
-                  ? "Stop listening and send"
-                  : jack.localMicState === "requesting" || jack.localMicState === "initializing"
-                    ? "Preparing the microphone…"
-                    : "Talk to Jack"
+                : micToggledOn
+                  ? "Turn mic off"
+                  : "Turn mic on -- Jack listens for his name until you turn it off"
             }
           >
-            {pushToTalkOwnsRecorder
-              ? "⏹"
-              : jack.localMicState === "requesting" || jack.localMicState === "initializing"
-                ? "…"
-                : "🎤"}
+            {jack.localMicState === "requesting" || jack.localMicState === "initializing" ? "…" : "🎤"}
           </button>
           <button
             type="button"

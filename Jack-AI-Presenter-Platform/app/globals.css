@@ -200,8 +200,8 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{ou
 }
 
 /* Present setup / control-mode confirmation */
-.present-setup{max-width:760px}
-.setup-grid{display:grid;grid-template-columns:1.3fr 1fr;gap:20px;text-align:left}
+.present-setup{max-width:1040px}
+.setup-grid{display:grid;grid-template-columns:1.15fr .85fr 1fr;gap:20px;text-align:left}
 .setup-grid fieldset{border:1px solid var(--line);border-radius:14px;padding:18px 20px;background:rgba(13,24,41,.5);display:grid;gap:12px}
 .setup-grid legend{font-size:10px;letter-spacing:.12em;color:#7897b3;text-transform:uppercase;padding:0 6px}
 .setup-radio{display:flex;gap:10px;align-items:flex-start;cursor:pointer;padding:8px;border-radius:8px}
@@ -229,6 +229,7 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{ou
 .mic-listening{color:var(--cyan)}
 .mic-processing{color:#ffb84d}
 
-@media(max-width:850px){.setup-grid{grid-template-columns:1fr}}
+@media(max-width:1000px){.setup-grid{grid-template-columns:1fr 1fr}}
+@media(max-width:650px){.setup-grid{grid-template-columns:1fr}}
 
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}.analysis-spinner{animation:none!important}}

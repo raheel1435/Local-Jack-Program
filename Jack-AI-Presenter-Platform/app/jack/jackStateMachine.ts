@@ -69,8 +69,6 @@ export function nextAttentionState(state: JackAttentionState, event: JackEvent):
       return state === "thinking" ? "acting" : state;
     case "LOCAL_COMMAND_DONE":
       return state === "thinking" || state === "acting" ? "standby" : state;
-    case "LOCAL_MIC_START":
-      return state === "sleeping" || state === "disconnected" || state === "error" ? state : "listening";
 
     default:
       return state;

@@ -106,7 +106,4 @@ export type JackEvent =
   // through /jack/intent rather than the OpenAI Realtime audio pipeline.
   | { type: "LOCAL_COMMAND_START" }
   | { type: "LOCAL_COMMAND_ACTING" }
-  | { type: "LOCAL_COMMAND_DONE" }
-  // Push-to-talk mic capture for the local voice path (whisper.cpp), as
-  // opposed to USER_SPEECH_DETECTED which is OpenAI Realtime VAD-specific.
-  | { type: "LOCAL_MIC_START" };
+  | { type: "LOCAL_COMMAND_DONE" };
