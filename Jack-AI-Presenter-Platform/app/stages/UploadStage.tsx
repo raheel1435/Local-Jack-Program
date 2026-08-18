@@ -38,7 +38,7 @@ export function UploadStage() {
       <div className="stage-hero">
         <div className="jack-stage">
           <div className="orb-wrap">
-            <JackOrb state="available" size={220} />
+            <JackOrb state="available" size={160} />
           </div>
           <div className="jack-status">
             <i /> <strong>JACK IS AVAILABLE</strong>

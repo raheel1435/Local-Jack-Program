@@ -436,7 +436,7 @@ function PresentSession({
           </div>
         )}
         <div className="present-orb-corner">
-          <JackOrb state={jack.orb.orbState} size={64} />
+          <JackOrb state={jack.orb.orbState} size={192} />
         </div>
       </div>
 
