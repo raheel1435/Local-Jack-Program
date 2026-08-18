@@ -1294,7 +1294,16 @@ export function JackProvider({ children }: { children: ReactNode }) {
         // answer -- confirmed live). Every non-unknown intent goes through
         // the Q&A path in this mode instead of ever trying to act on slides
         // that don't exist.
-        const inAskJackMode = controllerRef.current.name === "Ask Jack";
+        //
+        // Checked via the controller's own reported `mode` (the structural
+        // identifier every controller already returns from
+        // getPresentationContext(), e.g. "askJack"), not
+        // controllerRef.current.name -- that name is only ever meant as
+        // display/prompt text (it's literally what tells the LLM "You are
+        // currently in ___ mode"), so branching on it would silently break
+        // this whole fix the moment someone reworded that display string.
+        const presentationInfo = controller.getPresentationContext();
+        const inAskJackMode = presentationInfo.success && presentationInfo.data.mode === "askJack";
 
         if (intent.type === "conversation" || inAskJackMode) {
           // Any conversational turn pauses autonomy first -- Phase 12: after

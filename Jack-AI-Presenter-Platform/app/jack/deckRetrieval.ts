@@ -89,7 +89,14 @@ export function retrieveForQuestion(
   activeFileId: string | null,
   comprehensive = false,
 ): RetrievalResult {
-  if (context && CURRENT_SLIDE_RE.test(question)) {
+  // Guarded on real current-slide text existing, same as the previous-slide
+  // branch below guards on previousSlideTitle -- Ask Jack mode's controller
+  // always returns a non-null context (currentSlideNumber: 1) but always
+  // fails getSlideContent, so currentSlideText is always "". Without this
+  // guard, "what does this slide say?" in Ask Jack hijacked retrieval with a
+  // bogus high-confidence EMPTY match before ever reaching the comprehensive
+  // keyword search below, defeating the whole-deck-knowledge fix entirely.
+  if (context && context.currentSlideText && CURRENT_SLIDE_RE.test(question)) {
     return {
       matches: [
         {
