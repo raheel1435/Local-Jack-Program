@@ -5,13 +5,12 @@ import { JackOrb } from "../JackOrb";
 import { JackStatusBar } from "../components/JackStatusBar";
 import { PresentSettingsPopover } from "../components/PresentSettingsPopover";
 import { PresentSetup } from "../components/PresentSetup";
+import { SlideVisual } from "../components/SlideVisual";
 import { useAutoHideControls } from "../hooks/useAutoHideControls";
 import { useFullscreen } from "../hooks/useFullscreen";
 import { useJack } from "../jack/JackProvider";
 import { searchDocuments } from "../jack/documentContext";
 import { fail, ok, type PresentationController } from "../jack/presentationController";
-import { jackApi } from "../lib/jackApi";
-import { openPdfForRender, type PdfRenderHandle } from "../lib/parsers/pdf";
 import { useSession } from "../session/SessionContext";
 import type { ParsedDocument, PresentationStatus, SessionAction, UploadedFile } from "../session/types";
 
@@ -59,7 +58,6 @@ function PresentSession({
   dispatch: (action: SessionAction) => void;
 }) {
   const stageRef = useRef<HTMLDivElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
   const sections = doc.sections;
   const jack = useJack();
 
@@ -67,22 +65,6 @@ function PresentSession({
   const [showNotes, setShowNotes] = useState(false);
   const [followMode, setFollowMode] = useState<"auto" | "manual">("auto");
   const [jackSectionIndex, setJackSectionIndex] = useState<number | null>(null);
-  const [pdfHandle, setPdfHandle] = useState<PdfRenderHandle | null>(null);
-  // PPTX visual fidelity (real slide layout via PowerPoint COM -> PDF,
-  // entirely separate from the semantic parser Jack's context comes from).
-  // "idle"/"converting" while a .pptx file's real visual is being prepared;
-  // "ready" once pdfHandle above is showing the converted PDF; "failed" if
-  // PowerPoint COM automation is unavailable or the conversion itself
-  // failed -- only THEN does the simplified-reading-view warning show, so
-  // it's never shown once real fidelity is actually working.
-  // Computed directly from doc.format at mount, not set synchronously inside
-  // the conversion effect below -- PresentSession remounts fully on file
-  // switch (keyed by activeFile.id), so this is always correct for the
-  // lifetime of one mount without needing a same-tick setState in the effect.
-  const [pptxVisualStatus, setPptxVisualStatus] = useState<"idle" | "converting" | "ready" | "failed">(
-    doc.format === "pptx" ? "converting" : "idle",
-  );
-  const [pptxVisualError, setPptxVisualError] = useState<string | null>(null);
   const [presentationStatus, setPresentationStatus] = useState<PresentationStatus>("presenting");
   const paused = presentationStatus === "paused";
   const [commandPanelOpen, setCommandPanelOpen] = useState(false);
@@ -126,77 +108,6 @@ function PresentSession({
 
   const currentSection = sections[sectionIndex];
   const inSync = jackSectionIndex === null || jackSectionIndex === sectionIndex;
-
-  // Load the PDF document proxy for canvas rendering -- a native PDF
-  // upload renders directly; a .pptx upload first attempts a real
-  // PowerPoint-COM visual conversion (see jackApi.convertPptxToPdf) and
-  // renders THAT through the exact same canvas path once it succeeds.
-  useEffect(() => {
-    let cancelled = false;
-    if (doc.format === "pdf") {
-      openPdfForRender(activeFile.file).then((handle) => {
-        if (cancelled) void handle.destroy();
-        else setPdfHandle(handle);
-      });
-      return () => {
-        cancelled = true;
-      };
-    }
-    if (doc.format === "pptx") {
-      jackApi
-        .convertPptxToPdf(activeFile.file)
-        .then((pdfBlob) => openPdfForRender(pdfBlob))
-        .then((handle) => {
-          if (cancelled) {
-            void handle.destroy();
-            return;
-          }
-          setPdfHandle(handle);
-          setPptxVisualStatus("ready");
-        })
-        .catch((err: unknown) => {
-          if (cancelled) return;
-          // Honest fallback, not a fake success (Phase 27) -- the existing
-          // simplified text view still renders from the semantic parser
-          // below; this only controls whether the reading-view warning shows.
-          setPptxVisualStatus("failed");
-          setPptxVisualError(err instanceof Error ? err.message : "PPTX visual conversion failed.");
-        });
-      return () => {
-        cancelled = true;
-      };
-    }
-    return undefined;
-  }, [doc.format, activeFile]);
-
-  useEffect(() => {
-    return () => {
-      void pdfHandle?.destroy();
-    };
-  }, [pdfHandle]);
-
-  // Render the current PDF page to canvas.
-  useEffect(() => {
-    if (!pdfHandle) return;
-    let cancelled = false;
-    (async () => {
-      const page = await pdfHandle.pdf.getPage(sectionIndex + 1);
-      if (cancelled) return;
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      const containerWidth = canvas.parentElement?.clientWidth ?? 900;
-      const base = page.getViewport({ scale: 1 });
-      const viewport = page.getViewport({ scale: Math.min(2, containerWidth / base.width) });
-      canvas.width = viewport.width;
-      canvas.height = viewport.height;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return;
-      await page.render({ canvas, canvasContext: ctx, viewport }).promise;
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [pdfHandle, sectionIndex]);
 
   function goTo(index: number) {
     if (index < 0 || index >= sections.length) return;
@@ -423,29 +334,13 @@ function PresentSession({
       </div>
 
       <div className="present-content">
-        {doc.format === "pdf" || (doc.format === "pptx" && pptxVisualStatus === "ready") ? (
-          <canvas ref={canvasRef} className="present-pdf-canvas" />
-        ) : doc.format === "pptx" && pptxVisualStatus === "converting" ? (
-          <div className="present-text-slide present-visual-preparing">
-            <p>Preparing your slides…</p>
-          </div>
-        ) : (
-          <div className="present-text-slide">
-            {currentSection?.title && <h2>{currentSection.title}</h2>}
-            <p>{currentSection?.text}</p>
-          </div>
-        )}
+        <SlideVisual doc={doc} activeFile={activeFile} sectionIndex={sectionIndex} currentSection={currentSection} />
         <div className="present-orb-corner">
           <JackOrb state={jack.orb.orbState} size={192} />
         </div>
       </div>
 
       {overlaysVisible && doc.warnings.length > 0 && <p className="present-warning">{doc.warnings[0]}</p>}
-      {overlaysVisible && doc.format === "pptx" && pptxVisualStatus === "failed" && (
-        <p className="present-warning" title={pptxVisualError ?? undefined}>
-          Original PowerPoint formatting, images, and layout are not fully preserved — slide text and speaker notes are shown in a simplified reading view.
-        </p>
-      )}
       {overlaysVisible && paused && <p className="present-warning">Paused · Say &ldquo;Jack, continue&rdquo;</p>}
 
       {/* Captions default OFF (Phase 3/26): audience hears Jack, doesn't see the

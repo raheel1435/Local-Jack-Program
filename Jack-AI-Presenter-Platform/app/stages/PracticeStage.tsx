@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { JackOrb } from "../JackOrb";
-import { MicButton } from "../components/MicButton";
+import { SlideVisual } from "../components/SlideVisual";
 import { useJack } from "../jack/JackProvider";
 import { searchDocuments } from "../jack/documentContext";
 import { fail, ok, type PresentationController } from "../jack/presentationController";
@@ -126,7 +126,8 @@ export function PracticeStage() {
     jack.registerController("Practice", controllerRef.current);
     return () => {
       jack.unregisterController();
-      jack.sleep();
+      jack.sleepJackLocal();
+      jack.setAmbientListeningEnabled(false);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -154,14 +155,18 @@ export function PracticeStage() {
     setSectionIndex(0);
   }
 
-  function handleMicToggle() {
-    if (jack.micStatus === "listening") jack.mute();
-    else if (jack.micStatus === "muted") jack.unmute();
-  }
-
   const currentSection = sections[sectionIndex];
-  const presenterWords = jack.transcript.filter((e) => e.role === "presenter" && e.final).map((e) => e.text).join(" ");
-  const wordCount = presenterWords ? presenterWords.split(/\s+/).filter(Boolean).length : 0;
+  const localUnavailable =
+    jack.jackLocalHealth !== null &&
+    jack.jackLocalHealth.llamacpp === "unavailable" &&
+    jack.jackLocalHealth.colibri === "unavailable";
+  const feedback = jack.lastCommandOutcome
+    ? {
+        prefix: jack.lastCommandKind === "interruption" ? "Interruption" : null,
+        heard: jack.lastCommandTranscript,
+        outcome: jack.lastCommandOutcome,
+      }
+    : null;
 
   if (!activeFile || !doc) {
     return (
@@ -184,8 +189,7 @@ export function PracticeStage() {
       ) : (
         <>
           <div className="practice-content">
-            {currentSection?.title && <h2>{currentSection.title}</h2>}
-            <p>{currentSection?.text}</p>
+            <SlideVisual doc={doc} activeFile={activeFile} sectionIndex={sectionIndex} currentSection={currentSection} />
           </div>
           <div className="practice-nav">
             <button type="button" onClick={() => setSectionIndex((i) => Math.max(0, i - 1))} disabled={sectionIndex === 0} aria-label="Previous section">‹ Prev</button>
@@ -196,27 +200,43 @@ export function PracticeStage() {
       )}
 
       <div className="practice-controls">
-        {!running && !finished && <button type="button" className="primary" onClick={start}>Start practice</button>}
+        {/* Only offer "Start practice" before the timer has ever run -- once
+            paused mid-practice (running=false, elapsedMs>0), only Resume and
+            Finish make sense; showing Start practice again alongside Resume
+            read as a duplicate/confusing option. */}
+        {!running && !finished && elapsedMs === 0 && <button type="button" className="primary" onClick={start}>Start practice</button>}
         {running && <button type="button" className="secondary" onClick={pause}>Pause</button>}
         {!running && elapsedMs > 0 && !finished && <button type="button" className="secondary" onClick={start}>Resume</button>}
         {(running || elapsedMs > 0) && !finished && <button type="button" className="secondary" onClick={finish}>Finish</button>}
         {finished && <button type="button" className="primary" onClick={practiceAgain}>Practice again</button>}
-        <MicButton state={jack.micStatus} level={jack.micLevel} onStart={jack.wake} onStop={jack.sleep} onToggleMute={handleMicToggle} />
+        <button
+          type="button"
+          className={`jack-mic-btn ${jack.ambientListeningEnabled ? "state-listening" : ""}`}
+          onClick={() => jack.setAmbientListeningEnabled(!jack.ambientListeningEnabled)}
+          disabled={jack.jackLocalHealth?.whisper === "unavailable"}
+          aria-pressed={jack.ambientListeningEnabled}
+          aria-label={jack.ambientListeningEnabled ? "Turn mic off" : "Turn mic on -- ask Jack anything by name while you practice"}
+          title={jack.ambientListeningEnabled ? "Turn mic off" : "Turn mic on -- say “Jack” to ask a question or get an explanation"}
+        >
+          🎤
+        </button>
       </div>
 
-      <p className="practice-connection">{jack.connectionStatus === "connected" ? "Connected to OpenAI" : "Jack isn't connected — practicing without live AI feedback"}</p>
+      <p className="practice-connection">
+        {localUnavailable
+          ? "Jack Local AI is unavailable — practicing without live AI feedback."
+          : jack.ambientListeningEnabled
+            ? "Jack is listening -- say “Jack” to ask a question or get an explanation."
+            : "Jack is ready -- turn the mic on to ask questions by voice, or use typed commands elsewhere."}
+      </p>
 
       {jack.lastError && <p className="speech-error" role="alert">{jack.lastError}</p>}
-
-      {jack.transcript.length > 0 ? (
-        <div className="practice-transcript">
-          <h3>Transcript</h3>
-          {jack.transcript.map((entry) => (
-            <p key={entry.id}><strong>{entry.role === "presenter" ? "You" : "Jack"}:</strong> {entry.text}</p>
-          ))}
-        </div>
-      ) : (
-        jack.connectionStatus !== "connected" && <p className="practice-transcript-unavailable">Live transcription requires a connected Jack session.</p>
+      {feedback && (
+        <p className={`jack-mic-feedback ${feedback.outcome.ok ? "" : "speech-error"}`} aria-live="polite">
+          {feedback.prefix && `${feedback.prefix}: `}
+          {feedback.heard && `Heard: “${feedback.heard}.” `}
+          {feedback.outcome.ok ? feedback.outcome.message ?? "Done." : feedback.outcome.message}
+        </p>
       )}
 
       {finished && (
@@ -224,7 +244,6 @@ export function PracticeStage() {
           <h3>Practice summary</h3>
           <ul>
             <li><strong>Time practiced:</strong> {formatElapsed(elapsedMs)}</li>
-            <li><strong>Words captured:</strong> {jack.transcript.length > 0 ? wordCount : <span className="unavailable">Not available (no session transcript)</span>}</li>
             <li><strong>Filler words:</strong> <span className="unavailable">Not available</span></li>
             <li><strong>Pacing score:</strong> <span className="unavailable">Not available</span></li>
           </ul>
