@@ -3,6 +3,39 @@ import type { ParsedDocument } from "../session/types";
 import { retrieveForQuestion } from "./deckRetrieval";
 import { formatContextForPrompt, formatContextForQA, type PresentationContext } from "./presentationContext";
 
+// Comprehensive mode (Ask Jack) can include up to 10 full-section matches in
+// one prompt (see deckRetrieval's COMPREHENSIVE_MATCH_LIMIT) -- with no cap,
+// a handful of genuinely long slides could bloat the assembled prompt well
+// past the small local model's context window, silently truncating material
+// server-side or degrading answer quality, defeating the whole point of
+// giving Ask Jack more material to draw on. Capping each match's own text
+// keeps the total bounded regardless of match count or slide length.
+const MAX_MATCH_TEXT_CHARS = 600;
+
+/**
+ * Truncates at the last word boundary at/before the cap, not a hard
+ * character cut -- QA_SYSTEM_PROMPT_HIGH/MEDIUM explicitly promise to
+ * preserve numbers/percentages/prices exactly as written, so slicing mid-
+ * token could chop "$1,234,567" into "$1,234,5…" and either strand the
+ * model without the real figure or invite it to guess one, which is exactly
+ * what those prompts are trying to prevent.
+ */
+function truncateForPrompt(text: string): string {
+  if (text.length <= MAX_MATCH_TEXT_CHARS) return text;
+  const cut = text.slice(0, MAX_MATCH_TEXT_CHARS);
+  const lastSpace = cut.lastIndexOf(" ");
+  // Only back off to the last space if it's not absurdly far from the cap
+  // (a single very long token with no spaces at all falls back to the hard
+  // cut rather than returning almost nothing).
+  let safe = lastSpace > MAX_MATCH_TEXT_CHARS * 0.6 ? cut.slice(0, lastSpace) : cut;
+  // A hard cut can still land inside a UTF-16 surrogate pair (an emoji or
+  // other astral character) -- trim the trailing lone high surrogate rather
+  // than ship a broken code unit to the model.
+  const lastCode = safe.charCodeAt(safe.length - 1);
+  if (lastCode >= 0xd800 && lastCode <= 0xdbff) safe = safe.slice(0, -1);
+  return `${safe}…`;
+}
+
 const NARRATION_SYSTEM_PROMPT_BASE =
   "You are Jack, an AI co-presenter narrating a slide deck out loud to a live audience. " +
   "Given the current slide's content, generate a short, natural spoken narration -- present " +
@@ -166,7 +199,7 @@ export async function answerDeckQuestion(
   if (matches.length > 0) {
     materialParts.push(
       "Relevant material found in the deck:\n" +
-        matches.map((m) => `- "${m.title}": ${m.text}`).join("\n"),
+        matches.map((m) => `- "${m.title}": ${truncateForPrompt(m.text)}`).join("\n"),
     );
   }
   const prompt = `${materialParts.join("\n\n")}\n\nQuestion: ${question}`;

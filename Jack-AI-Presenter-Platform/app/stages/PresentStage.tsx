@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { JackOrb } from "../JackOrb";
 import { JackStatusBar } from "../components/JackStatusBar";
+import { MicDiagnostics } from "../components/MicDiagnostics";
 import { PresentSettingsPopover } from "../components/PresentSettingsPopover";
 import { PresentSetup } from "../components/PresentSetup";
 import { SlideVisual } from "../components/SlideVisual";
@@ -11,6 +12,7 @@ import { useFullscreen } from "../hooks/useFullscreen";
 import { useJack } from "../jack/JackProvider";
 import { searchDocuments } from "../jack/documentContext";
 import { fail, ok, type PresentationController } from "../jack/presentationController";
+import { isDevDiagnosticsEnabled } from "../lib/devDiagnostics";
 import { useSession } from "../session/SessionContext";
 import type { ParsedDocument, PresentationStatus, SessionAction, UploadedFile } from "../session/types";
 
@@ -242,14 +244,17 @@ function PresentSession({
       jack.sleep();
       jack.sleepJackLocal(); // leaving Present mode resets local activation -- re-entering starts asleep again
       jack.resetPresentationOpening(); // leaving Present mode is a genuinely new session next time (Phase 18)
+      // Practice/AskJack's own unmount cleanup already does this -- Present
+      // mode was the one missing it. Without this, turning the mic on here
+      // and then exiting left ambientListeningEnabled stuck true (it's
+      // shared context state, not per-mode), so the local ambient mic kept
+      // arming and capturing in the background of the mode-select screen and
+      // any other stage until someone happened to find a mic toggle again.
+      jack.setAmbientListeningEnabled(false);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const localUnavailable =
-    jack.jackLocalHealth !== null &&
-    jack.jackLocalHealth.llamacpp === "unavailable" &&
-    jack.jackLocalHealth.colibri === "unavailable";
   const whisperUnavailable = jack.jackLocalHealth?.whisper === "unavailable";
 
   async function submitLocalCommand(e: FormEvent) {
@@ -276,13 +281,10 @@ function PresentSession({
     jack.setAmbientListeningEnabled(!jack.ambientListeningEnabled);
   }
 
-  // Acoustic diagnostics gate (Phase 23): dev build AND an explicit ?dev=1
-  // opt-in, never both a normal dev-server session and a normal viewer.
-  const devDiagnosticsEnabled =
-    Boolean(import.meta.env?.DEV) && typeof window !== "undefined" && new URLSearchParams(window.location.search).get("dev") === "1";
+  const devDiagnosticsEnabled = isDevDiagnosticsEnabled();
 
   const localHealth: "checking" | "connected" | "offline" =
-    jack.jackLocalHealth === null ? "checking" : localUnavailable ? "offline" : "connected";
+    jack.jackLocalHealth === null ? "checking" : jack.localUnavailable ? "offline" : "connected";
   // Mic button/status now reflect the ambient-listening pipeline directly
   // (Phase 26) -- there's no separate push-to-talk ownership concept left,
   // just whichever bargeInPhase the shared recorder is actually in, plus
@@ -354,19 +356,13 @@ function PresentSession({
         )}
       {overlaysVisible && jack.lastError && <p className="speech-error present-subtitle-line" role="alert">{jack.lastError}</p>}
 
-      {overlaysVisible && localUnavailable && (
+      {overlaysVisible && jack.localUnavailable && (
         <p className="present-warning">Jack Local AI is unavailable. Manual presentation is still available.</p>
       )}
 
       {/* Acoustic diagnostics (Phase 23): dev-only, never shown to an audience by
           default -- requires BOTH a dev build and an explicit ?dev=1 opt-in. */}
-      {overlaysVisible && devDiagnosticsEnabled && jack.bargeInPhase !== "idle" && (
-        <p className="jack-mic-diagnostic" title="Ambient listening diagnostics -- for real-hardware interruption testing">
-          mic: {jack.bargeInPhase} · lvl {jack.localMicLevel.toFixed(2)}
-          {(jack.bargeInPhase === "armed" || jack.bargeInPhase === "capturing") &&
-            ` · floor ${jack.bargeInNoiseFloor.toFixed(2)} · thr ${jack.bargeInThreshold.toFixed(2)}`}
-        </p>
-      )}
+      {overlaysVisible && devDiagnosticsEnabled && <MicDiagnostics jack={jack} />}
 
       {overlaysVisible && (jack.localMicState === "requesting" || jack.localMicState === "initializing") && (
         <p className="jack-mic-feedback" aria-live="polite">Preparing the microphone…</p>

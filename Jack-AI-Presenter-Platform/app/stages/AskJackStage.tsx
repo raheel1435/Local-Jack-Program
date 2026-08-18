@@ -2,10 +2,12 @@
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { JackOrb } from "../JackOrb";
+import { MicDiagnostics } from "../components/MicDiagnostics";
 import { useJack } from "../jack/JackProvider";
 import { searchDocuments } from "../jack/documentContext";
 import { fail, ok, type PresentationController } from "../jack/presentationController";
 import { getAskJackProvider } from "../lib/askJackProvider";
+import { isDevDiagnosticsEnabled } from "../lib/devDiagnostics";
 import { useSession } from "../session/SessionContext";
 
 interface ConversationEntry {
@@ -28,15 +30,12 @@ export function AskJackStage() {
   const docs = Object.values(session.parsedDocs);
   const activeDoc = activeFileId ? session.parsedDocs[activeFileId] : undefined;
   const suggestions = activeDoc?.suggestedQuestions.slice(0, 4) ?? [];
+  const devDiagnosticsEnabled = isDevDiagnosticsEnabled();
   // The local gateway (llama.cpp/Kokoro/Whisper), not OpenAI -- this mode
   // never needed an OpenAI key and shouldn't ask for one. Only when the
-  // local LLM itself is unreachable does this fall back to a dumb offline
-  // keyword search (no AI at all), same graceful-degradation pattern as
-  // Present/Practice's localUnavailable warning.
-  const localUnavailable =
-    jack.jackLocalHealth !== null &&
-    jack.jackLocalHealth.llamacpp === "unavailable" &&
-    jack.jackLocalHealth.colibri === "unavailable";
+  // local LLM itself is unreachable (jack.localUnavailable) does this fall
+  // back to a dumb offline keyword search (no AI at all), same graceful-
+  // degradation pattern as Present/Practice's own localUnavailable warning.
 
   const latest = useRef({ docs, activeFileId });
   useEffect(() => {
@@ -93,7 +92,7 @@ export function AskJackStage() {
     setQuestion("");
     setThinking(true);
     try {
-      if (localUnavailable) {
+      if (jack.localUnavailable) {
         const answer = await offlineProvider.ask(trimmed, { docs, activeFileId });
         setHistory((h) => [...h, { id: crypto.randomUUID(), role: "jack", text: answer.text }]);
         return;
@@ -127,7 +126,7 @@ export function AskJackStage() {
         <div className="orb-wrap"><JackOrb state={jack.orb.orbState} size={140} /></div>
         <div className="jack-status">
           <i /> <strong>{jack.orb.label.toUpperCase()}</strong>
-          <small>{localUnavailable ? "Jack Local AI is unavailable — offline keyword search only" : "Ask about anything you uploaded"}</small>
+          <small>{jack.localUnavailable ? "Jack Local AI is unavailable — offline keyword search only" : "Ask about anything you uploaded"}</small>
         </div>
       </div>
 
@@ -164,6 +163,7 @@ export function AskJackStage() {
         </div>
       )}
 
+      {devDiagnosticsEnabled && <MicDiagnostics jack={jack} />}
       {jack.lastError && <p className="speech-error" role="alert">{jack.lastError}</p>}
 
       <form className="ask-jack-input-row" onSubmit={onSubmit}>

@@ -2,10 +2,12 @@
 
 import { useEffect, useRef, useState } from "react";
 import { JackOrb } from "../JackOrb";
+import { MicDiagnostics } from "../components/MicDiagnostics";
 import { SlideVisual } from "../components/SlideVisual";
 import { useJack } from "../jack/JackProvider";
 import { searchDocuments } from "../jack/documentContext";
 import { fail, ok, type PresentationController } from "../jack/presentationController";
+import { isDevDiagnosticsEnabled } from "../lib/devDiagnostics";
 import { useSession } from "../session/SessionContext";
 
 function formatElapsed(ms: number): string {
@@ -156,10 +158,7 @@ export function PracticeStage() {
   }
 
   const currentSection = sections[sectionIndex];
-  const localUnavailable =
-    jack.jackLocalHealth !== null &&
-    jack.jackLocalHealth.llamacpp === "unavailable" &&
-    jack.jackLocalHealth.colibri === "unavailable";
+  const devDiagnosticsEnabled = isDevDiagnosticsEnabled();
   const feedback = jack.lastCommandOutcome
     ? {
         prefix: jack.lastCommandKind === "interruption" ? "Interruption" : null,
@@ -223,13 +222,14 @@ export function PracticeStage() {
       </div>
 
       <p className="practice-connection">
-        {localUnavailable
+        {jack.localUnavailable
           ? "Jack Local AI is unavailable — practicing without live AI feedback."
           : jack.ambientListeningEnabled
             ? "Jack is listening -- say “Jack” to ask a question or get an explanation."
             : "Jack is ready -- turn the mic on to ask questions by voice, or use typed commands elsewhere."}
       </p>
 
+      {devDiagnosticsEnabled && <MicDiagnostics jack={jack} />}
       {jack.lastError && <p className="speech-error" role="alert">{jack.lastError}</p>}
       {feedback && (
         <p className={`jack-mic-feedback ${feedback.outcome.ok ? "" : "speech-error"}`} aria-live="polite">

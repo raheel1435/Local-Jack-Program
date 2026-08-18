@@ -260,6 +260,8 @@ export interface JackContextValue {
   setPresenterControl(owner: ControlOwner): void;
   /** Jack-Local-AI-Service reachability -- polled independently of the OpenAI Realtime connection, so manual mode can always report an honest status even when Jack is fully offline. */
   jackLocalHealth: JackHealth | null;
+  /** True once BOTH local LLM providers (llama.cpp and Colibri) are confirmed unavailable -- the one computation every mode's "Jack Local AI is unavailable" warning needs, centralized here instead of copied per-stage. */
+  localUnavailable: boolean;
 
   wake(): Promise<void>;
   sleep(): void;
@@ -737,12 +739,25 @@ export function JackProvider({ children }: { children: ReactNode }) {
   }, [dispatchEvent, teardownMic, runLevelLoop, humourEnabled, buildCurrentInstructions, fetchEphemeralKey, wireSessionEvents]);
 
   const sleep = useCallback(() => {
+    // Only dispatch SLEEP (which sets the SHARED attentionState to
+    // "sleeping") if there was an actual OpenAI Realtime session to tear
+    // down. Present mode's unmount cleanup calls sleep() unconditionally as
+    // defensive teardown regardless of whether OpenAI was ever connected --
+    // and since nothing in the current UI ever calls wake() to establish
+    // that connection in the first place, every real call here used to be a
+    // no-op session teardown that nonetheless permanently poisoned
+    // attentionState to "sleeping" for the rest of the browser session (no
+    // local-only code path ever dispatches WAKE to undo it). Confirmed live
+    // as captions silently never rendering again after a single visit to
+    // Present mode, and (before a separate fix) the local ambient mic
+    // refusing to arm anywhere afterward.
+    const hadSession = realtimeSessionRef.current !== null;
     realtimeSessionRef.current?.close();
     realtimeSessionRef.current = null;
     teardownMic();
     setMicStatus("off");
     setConnectionStatus("disconnected");
-    dispatchEvent({ type: "SLEEP" });
+    if (hadSession) dispatchEvent({ type: "SLEEP" });
   }, [teardownMic, dispatchEvent]);
 
   const mute = useCallback(() => {
@@ -809,6 +824,16 @@ export function JackProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const endSession = useCallback(() => {
+    // Same fix as sleep() above and for the same reason: only dispatch
+    // DISCONNECTED (-> attentionState "disconnected", permanently, since
+    // nothing local-only ever dispatches WAKE/CONNECTED to undo it) if there
+    // was a real OpenAI Realtime session to disconnect from. endSession()
+    // runs on every single "Exit presentation" click -- far more often than
+    // sleep()'s unmount-only path -- so this was the MORE common real-world
+    // trigger for attentionState getting stuck, confirmed live as captions
+    // silently never rendering again after simply exiting a presentation
+    // once via the Exit button.
+    const hadSession = realtimeSessionRef.current !== null;
     realtimeSessionRef.current?.close();
     realtimeSessionRef.current = null;
     teardownMic();
@@ -827,7 +852,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     // Jack to take over yet -- cosmetic, but a genuinely new session should
     // start with the presenter in control, same as the very first one does.
     setPresenterControl("presenter");
-    dispatchEvent({ type: "DISCONNECTED" });
+    if (hadSession) dispatchEvent({ type: "DISCONNECTED" });
   }, [teardownMic, dispatchEvent, wakeWordService]);
 
   // --- Controlled Jack speech (Phase 6) ---------------------------------
@@ -1179,9 +1204,22 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // Either way, EVERY captured utterance still has to pass isAddressedToJack
   // in finishBargeInCapture before it's treated as a command -- staying
   // armed longer/wider never means Jack reacts to more ambient noise, only
-  // that he's still listening for his own name. Reachability guard applies
-  // to both: never armed while Jack is asleep/disconnected/muted/erroring,
-  // since there's nothing that could sensibly act on a capture then.
+  // that he's still listening for his own name.
+  //
+  // Deliberately NOT gated on attentionState's sleeping/disconnected/muted/
+  // error (an earlier version of this effect was) -- those only ever get
+  // set by the OpenAI-Realtime-specific wake()/sleep()/mute() calls, and
+  // Present mode's own unmount cleanup calls sleep() unconditionally to tear
+  // down any lingering OpenAI resources. Confirmed live: visit Present mode
+  // once, leave it, and attentionState is stuck at "sleeping" for the rest
+  // of the session -- nothing in the local-only pipeline ever dispatches
+  // WAKE to undo it. With that guard here, ambientListeningEnabled would
+  // still flip on and the UI would still claim "Jack is listening", but
+  // localRecorder.start() would silently never run again anywhere in the
+  // app. attentionState genuinely does track real local speaking/standby
+  // transitions correctly (LOCAL_COMMAND_*/AUDIO_* are dispatched by this
+  // same local pipeline), which is why autoArmWhileJackPresents below still
+  // reads it directly -- only the extra blanket reachability gate was wrong.
   //
   // Sequence once armed: start the recorder immediately (so there's no audio
   // gap), but hold off actually watching for a burst for
@@ -1191,13 +1229,8 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // level-keyed effect) for the same reason the capture-silence poll is --
   // see its comment.
   useEffect(() => {
-    const jackReachable =
-      attentionState !== "sleeping" &&
-      attentionState !== "disconnected" &&
-      attentionState !== "muted" &&
-      attentionState !== "error";
     const autoArmWhileJackPresents = presenterControl === "jack" && (attentionState === "speaking" || attentionState === "standby");
-    const shouldArm = jackReachable && (ambientListeningEnabled || autoArmWhileJackPresents);
+    const shouldArm = ambientListeningEnabled || autoArmWhileJackPresents;
     if (shouldArm && bargeInPhaseRef.current === "idle") {
       setBargeInPhaseBoth("guarding");
       bargeInLoudTicksRef.current = 0;
@@ -1515,6 +1548,9 @@ export function JackProvider({ children }: { children: ReactNode }) {
     attentionState !== "muted" &&
     attentionState !== "disconnected";
 
+  const localUnavailable =
+    jackLocalHealth !== null && jackLocalHealth.llamacpp === "unavailable" && jackLocalHealth.colibri === "unavailable";
+
   const value: JackContextValue = {
     attentionState,
     orb: toOrbPresentation(attentionState),
@@ -1546,6 +1582,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     presenterControl,
     setPresenterControl,
     jackLocalHealth,
+    localUnavailable,
     wake,
     sleep,
     mute,
