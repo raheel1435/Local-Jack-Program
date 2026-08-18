@@ -39,8 +39,19 @@ const JACK_LOCAL_HEALTH_POLL_MS = 8000;
 // positive source: Jack's own TTS output starting up), not a substitute for
 // real acoustic verification with real speaker/mic hardware.
 const BARGE_IN_LEVEL = 0.12;
-const BARGE_IN_SUSTAIN_TICKS = 4; // consecutive over-threshold rAF ticks before it counts as real speech
-const BARGE_IN_SILENCE_MS = 900; // sustained quiet before auto-ending the captured utterance
+// 4 ticks (~64ms at the level-loop's ~60fps) was long enough for a brief
+// transient (a click, a cough onset, a chair creak) to trip a full
+// interruption -- confirmed live as Jack's own narration getting cut off
+// mid-sentence ("I can hear only part of his sentence") from things that
+// were never a real attempt to talk to him. 10 ticks (~160ms) still catches
+// genuine speech onset quickly but requires it to actually sustain.
+const BARGE_IN_SUSTAIN_TICKS = 10;
+// 900ms of quiet was tight enough to cut off a real utterance during an
+// ordinary mid-sentence thinking pause -- confirmed live as Jack only
+// hearing a fragment ("Jack?" instead of the rest of the question). 1500ms
+// gives a real pause room without making a finished utterance feel slow to
+// send.
+const BARGE_IN_SILENCE_MS = 1500;
 const BARGE_IN_MAX_CAPTURE_MS = 8000; // hard cap so a stuck capture can't hang forever
 // Jack's TTS output has the loudest, least-adapted transient in the first
 // instant of playback (volume ramp-up, echo-cancellation filter not yet
@@ -57,7 +68,12 @@ const BARGE_IN_ARM_GUARD_MS = 350;
 // needs a real spike on top of it to count as an interruption, rather than
 // arming exactly at the fixed BARGE_IN_LEVEL regardless of conditions.
 const BARGE_IN_CALIBRATION_MS = 250;
-const BARGE_IN_FLOOR_MARGIN = 0.06;
+// Raised from .06 alongside the sustain-tick increase above -- the same
+// false-triggering-on-Jack's-own-narration reports motivated both: a wider
+// margin above the calibrated floor means moderate background noise/echo
+// bleed-through needs a real spike, not just a slightly-elevated baseline,
+// to count as a genuine interruption.
+const BARGE_IN_FLOOR_MARGIN = 0.09;
 
 export interface LocalCommandOutcome {
   source: "deterministic" | "llm";
@@ -1269,17 +1285,33 @@ export function JackProvider({ children }: { children: ReactNode }) {
           return finish({ source: intent.source, ok: false, message });
         }
 
-        if (intent.type === "conversation") {
+        // Ask Jack has no slide concept at all -- an "action" classification
+        // there (explain_slide, next_slide, jump_to_slide, ...) is always a
+        // router/LLM misreading of what was actually an open question typed
+        // in a Q&A box ("tell me everything about pricing and the team" was
+        // getting classified as "explain_slide" and then handed a literally
+        // empty slide, producing "This slide is empty" instead of a real
+        // answer -- confirmed live). Every non-unknown intent goes through
+        // the Q&A path in this mode instead of ever trying to act on slides
+        // that don't exist.
+        const inAskJackMode = controllerRef.current.name === "Ask Jack";
+
+        if (intent.type === "conversation" || inAskJackMode) {
           // Any conversational turn pauses autonomy first -- Phase 12: after
           // an answer, Jack stays paused until an explicit "Continue.".
           cancelAutonomousPresenting();
           const ctx = buildPresentationContext(controller);
           const { parsedDocs, activeFileId } = appSessionRef.current;
+          // Ask Jack has no live narration to keep pace with and exists
+          // specifically for deep material knowledge -- give it a much wider
+          // slice of the deck than Present/Practice's lean, real-time
+          // narration-context Q&A (see retrieveForQuestion's comment).
           const { answer } = await answerDeckQuestion(
             text,
             ctx ?? { deckTitle: "", currentSlideNumber: 0, totalSlides: 0, currentSlideText: "" },
             Object.values(parsedDocs),
             activeFileId,
+            inAskJackMode,
           );
           dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
           void speakThroughPlayer(answer); // sets currentCaption itself

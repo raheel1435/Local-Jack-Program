@@ -72,11 +72,22 @@ function findNamedSlide(question: string, docs: ParsedDocument[], activeFileId: 
  * derived from retrieval evidence alone -- the caller must not ask the LLM to
  * decide whether the deck covers the question when confidence is "low".
  */
+// Real-time narration Q&A (Present/Practice) deliberately stays lean -- see
+// PresentationContext's doc comment ("no whole-deck dump"). Ask Jack mode has
+// no such constraint (no live narration to keep pace with) and its entire
+// purpose is deep material knowledge, so it gets a much wider slice of the
+// deck instead of just the top 3 keyword hits -- confirmed live that asking
+// broad questions in Ask Jack was getting shallow answers grounded in only
+// one or two slides when the deck had far more relevant material.
+const DEFAULT_MATCH_LIMIT = 3;
+const COMPREHENSIVE_MATCH_LIMIT = 10;
+
 export function retrieveForQuestion(
   question: string,
   context: PresentationContext | null,
   docs: ParsedDocument[],
   activeFileId: string | null,
+  comprehensive = false,
 ): RetrievalResult {
   if (context && CURRENT_SLIDE_RE.test(question)) {
     return {
@@ -112,7 +123,7 @@ export function retrieveForQuestion(
   if (named) return { matches: [named], confidence: "high" };
 
   const terms = tokenize(question);
-  const scored = findRelevantSections(question, docs, activeFileId, 3);
+  const scored = findRelevantSections(question, docs, activeFileId, comprehensive ? COMPREHENSIVE_MATCH_LIMIT : DEFAULT_MATCH_LIMIT);
   if (terms.length === 0 || scored.length === 0) return { matches: [], confidence: "low" };
 
   const matches: RetrievalMatch[] = scored.map((s) => ({

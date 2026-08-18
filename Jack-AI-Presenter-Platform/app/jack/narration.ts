@@ -138,8 +138,9 @@ export async function answerDeckQuestion(
   context: PresentationContext,
   docs: ParsedDocument[],
   activeFileId: string | null,
+  comprehensive = false,
 ): Promise<DeckAnswer> {
-  const retrieval = retrieveForQuestion(question, context, docs, activeFileId);
+  const retrieval = retrieveForQuestion(question, context, docs, activeFileId, comprehensive);
   const matches = retrieval.matches;
 
   // No deck material matched -- still let the LLM assess and answer (see
@@ -175,7 +176,11 @@ export async function answerDeckQuestion(
       { role: "system", content: systemPrompt },
       { role: "user", content: prompt },
     ],
-    { maxTokens: 180, temperature: 0.3 },
+    // Comprehensive mode (Ask Jack) draws on more material and deserves room
+    // for a fuller answer -- capping it at the same 180 tokens used for a
+    // lean, single-slide, real-time narration answer risked truncating a
+    // genuinely thorough answer mid-sentence.
+    { maxTokens: comprehensive ? 320 : 180, temperature: 0.3 },
   );
   return { answer: result.content.trim(), grounded: matches.length > 0, confidence: retrieval.confidence };
 }
