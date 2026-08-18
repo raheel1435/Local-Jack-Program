@@ -81,6 +81,44 @@ const QA_SYSTEM_PROMPT_MEDIUM =
   'address the question, say plainly: "' + NOT_COVERED_ANSWER + '" Never invent facts not ' +
   "present in the material provided.";
 
+/**
+ * Used when retrieval found nothing relevant AND the remark itself doesn't
+ * even reference the deck (see DECK_REFERENCE_RE / QA_SYSTEM_PROMPT_NO_MATERIAL
+ * below for the other half of this split). Deliberately does not mention
+ * NOT_COVERED_ANSWER anywhere in this prompt: confirmed live against the
+ * small local model (qwen2.5-1.5b) that simply INCLUDING that exact phrase
+ * as a quoted "if genuinely unrelated, say X" escape hatch was enough for
+ * the model to default to it even for a plain "Jack, are you listening?" --
+ * a weak model gravitates to the lowest-risk literal string handed to it in
+ * the prompt, regardless of the surrounding conditional logic. The fix is
+ * structural, not a wording tweak: keep this prompt entirely free of that
+ * phrase so there's nothing for the model to default to.
+ */
+const QA_SYSTEM_PROMPT_CONVERSATIONAL =
+  "You are Jack, a friendly AI co-presenter. The presenter or an audience member just said " +
+  "something to you during a live presentation -- a remark, greeting, or check-in, not a " +
+  "question about the slide deck's content. Respond naturally and briefly (1-2 short " +
+  "sentences), the way a helpful co-presenter would when spoken to directly.";
+
+/**
+ * Used when retrieval found nothing relevant, but the remark itself
+ * references the deck (contains "slide", "presentation", etc.) -- likely a
+ * genuine content question the deck just doesn't answer, so NOT_COVERED_ANSWER
+ * stays available here as the deliberate outcome, not a lazy default.
+ */
+const QA_SYSTEM_PROMPT_NO_MATERIAL =
+  "You are Jack, an AI co-presenter answering a question about the current deck during a live " +
+  "presentation. Nothing in the slide deck matched this question well enough to quote from. If, " +
+  "after considering it, this genuinely seems to be asking about the deck's content, say plainly: " +
+  '"' +
+  NOT_COVERED_ANSWER +
+  '" Never invent facts about the deck\'s content. Keep the reply to 1-2 short sentences.';
+
+/** Cheap, deterministic signal for whether an unmatched remark is even
+ * trying to ask about the deck at all -- see QA_SYSTEM_PROMPT_CONVERSATIONAL's
+ * comment for why this split exists instead of a single LLM-judged prompt. */
+const DECK_REFERENCE_RE = /\b(slide|slides|deck|presentation|page|pages|section|sections)\b/i;
+
 export interface DeckAnswer {
   answer: string;
   /** True if retrieval found material beyond a bare current-slide fallback. */
@@ -102,13 +140,28 @@ export async function answerDeckQuestion(
   activeFileId: string | null,
 ): Promise<DeckAnswer> {
   const retrieval = retrieveForQuestion(question, context, docs, activeFileId);
+  const matches = retrieval.matches;
 
+  // No deck material matched -- still let the LLM assess and answer (see
+  // QA_SYSTEM_PROMPT_NO_MATERIAL's comment): a lot of real speech directed
+  // at Jack was never a deck question in the first place.
   if (retrieval.confidence === "low") {
-    return { answer: NOT_COVERED_ANSWER, grounded: false, confidence: "low" };
+    const soundsLikeDeckQuestion = DECK_REFERENCE_RE.test(question);
+    const systemPrompt = soundsLikeDeckQuestion ? QA_SYSTEM_PROMPT_NO_MATERIAL : QA_SYSTEM_PROMPT_CONVERSATIONAL;
+    const prompt = soundsLikeDeckQuestion
+      ? `${formatContextForQA(context)}\n\nSomething was said that didn't match any deck content:\n"${question}"`
+      : `Something was just said to you during the presentation:\n"${question}"`;
+    const result = await jackApi.chat(
+      [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: prompt },
+      ],
+      { maxTokens: 120, temperature: 0.4 },
+    );
+    return { answer: result.content.trim(), grounded: false, confidence: "low" };
   }
 
   const materialParts = [formatContextForQA(context)];
-  const matches = retrieval.matches;
   if (matches.length > 0) {
     materialParts.push(
       "Relevant material found in the deck:\n" +

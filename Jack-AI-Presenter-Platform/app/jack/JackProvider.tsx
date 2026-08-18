@@ -1052,6 +1052,14 @@ export function JackProvider({ children }: { children: ReactNode }) {
     startAutonomousPresentingRef.current = startAutonomousPresenting;
   }, [cancelAutonomousPresenting, startAutonomousPresenting]);
 
+  // Ambient barge-in picks up EVERY sustained sound over threshold -- room
+  // noise, someone else talking, a cough -- not just remarks actually meant
+  // for Jack. Unlike push-to-talk (an explicit button press, always meant
+  // for Jack) or typed text, a barge-in transcript must actually name Jack
+  // before it's treated as a command/question; otherwise it's silently
+  // discarded here, before ever reaching runLocalCommand or the UI.
+  const isAddressedToJack = useCallback((transcript: string) => /\bjack\b/i.test(transcript), []);
+
   // --- Barge-in: capture finished (silence/timeout) -> transcribe -> route ---
   const finishBargeInCapture = useCallback(async () => {
     setBargeInPhaseBoth("idle");
@@ -1066,7 +1074,9 @@ export function JackProvider({ children }: { children: ReactNode }) {
     try {
       const { text } = await jackApi.transcribeAudio(audio);
       const transcript = text.trim();
-      if (!transcript) {
+      if (!transcript || !isAddressedToJack(transcript)) {
+        // Ambient noise / background speech that never named Jack -- ignore
+        // it entirely rather than surfacing it as a failed "Interruption".
         dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
         return;
       }
@@ -1080,7 +1090,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
       setLastError(err instanceof Error ? err.message : "Transcription failed.");
     }
-  }, [clearBargeInCaptureTimeout, localRecorder, dispatchEvent, setBargeInPhaseBoth]);
+  }, [clearBargeInCaptureTimeout, localRecorder, dispatchEvent, setBargeInPhaseBoth, isAddressedToJack]);
 
   const handleBargeInDetected = useCallback(() => {
     setBargeInPhaseBoth("capturing");
@@ -1117,20 +1127,35 @@ export function JackProvider({ children }: { children: ReactNode }) {
     }, 150);
   }, [stopJackAudio, dispatchEvent, clearBargeInArmTimers, clearBargeInCaptureTimeout, finishBargeInCapture]);
 
-  // Arm/disarm ambient listening as Jack's own autonomous speech starts and
-  // stops. Only while Jack himself holds the floor (presenterControl ===
-  // "jack") -- barge-in during a human-triggered explain/summarize answer is
-  // out of scope for this milestone.
+  // Arm/disarm ambient listening for as long as Jack holds the floor
+  // (presenterControl === "jack") and is actually awake and reachable --
+  // not just the instant he's mid-utterance. Originally this only armed
+  // while attentionState === "speaking", which meant the mic went dead the
+  // moment Jack stopped talking (between narration steps, or -- confirmed
+  // live -- immediately after ANY failed command, since a failure's
+  // LOCAL_COMMAND_DONE lands on "standby" and nothing else was there to
+  // re-arm it). From the user's side that reads as "the mic keeps turning
+  // itself off". "standby" is Jack's normal idle-but-in-control state, so
+  // including it keeps ambient listening running continuously through the
+  // whole time Jack is presenting -- addressed remarks are still filtered by
+  // isAddressedToJack in finishBargeInCapture, so staying armed longer does
+  // not mean Jack reacts to more ambient noise, only that he's still
+  // listening for his own name. Explicitly excluded: "listening" (push-to-
+  // talk owns the mic then -- see startLocalListening's comment on recorder
+  // ownership), "thinking"/"acting" (a command is already in flight),
+  // "muted"/"sleeping"/"paused"/"disconnected"/"error" (Jack isn't available
+  // to be interrupted).
   //
-  // Sequence once Jack starts speaking: start the recorder immediately (so
-  // there's no audio gap), but hold off actually watching for a burst for
+  // Sequence once armed: start the recorder immediately (so there's no audio
+  // gap), but hold off actually watching for a burst for
   // BARGE_IN_ARM_GUARD_MS (skips the playback-start transient), then spend
   // BARGE_IN_CALIBRATION_MS sampling the level to set an effective threshold
   // for this utterance, THEN arm. All timers are on their own clock (not a
   // level-keyed effect) for the same reason the capture-silence poll is --
   // see its comment.
   useEffect(() => {
-    const shouldArm = attentionState === "speaking" && presenterControl === "jack";
+    const shouldArm =
+      presenterControl === "jack" && (attentionState === "speaking" || attentionState === "standby");
     if (shouldArm && bargeInPhaseRef.current === "idle") {
       setBargeInPhaseBoth("guarding");
       bargeInLoudTicksRef.current = 0;
@@ -1213,7 +1238,9 @@ export function JackProvider({ children }: { children: ReactNode }) {
         // below, no matter what the model happened to put in `action`.
         if (intent.type === "unknown") {
           dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
-          return finish({ source: intent.source, ok: false, message: "I only heard part of that. Please try again." });
+          const message = "I only heard part of that. Please try again.";
+          void speakThroughPlayer(message);
+          return finish({ source: intent.source, ok: false, message });
         }
 
         if (intent.type === "conversation") {
@@ -1333,6 +1360,14 @@ export function JackProvider({ children }: { children: ReactNode }) {
         }
 
         dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
+        // Success paths above already speak their own acknowledgement/answer
+        // through speakThroughPlayer/speakAndWait -- this only covers the
+        // ones that fall through to here with a failure, which previously
+        // left Jack completely silent (the failure only ever reached the
+        // UI as text), e.g. "Couldn't find a slide matching ...".
+        if (!(result?.success ?? false) && result?.error) {
+          void speakThroughPlayer(result.error);
+        }
         return finish({
           source: intent.source,
           action,
@@ -1341,10 +1376,12 @@ export function JackProvider({ children }: { children: ReactNode }) {
         });
       } catch (err) {
         dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
+        const message = err instanceof Error ? err.message : "Local Jack request failed.";
+        void speakThroughPlayer(message);
         return finish({
           source: "llm",
           ok: false,
-          message: err instanceof Error ? err.message : "Local Jack request failed.",
+          message,
         });
       }
     },

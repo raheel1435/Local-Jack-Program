@@ -18,7 +18,7 @@ const WORD_NUMBERS: Record<string, number> = {
 function extractExplicitNumber(utterance: string): number | null {
   const lower = utterance.toLowerCase();
 
-  const digitMatch = lower.match(/\b(?:slide|page|section)\s*#?\s*(\d+)\b/);
+  const digitMatch = lower.match(/\b(?:slide|page|section)\s*(?:number|num|no\.?)?\s*#?\s*(\d+)\b/);
   if (digitMatch) return Number(digitMatch[1]);
 
   const digitOrdinalMatch = lower.match(/\b(\d+)(?:st|nd|rd|th)?\s*(?:slide|page|section)\b/);
