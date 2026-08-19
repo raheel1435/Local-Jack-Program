@@ -160,6 +160,35 @@ button.sync-presence:hover{filter:brightness(1.15)}
 .jack-asr-diag-row{display:grid;grid-template-columns:64px 48px 56px 1fr;gap:6px;align-items:center;font-family:monospace;font-size:10px;padding:3px 4px;background:rgba(255,255,255,.03);border-radius:4px}
 .jack-asr-diag-transcript{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#dff8ff}
 
+/* Jack Performance panel (latency-observatory milestone) */
+.jack-perf-subtitle{font-size:10px;color:#8aa0c0;text-transform:uppercase;letter-spacing:.04em;margin:8px 0 4px}
+.jack-perf-trace-card{background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+.jack-perf-trace-header{display:flex;align-items:center;justify-content:space-between}
+.jack-perf-trace-kind{font-size:11px;color:#c3dcea;font-weight:600}
+.jack-perf-trace-label{font-size:10px;color:#8aa0c0;margin:2px 0 6px;font-style:italic;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.jack-perf-rating{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.03em;padding:2px 6px;border-radius:4px}
+.jack-perf-rating-excellent{background:rgba(61,220,132,.18);color:#3ddc84}
+.jack-perf-rating-good{background:rgba(0,217,245,.18);color:var(--cyan)}
+.jack-perf-rating-acceptable{background:rgba(255,200,0,.18);color:#ffc800}
+.jack-perf-rating-poor{background:rgba(255,140,0,.18);color:#ff8c00}
+.jack-perf-rating-unacceptable{background:rgba(255,92,92,.18);color:#ff5c5c}
+.jack-perf-table{width:100%;border-collapse:collapse;font-family:monospace;font-size:11px}
+.jack-perf-table td{padding:2px 0;color:#dff8ff}
+.jack-perf-table td:last-child{text-align:right;font-variant-numeric:tabular-nums}
+.jack-perf-total-row td{border-top:1px solid var(--line);padding-top:4px;font-weight:700;color:var(--cyan)}
+.jack-perf-bottleneck{font-size:10px;color:#ff9a5c;margin:6px 0 0;font-weight:600}
+.jack-perf-failed{font-size:10px;color:#ff5c5c;margin:4px 0 0}
+.jack-perf-stats-scroll{overflow-x:auto}
+.jack-perf-stats-table{width:100%;border-collapse:collapse;font-family:monospace;font-size:10px;white-space:nowrap}
+.jack-perf-stats-table th{text-align:right;color:#8aa0c0;font-weight:600;padding:2px 6px}
+.jack-perf-stats-table th:first-child,.jack-perf-stats-table td:first-child{text-align:left}
+.jack-perf-stats-table td{text-align:right;padding:2px 6px;color:#dff8ff;font-variant-numeric:tabular-nums}
+.jack-perf-history{font-size:11px;color:#8aa0c0;margin-top:6px}
+.jack-perf-history summary{cursor:pointer;color:#c3dcea}
+.jack-perf-history-list{list-style:none;margin:6px 0 0;padding:0;display:flex;flex-direction:column;gap:4px;max-height:160px;overflow-y:auto}
+.jack-perf-history-row{display:grid;grid-template-columns:110px 64px 48px 1fr;gap:6px;align-items:center;font-family:monospace;font-size:10px;padding:3px 4px;background:rgba(255,255,255,.03);border-radius:4px}
+.jack-perf-history-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#dff8ff;font-style:italic}
+
 /* Compact Jack control cluster (mic / typed-command toggle / browser-voice fallback) -- lives inline in present-controls */
 .jack-controls-cluster{display:inline-flex;gap:6px;padding:0 4px;border-left:1px solid var(--line);border-right:1px solid var(--line);margin:0 2px}
 .jack-mic-btn,.jack-command-toggle-btn,.jack-voice-fallback-btn{background:rgba(0,217,245,.06);border:1px solid rgba(0,217,245,.25);border-radius:8px;color:var(--text);padding:8px 12px;font-size:14px;line-height:1;cursor:pointer}

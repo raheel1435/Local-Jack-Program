@@ -2,6 +2,7 @@
 
 import { LANGUAGE_OPTIONS, VOICE_OPTIONS } from "../jack/voiceSettings";
 import { useJack } from "../jack/JackProvider";
+import { JackPerformancePanel } from "./JackPerformancePanel";
 
 /**
  * Compact settings sheet for Present mode (Phase 18) -- language, voice,
@@ -109,6 +110,8 @@ export function PresentSettingsPopover({ onClose }: { onClose: () => void }) {
           </ul>
         </details>
       )}
+
+      <JackPerformancePanel traces={jack.perfTraces} />
 
       <button type="button" className="jack-settings-close" onClick={onClose} aria-label="Close settings">Done</button>
     </div>

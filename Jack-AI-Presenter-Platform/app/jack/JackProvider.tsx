@@ -5,6 +5,17 @@ import { OpenAIRealtimeWebRTC, RealtimeAgent, RealtimeSession, type RealtimeItem
 import { useLocalRecorder, type LocalRecorderState } from "../hooks/useLocalRecorder";
 import { useSpeech, type UseSpeechResult } from "../hooks/useSpeech";
 import { jackApi, type AsrProviderId, type JackHealth, type JackIntentAction } from "../lib/jackApi";
+import {
+  abortTrace,
+  finishTrace,
+  getTraceHistory,
+  mark,
+  setTraceLabel,
+  setTraceProvider,
+  startTrace,
+  subscribeTraces,
+  type TraceRecord,
+} from "./perfTrace";
 import { summarizeDocuments } from "./documentContext";
 import { buildInstructions } from "./instructions";
 import { createJackSpeechPlayer } from "./jackSpeechPlayer";
@@ -283,6 +294,8 @@ export interface JackContextValue {
   asrProvider: AsrProviderId;
   /** Last few measured transcriptions (both engines), newest first -- see AsrDiagnosticEntry. */
   asrDiagnostics: AsrDiagnosticEntry[];
+  /** Last few end-to-end latency traces (voice commands, typed commands, narration steps, wake greetings), newest first -- see perfTrace.ts. */
+  perfTraces: TraceRecord[];
   setVoice(voice: string): void;
   setCaptionsEnabled(enabled: boolean): void;
   setBrowserFallbackEnabled(enabled: boolean): void;
@@ -445,6 +458,16 @@ export function JackProvider({ children }: { children: ReactNode }) {
       ...prev,
     ].slice(0, MAX_ASR_DIAGNOSTICS));
   }, []);
+  // End-to-end latency traces (latency-observatory milestone): mirrors
+  // perfTrace.ts's module-level history into React state via its
+  // subscription so the Diagnostics panel re-renders when a trace finishes.
+  // Same local-only/session-scoped/no-raw-audio guarantees as asrDiagnostics
+  // above -- see perfTrace.ts's module doc comment.
+  const [perfTraces, setPerfTraces] = useState<TraceRecord[]>([]);
+  useEffect(() => {
+    setPerfTraces(getTraceHistory());
+    return subscribeTraces(() => setPerfTraces(getTraceHistory()));
+  }, []);
   const [lastError, setLastError] = useState<string | null>(null);
   const [controlMode, setControlModeState] = useState<ControlMode>("presenterLeads");
   const [audienceQuestionPolicy, setAudienceQuestionPolicyState] = useState<AudienceQuestionPolicy>("askPresenterFirst");
@@ -560,6 +583,18 @@ export function JackProvider({ children }: { children: ReactNode }) {
     setBargeInPhase(phase);
   }, []);
   const bargeInLoudTicksRef = useRef(0);
+  // Perf trace id for the in-progress capture (dual-ASR-latency milestone):
+  // started the moment barge-in is detected (T0), used by both the silence
+  // poller (T1/T2) and finishBargeInCapture (T3-T9) below.
+  const bargeInTraceIdRef = useRef<string | undefined>(undefined);
+  // Perf trace id for whichever speak+play cycle is CURRENTLY audible (dual-
+  // ASR-latency milestone). speechPlayer.stop() deliberately never invokes
+  // its pending onEnded callback (see jackSpeechPlayer.ts's stop() doc
+  // comment -- that's how callers tell "finished" from "cut off"), which
+  // means the finishTrace() call that normally lives inside onEnded would
+  // never run for an interrupted utterance, leaking that trace forever.
+  // stopJackAudio reads this ref to finish it explicitly, with ok=false.
+  const activeSpeechTraceIdRef = useRef<string | undefined>(undefined);
   const bargeInSilenceStartRef = useRef<number | null>(null);
   const bargeInCaptureTimeoutRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const bargeInArmGuardTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -583,9 +618,9 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // Lets finishBargeInCapture (defined before runLocalCommand, since
   // runLocalCommand itself needs the barge-in machinery) call the latest
   // runLocalCommand without a circular useCallback dependency.
-  const runLocalCommandRef = useRef<(text: string, kind?: "typed" | "voice" | "interruption") => Promise<LocalCommandOutcome>>(
-    async () => ({ source: "deterministic", ok: false, message: "Jack isn't ready yet." }),
-  );
+  const runLocalCommandRef = useRef<
+    (text: string, kind?: "typed" | "voice" | "interruption", traceId?: string) => Promise<LocalCommandOutcome>
+  >(async () => ({ source: "deterministic", ok: false, message: "Jack isn't ready yet." }));
   // Same forward-reference pattern for pause()/resume() (defined earlier,
   // for the manual Pause/Resume buttons) to reach the autonomy controls
   // (defined later, since they depend on the speech player/narration deps).
@@ -593,11 +628,13 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const startAutonomousPresentingRef = useRef<() => void>(() => {});
   // Same forward-reference pattern, for pause()/interrupt()'s short spoken
   // acknowledgement (Phase 14) -- speakThroughPlayer is defined later since
-  // it depends on speechPlayer/voice.
-  const speakThroughPlayerRef = useRef<(text: string) => Promise<void>>(async () => {});
+  // it depends on speechPlayer/voice. Optional traceId (perf tracing,
+  // dual-ASR-latency milestone): callers that started a trace pass it
+  // through so this call can mark/finish its T15-T19 stages.
+  const speakThroughPlayerRef = useRef<(text: string, traceId?: string) => Promise<void>>(async () => {});
   // Same pattern, for resume()'s short continuity line (Phase 13/14) --
   // speakAndWait is defined later since it depends on speechPlayer/voice.
-  const speakAndWaitRef = useRef<(text: string) => Promise<void>>(async () => {});
+  const speakAndWaitRef = useRef<(text: string, traceId?: string) => Promise<void>>(async () => {});
 
   const realtimeSessionRef = useRef<RealtimeSession | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -948,6 +985,10 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // --- Controlled Jack speech (Phase 6) ---------------------------------
   const stopJackAudio = useCallback(() => {
     speechPlayer.stop();
+    // See activeSpeechTraceIdRef's comment -- stop() never fires onEnded, so
+    // this is the only place an interrupted trace ever gets recorded.
+    finishTrace(activeSpeechTraceIdRef.current, false);
+    activeSpeechTraceIdRef.current = undefined;
   }, [speechPlayer]);
 
   /**
@@ -964,14 +1005,29 @@ export function JackProvider({ children }: { children: ReactNode }) {
    * readCurrentSlide below).
    */
   const speakThroughPlayer = useCallback(
-    async (text: string) => {
+    // traceId is optional (perf tracing, dual-ASR-latency milestone): when
+    // given, this call owns marking/finishing T15-T19 -- it's the last
+    // stage for every branch that calls it (Q&A answers, explain/summarize,
+    // the unknown-command fallback), so it's the only place that actually
+    // knows when audio starts/finishes playing.
+    async (text: string, traceId?: string) => {
       setCurrentCaption(text);
+      mark(traceId, "ttsRequestStart"); // T15 -- ttsFirstAudio (T16) not measurable, non-streaming
       try {
         const audio = await jackApi.speak(text, voice);
+        mark(traceId, "ttsResponseReady");
         dispatchEvent({ type: "AUDIO_START" });
-        speechPlayer.play(audio, () => dispatchEvent({ type: "AUDIO_STOPPED" }));
+        mark(traceId, "playbackStart"); // T17
+        activeSpeechTraceIdRef.current = traceId;
+        speechPlayer.play(audio, () => {
+          activeSpeechTraceIdRef.current = undefined;
+          mark(traceId, "playbackComplete"); // T19
+          finishTrace(traceId);
+          dispatchEvent({ type: "AUDIO_STOPPED" });
+        });
       } catch {
         // Kokoro unavailable -- text already shown via currentCaption; speech is best-effort.
+        finishTrace(traceId, false);
       }
     },
     [dispatchEvent, speechPlayer, voice],
@@ -990,19 +1046,29 @@ export function JackProvider({ children }: { children: ReactNode }) {
    * narration.
    */
   const speakAndWait = useCallback(
-    (text: string): Promise<void> =>
+    (text: string, traceId?: string): Promise<void> =>
       new Promise((resolve) => {
         setCurrentCaption(text);
+        mark(traceId, "ttsRequestStart"); // T15
         jackApi
           .speak(text, voice)
           .then((audio) => {
+            mark(traceId, "ttsResponseReady");
             dispatchEvent({ type: "AUDIO_START" });
+            mark(traceId, "playbackStart"); // T17
+            activeSpeechTraceIdRef.current = traceId;
             speechPlayer.play(audio, () => {
+              activeSpeechTraceIdRef.current = undefined;
+              mark(traceId, "playbackComplete"); // T19
+              finishTrace(traceId);
               dispatchEvent({ type: "AUDIO_STOPPED" });
               resolve();
             });
           })
-          .catch(() => resolve()); // Kokoro unavailable -- don't block the caller's continuation
+          .catch(() => {
+            finishTrace(traceId, false);
+            resolve(); // Kokoro unavailable -- don't block the caller's continuation
+          });
       }),
     [dispatchEvent, speechPlayer, voice],
   );
@@ -1056,7 +1122,8 @@ export function JackProvider({ children }: { children: ReactNode }) {
     if (jackAwakeRef.current) return;
     jackAwakeRef.current = true;
     setJackAwake(true);
-    await speakAndWait(pickGreeting(humourEnabled));
+    const traceId = startTrace("wake_greeting");
+    await speakAndWait(pickGreeting(humourEnabled), traceId);
   }, [speechPlayer, speakAndWait, humourEnabled]);
 
   const unlockSpeech = useCallback(() => {
@@ -1138,10 +1205,22 @@ export function JackProvider({ children }: { children: ReactNode }) {
       const stillCurrent = () => narrationGenerationRef.current === generation && narrationActiveRef.current;
       if (!stillCurrent()) return;
 
+      // One trace per narration step (per slide), covering T9 (this slide
+      // becoming current -- the earliest point in code where it's known,
+      // essentially concurrent with React committing the slide change) all
+      // the way through T17/T19 (audible speech start/playback end). This is
+      // the headline "slide change -> Jack speaking" metric the Diagnostics
+      // panel surfaces -- see perfTrace.ts's rateSlideToSpeech.
+      const traceId = startTrace("slide_narration");
+      mark(traceId, "slideMutationDone"); // T9
+
       const controller = controllerRef.current.controller;
+      mark(traceId, "contextBuildStart"); // T10
       const context: PresentationContext | null = buildPresentationContext(controller, slideIndex);
+      mark(traceId, "contextBuildReady"); // T11
       if (!context) {
         cancelAutonomousPresenting();
+        finishTrace(traceId, false);
         return;
       }
 
@@ -1153,17 +1232,25 @@ export function JackProvider({ children }: { children: ReactNode }) {
       const isOpening = !presentationOpeningDeliveredRef.current;
       presentationOpeningDeliveredRef.current = true;
       let narrationText: string;
+      mark(traceId, "llmRequestStart"); // T12 -- llmFirstToken (T13) is not measurable: jackApi.chat is a single non-streaming JSON response, not SSE
       try {
         narrationText = await generateSlideNarration(context, isOpening, humourEnabled);
       } catch (err) {
         // Phase 17: LLM failure during autonomy -- stop, don't guess, stay put.
         cancelAutonomousPresenting();
         setLastError(err instanceof Error ? err.message : "Jack couldn't prepare narration for this slide.");
+        finishTrace(traceId, false);
         return;
       }
-      if (!stillCurrent()) return;
+      mark(traceId, "llmResponseReady"); // T14
+      setTraceLabel(traceId, narrationText);
+      if (!stillCurrent()) {
+        finishTrace(traceId, false);
+        return;
+      }
 
       let audio: Blob;
+      mark(traceId, "ttsRequestStart"); // T15 -- ttsFirstAudio (T16) is not measurable: jackApi.speak resolves only once the whole audio blob is downloaded
       try {
         audio = await jackApi.speak(narrationText, voice);
       } catch (err) {
@@ -1171,13 +1258,23 @@ export function JackProvider({ children }: { children: ReactNode }) {
         setCurrentCaption(narrationText);
         cancelAutonomousPresenting();
         setLastError(err instanceof Error ? err.message : "Jack's voice is unavailable right now.");
+        finishTrace(traceId, false);
         return;
       }
-      if (!stillCurrent()) return;
+      mark(traceId, "ttsResponseReady");
+      if (!stillCurrent()) {
+        finishTrace(traceId, false);
+        return;
+      }
 
       setCurrentCaption(narrationText);
       dispatchEvent({ type: "AUDIO_START" });
+      mark(traceId, "playbackStart"); // T17 -- closest available proxy for first audible sample (no lower-level playback-started callback exists)
+      activeSpeechTraceIdRef.current = traceId;
       speechPlayer.play(audio, () => {
+        activeSpeechTraceIdRef.current = undefined;
+        mark(traceId, "playbackComplete"); // T19
+        finishTrace(traceId);
         dispatchEvent({ type: "AUDIO_STOPPED" });
         if (!stillCurrent()) return; // cancelled/interrupted during playback -- do NOT advance
         const advance = controller.goToNextSlide();
@@ -1218,31 +1315,44 @@ export function JackProvider({ children }: { children: ReactNode }) {
 
   // --- Barge-in: capture finished (silence/timeout) -> transcribe -> route ---
   const finishBargeInCapture = useCallback(async () => {
+    const traceId = bargeInTraceIdRef.current;
     setBargeInPhaseBoth("idle");
     clearBargeInCaptureTimeout();
     console.log("[mic] stop() called from: finishBargeInCapture");
     const audio = await localRecorder.stop();
+    mark(traceId, "captureFinalized"); // T3
     if (!audio) {
+      abortTrace(traceId);
+      bargeInTraceIdRef.current = undefined;
       dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
       return;
     }
     dispatchEvent({ type: "LOCAL_COMMAND_START" });
     try {
+      mark(traceId, "asrRequestStart"); // T4
       const result = await jackApi.transcribeAudio(audio, undefined, asrProvider);
+      mark(traceId, "asrTranscriptReady"); // T5
+      if (traceId) setTraceProvider(traceId, result.provider);
       const transcript = result.text.trim();
+      if (traceId) setTraceLabel(traceId, transcript);
       if (!transcript || !isAddressedToJack(transcript)) {
         // Ambient noise / background speech that never named Jack -- ignore
         // it entirely rather than surfacing it as a failed "Interruption".
         recordAsrDiagnostic({ provider: result.provider, transcript, latencyMs: result.latencyMs, success: true });
+        finishTrace(traceId, false);
+        bargeInTraceIdRef.current = undefined;
         dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
         return;
       }
       // Reuses the exact same intent-routing path as typed/push-to-talk
-      // input -- interruption is just another way text reaches Jack.
-      // runLocalCommand itself records the outcome (kind: "interruption")
-      // into the single shared lastCommand* state -- no separate tracking
-      // needed here, and nothing about to become stale later.
-      const outcome = await runLocalCommandRef.current(transcript, "interruption");
+      // input -- interruption is just another way text reaches Jack. Hands
+      // off the same traceId so intent/action/response stages (T6 onward)
+      // land on this trace instead of starting a new one. runLocalCommand
+      // itself records the outcome (kind: "interruption") into the single
+      // shared lastCommand* state -- no separate tracking needed here, and
+      // nothing about to become stale later.
+      const outcome = await runLocalCommandRef.current(transcript, "interruption", traceId);
+      bargeInTraceIdRef.current = undefined;
       recordAsrDiagnostic({
         provider: result.provider,
         transcript,
@@ -1251,6 +1361,8 @@ export function JackProvider({ children }: { children: ReactNode }) {
         downstreamOk: outcome.ok,
       });
     } catch (err) {
+      finishTrace(traceId, false);
+      bargeInTraceIdRef.current = undefined;
       dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
       setLastError(err instanceof Error ? err.message : "Transcription failed.");
       recordAsrDiagnostic({ provider: asrProvider, transcript: "", latencyMs: 0, success: false });
@@ -1267,6 +1379,9 @@ export function JackProvider({ children }: { children: ReactNode }) {
     dispatchEvent({ type: "USER_SPEECH_DETECTED" }); // speaking -> listening (existing transition)
     clearBargeInArmTimers();
     clearBargeInCaptureTimeout();
+    const traceId = startTrace("voice_command");
+    bargeInTraceIdRef.current = traceId;
+    mark(traceId, "speechStart"); // T0 -- VAD crossing the barge-in threshold is the earliest signal available
     const captureStarted = Date.now();
     let finished = false;
     // Polling interval, not a level-keyed effect: true silence can hold at
@@ -1286,6 +1401,12 @@ export function JackProvider({ children }: { children: ReactNode }) {
       const hardCap = now - captureStarted > BARGE_IN_MAX_CAPTURE_MS;
       if ((sustainedSilence || hardCap) && !finished) {
         finished = true;
+        // T1: the moment silence actually started (sustainedSilence case),
+        // not the moment this poll noticed it BARGE_IN_SILENCE_MS later --
+        // falls back to "now" for the hardCap case, where there's no clean
+        // end-of-speech signal at all.
+        mark(bargeInTraceIdRef.current, "speechEnd", sustainedSilence ? (bargeInSilenceStartRef.current ?? now) : now);
+        mark(bargeInTraceIdRef.current, "vadEndOfTurn"); // T2
         clearBargeInCaptureTimeout();
         void finishBargeInCapture();
       }
@@ -1391,7 +1512,11 @@ export function JackProvider({ children }: { children: ReactNode }) {
   }, [localRecorder.level, handleBargeInDetected]);
 
   const runLocalCommand = useCallback(
-    async (text: string, kind: "typed" | "voice" | "interruption" = "typed"): Promise<LocalCommandOutcome> => {
+    async (
+      text: string,
+      kind: "typed" | "voice" | "interruption" = "typed",
+      incomingTraceId?: string,
+    ): Promise<LocalCommandOutcome> => {
       // Every exit path funnels through here so lastCommand* always reflects
       // whichever call to runLocalCommand most recently finished -- see the
       // comment on lastCommandOutcome in the context interface above.
@@ -1399,6 +1524,16 @@ export function JackProvider({ children }: { children: ReactNode }) {
         recordCommandOutcome(text, outcome, kind);
         return outcome;
       };
+
+      // Perf tracing (dual-ASR-latency milestone): voice/interruption calls
+      // arrive with a trace already started back in finishBargeInCapture
+      // (covering T0-T5); typed calls have no ASR stage, so a fresh trace
+      // starts here at T6. `traceHandedOff` tracks whether some downstream
+      // speakThroughPlayer/speakAndWait call now owns finishing this trace
+      // (T15-T19) -- if nothing ends up speaking, this function finishes it
+      // itself right before returning.
+      const traceId = incomingTraceId ?? startTrace(kind === "typed" ? "typed_command" : "voice_command", text);
+      let traceHandedOff = false;
 
       // Typed submission is a real user gesture -- must unlock synchronously
       // within it (see jackSpeechPlayer.ts). Voice-triggered calls are
@@ -1408,7 +1543,9 @@ export function JackProvider({ children }: { children: ReactNode }) {
       dispatchEvent({ type: "LOCAL_COMMAND_START" });
       const controller = controllerRef.current.controller;
       try {
+        mark(traceId, "intentRequestStart"); // T6
         const intent = await jackApi.detectIntent(text);
+        mark(traceId, "intentResultReady"); // T7
         dispatchEvent({ type: "LOCAL_COMMAND_ACTING" });
 
         // Phase 1 safety gate: the presentation may ONLY change for
@@ -1417,7 +1554,8 @@ export function JackProvider({ children }: { children: ReactNode }) {
         if (intent.type === "unknown") {
           dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
           const message = "I only heard part of that. Please try again.";
-          void speakThroughPlayer(message);
+          traceHandedOff = true;
+          void speakThroughPlayer(message, traceId);
           return finish({ source: intent.source, ok: false, message });
         }
 
@@ -1479,22 +1617,26 @@ export function JackProvider({ children }: { children: ReactNode }) {
             // (shown in the feedback line/captions if visible) so the
             // presenter isn't left wondering whether the command landed.
             dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
+            finishTrace(traceId);
             return finish({ source: intent.source, ok: true, message: "Jack is staying quiet -- audience questions go to you." });
           }
           if (audiencePolicyApplies && audienceQuestionPolicy === "moderatedQueue") {
             queueQuestion(text);
             dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
             const ack = "Noted -- I'll leave that one for you to address.";
-            void speakThroughPlayer(ack);
+            void speakThroughPlayer(ack, traceId);
             return finish({ source: intent.source, ok: true, message: ack });
           }
 
+          mark(traceId, "contextBuildStart"); // T10
           const ctx = buildPresentationContext(controller);
+          mark(traceId, "contextBuildReady"); // T11
           const { parsedDocs, activeFileId } = appSessionRef.current;
           // Ask Jack has no live narration to keep pace with and exists
           // specifically for deep material knowledge -- give it a much wider
           // slice of the deck than Present/Practice's lean, real-time
           // narration-context Q&A (see retrieveForQuestion's comment).
+          mark(traceId, "llmRequestStart"); // T12 -- covers answerDeckQuestion's internal LLM call; T13 not measurable (non-streaming)
           const { answer } = await answerDeckQuestion(
             text,
             ctx ?? { deckTitle: "", currentSlideNumber: 0, totalSlides: 0, currentSlideText: "" },
@@ -1502,8 +1644,9 @@ export function JackProvider({ children }: { children: ReactNode }) {
             activeFileId,
             inAskJackMode,
           );
+          mark(traceId, "llmResponseReady"); // T14
           dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
-          void speakThroughPlayer(answer); // sets currentCaption itself
+          void speakThroughPlayer(answer, traceId); // sets currentCaption itself
           return finish({ source: intent.source, ok: true, message: answer });
         }
 
@@ -1511,22 +1654,28 @@ export function JackProvider({ children }: { children: ReactNode }) {
 
         if (action === "explain_slide" || action === "summarize_slide") {
           cancelAutonomousPresenting();
+          mark(traceId, "contextBuildStart"); // T10
           const ctx = buildPresentationContext(controller);
+          mark(traceId, "contextBuildReady"); // T11
           const instruction =
             action === "explain_slide"
               ? "Explain this slide to the audience in 2-3 concise sentences."
               : "Summarize this slide in one or two sentences.";
           const prompt = ctx ? `${formatContextForPrompt(ctx)}\n\n${instruction}` : instruction;
+          mark(traceId, "llmRequestStart"); // T12 -- T13 not measurable (non-streaming)
           const chat = await jackApi.chat([{ role: "user", content: prompt }], { maxTokens: 150 });
+          mark(traceId, "llmResponseReady"); // T14
           dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
-          void speakThroughPlayer(chat.content); // sets currentCaption itself
+          void speakThroughPlayer(chat.content, traceId); // sets currentCaption itself
           return finish({ source: intent.source, action, ok: true, message: chat.content });
         }
 
         let result: { success: boolean; error?: string } | null = null;
+        mark(traceId, "slideMutationStart"); // T8 -- covers every controller.xxx() call below, action-mutating or not
         switch (action) {
           case "start_presentation":
             result = controller.startPresentation();
+            mark(traceId, "slideMutationDone"); // T9
             if (result.success) {
               setPresenterControl("jack");
               // Wake (with greeting) first if Jack was still asleep -- Phase
@@ -1541,20 +1690,23 @@ export function JackProvider({ children }: { children: ReactNode }) {
               // the opening flag itself is what runNarrationStep uses to
               // decide whether to actually deliver the audience intro.
               const ack = presentationOpeningDeliveredRef.current ? pickTakeoverAgainAck() : pickTakeoverAck();
+              traceHandedOff = true; // this trace now measures voice-command -> spoken acknowledgement latency
               void (async () => {
                 if (!jackAwakeRef.current) await wakeJackLocal();
-                await speakAndWait(ack);
-                startAutonomousPresenting();
+                await speakAndWait(ack, traceId);
+                startAutonomousPresenting(); // starts its own separate slide_narration trace
               })();
             }
             break;
           case "next_slide":
             cancelAutonomousPresenting();
             result = controller.goToNextSlide();
+            mark(traceId, "slideMutationDone"); // T9
             break;
           case "previous_slide":
             cancelAutonomousPresenting();
             result = controller.goToPreviousSlide();
+            mark(traceId, "slideMutationDone"); // T9
             break;
           case "jump_to_slide": {
             cancelAutonomousPresenting();
@@ -1569,41 +1721,52 @@ export function JackProvider({ children }: { children: ReactNode }) {
             } else {
               result = { success: false, error: `Couldn't find a slide matching "${intent.target || text}".` };
             }
+            mark(traceId, "slideMutationDone"); // T9
             break;
           }
           case "pause_presentation":
             cancelAutonomousPresenting(); // stops current audio/narration before the acknowledgement below fires
             result = controller.pausePresentation();
-            if (result.success) void speakThroughPlayer("Of course. I'll pause here.");
+            mark(traceId, "slideMutationDone"); // T9
+            if (result.success) {
+              traceHandedOff = true;
+              void speakThroughPlayer("Of course. I'll pause here.", traceId);
+            }
             break;
           case "resume_presentation":
             result = controller.resumePresentation();
+            mark(traceId, "slideMutationDone"); // T9
             if (result.success && presenterControlRef.current === "jack") {
               // Phase 13/14: short continuity line, NOT the full opening --
               // narration only starts once it's actually finished speaking,
               // so they never overlap. Regenerates for the CURRENT slide,
               // never skips ahead.
+              traceHandedOff = true;
               void (async () => {
-                await speakAndWait(pickResumeLine(humourEnabled));
-                startAutonomousPresenting();
+                await speakAndWait(pickResumeLine(humourEnabled), traceId);
+                startAutonomousPresenting(); // starts its own separate slide_narration trace
               })();
             }
             break;
           case "handoff_to_presenter":
             cancelAutonomousPresenting(); // stops current audio/narration before the acknowledgement below fires
             result = controller.handControlToPresenter();
+            mark(traceId, "slideMutationDone"); // T9
             if (result.success) {
               setPresenterControl("presenter");
-              void speakThroughPlayer("Absolutely. It's yours.");
+              traceHandedOff = true;
+              void speakThroughPlayer("Absolutely. It's yours.", traceId);
             }
             break;
           case "stop_presentation":
             cancelAutonomousPresenting();
             result = controller.endPresentation();
+            mark(traceId, "slideMutationDone"); // T9
             setPresenterControl("presenter");
             break;
           default:
             result = { success: false, error: `Jack didn't recognize "${text}" as a presentation command.` };
+            mark(traceId, "slideMutationDone"); // T9 -- no real mutation, but keeps the pair balanced
         }
 
         dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
@@ -1613,7 +1776,14 @@ export function JackProvider({ children }: { children: ReactNode }) {
         // left Jack completely silent (the failure only ever reached the
         // UI as text), e.g. "Couldn't find a slide matching ...".
         if (!(result?.success ?? false) && result?.error) {
-          void speakThroughPlayer(result.error);
+          traceHandedOff = true;
+          void speakThroughPlayer(result.error, traceId);
+        }
+        if (!traceHandedOff) {
+          // A silent success (next_slide, previous_slide, stop_presentation,
+          // ...) -- nothing downstream will ever mark T15-T19 or finish this
+          // trace, so it ends here, right after slideMutationDone (T9).
+          finishTrace(traceId);
         }
         return finish({
           source: intent.source,
@@ -1624,7 +1794,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       } catch (err) {
         dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
         const message = err instanceof Error ? err.message : "Local Jack request failed.";
-        void speakThroughPlayer(message);
+        void speakThroughPlayer(message, traceId);
         return finish({
           source: "llm",
           ok: false,
@@ -1719,6 +1889,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     browserFallbackEnabled,
     asrProvider,
     asrDiagnostics,
+    perfTraces,
     setVoice,
     setCaptionsEnabled,
     setBrowserFallbackEnabled,
