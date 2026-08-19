@@ -1,4 +1,5 @@
 import { findRelevantSections, tokenize } from "../lib/askJackProvider";
+import { extractExplicitNumber } from "./slideTargetResolver";
 import type { ParsedDocument, ParsedSection } from "../session/types";
 import type { PresentationContext } from "./presentationContext";
 
@@ -66,6 +67,39 @@ function findNamedSlide(question: string, docs: ParsedDocument[], activeFileId: 
 }
 
 /**
+ * Matches an EXPLICIT slide/page number reference -- "what names are these
+ * on page 13?", "give me a summary of slide 12" -- to that actual slide's
+ * content. Confirmed live these were falling through to the keyword scorer
+ * (which found nothing, since neither question contains any of the slide's
+ * real words) and then to the low-confidence "no material" path, producing
+ * a hallucinated "the slide is empty" instead of ever looking at slide
+ * 12/13's real content. Reuses the exact same number extraction
+ * jump_to_slide navigation already relies on, so "page thirteen"/"slide
+ * number 12"/"slide 5" are all understood identically whether the utterance
+ * is a navigation command or a question.
+ */
+function findNumberedSlide(question: string, docs: ParsedDocument[], activeFileId: string | null): RetrievalMatch | null {
+  const num = extractExplicitNumber(question);
+  if (num === null) return null;
+  const scopedDocs = activeFileId ? docs.filter((d) => d.fileId === activeFileId) : docs;
+  // "Slide 5" is ambiguous across multiple concatenated decks (slide 5 of
+  // WHICH one?) -- only resolve confidently when exactly one document is in
+  // scope, same "don't guess" principle as the rest of this file (an
+  // unresolvable/ambiguous query falls through rather than picking an
+  // arbitrary, possibly-wrong slide from the wrong deck).
+  if (scopedDocs.length !== 1) return null;
+  const section = scopedDocs[0].sections[num - 1];
+  if (!section) return null;
+  return {
+    slideIndex: section.index,
+    title: section.title ?? `Slide ${section.index + 1}`,
+    text: section.text,
+    score: 999,
+    reason: `numbered slide match: slide ${num}`,
+  };
+}
+
+/**
  * Single retrieval entry point for Jack's deck-aware Q&A. Tries deterministic
  * positional/named resolution first (cheap, explainable, no scoring needed);
  * falls back to the shared keyword scorer for everything else. Confidence is
@@ -126,8 +160,17 @@ export function retrieveForQuestion(
     };
   }
 
+  // Named-slide title matching first: a question can incidentally contain a
+  // number that isn't really a slide reference ("does that match the
+  // pricing slide? I still owe you a 5 page report") -- if the question
+  // ALSO cleanly names a real slide by title, that's the stronger, more
+  // deliberate signal and should win before the number extraction ever
+  // gets a chance to hijack retrieval with an unrelated incidental digit.
   const named = findNamedSlide(question, docs, activeFileId);
   if (named) return { matches: [named], confidence: "high" };
+
+  const numbered = findNumberedSlide(question, docs, activeFileId);
+  if (numbered) return { matches: [numbered], confidence: "high" };
 
   const terms = tokenize(question);
   const scored = findRelevantSections(question, docs, activeFileId, comprehensive ? COMPREHENSIVE_MATCH_LIMIT : DEFAULT_MATCH_LIMIT);

@@ -23,12 +23,28 @@ export const ACTION_SYSTEM_PROMPT =
   'Only when type is "action", also include "action", one of: start_presentation, ' +
   "next_slide, previous_slide, jump_to_slide, pause_presentation, resume_presentation, " +
   'explain_slide, summarize_slide, handoff_to_presenter, stop_presentation -- and, ' +
-  'only for jump_to_slide, "target". When type is "conversation" or "unknown", do NOT ' +
+  'only for jump_to_slide, "target": the slide identifier itself -- a number ("5"), an ' +
+  'ordinal or number word ("fifth", "five"), or the slide\'s topic/title ("the pricing ' +
+  'slide") -- extracted from the utterance. Never the literal word "slide"/"page"/"number" ' +
+  'alone; if you can\'t identify what slide is actually meant, omit "target" entirely ' +
+  'rather than filling it with a filler word. When type is "conversation" or "unknown", do NOT ' +
   "include \"action\" -- guessing a presentation command for ordinary talk is unsafe. " +
   'When genuinely unsure between "action" and "conversation", prefer "conversation": ' +
   "silently doing nothing is always safer than mutating the presentation on a guess.\n" +
   'Note: "continue", "resume", "keep going", and "carry on" mean resume_presentation, ' +
   'NOT next_slide -- only explicit "next"/"next slide" means next_slide. ' +
+  'Judge the WHOLE utterance, not just whether it contains a keyword somewhere in it -- ' +
+  'a microphone transcript can contain a command-like word (e.g. "start", "next", ' +
+  '"stop") as part of an unrelated or garbled sentence, not as the actual command. Ask ' +
+  'yourself: does this cleanly read as someone giving THAT specific instruction, or does ' +
+  'it just happen to contain a word that command usually involves? Example: "start from ' +
+  'the flight 5" is NOT start_presentation -- "presentation" never appears, "flight" is ' +
+  "unrelated to any known command, and a real instruction to begin presenting doesn't " +
+  'trail off into other nouns. That kind of leftover, ungrammatical fragment around the ' +
+  'keyword is a strong sign of a mis-transcription, not a real command -- classify it ' +
+  '"unknown" rather than picking the action whose keyword happened to appear. Only ' +
+  "classify \"action\" when the instruction is one you'd be comfortable actually " +
+  "carrying out exactly as understood.\n" +
   "Control-handoff direction is decided by WHO the subject of the sentence is, not by " +
   'the presence of words like "take over" or "from here" -- both directions use similar ' +
   'vocabulary and are easy to confuse. If the subject is "I"/"I\'ll"/"I\'ve" (the ' +

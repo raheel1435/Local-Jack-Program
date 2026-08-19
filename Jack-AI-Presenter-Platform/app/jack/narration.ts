@@ -160,6 +160,24 @@ export interface DeckAnswer {
 }
 
 /**
+ * The real uploaded document title(s) for comprehensive mode's prompt
+ * header -- context.deckTitle is just "Ask Jack" there (a mode label, not a
+ * real deck name; Ask Jack's controller has nothing real to report). Falls
+ * through on a falsy (not just missing) title -- a parsed document whose
+ * filename-derived title happens to be an empty string must not produce a
+ * blank `Deck: "".` header, which would be exactly the kind of misleading
+ * framing this whole prompt restructure was written to eliminate.
+ */
+function deckTitleForComprehensivePrompt(docs: ParsedDocument[], activeFileId: string | null, fallback: string): string {
+  if (activeFileId) {
+    const activeTitle = docs.find((d) => d.fileId === activeFileId)?.title;
+    if (activeTitle) return activeTitle;
+  }
+  const titles = docs.map((d) => d.title).filter(Boolean);
+  return titles.length > 0 ? titles.join(", ") : fallback;
+}
+
+/**
  * Deterministic/lightweight retrieval (see deckRetrieval.ts) + LLM answer
  * grounded in it -- no vector DB. Whether the deck "covers" the question is
  * decided by retrieval evidence, not the LLM's guess: when nothing matches,
@@ -195,7 +213,24 @@ export async function answerDeckQuestion(
     return { answer: result.content.trim(), grounded: false, confidence: "low" };
   }
 
-  const materialParts = [formatContextForQA(context)];
+  // Comprehensive mode (Ask Jack) has no real "current slide" -- its
+  // controller can't report one (there's nothing being presented), so
+  // formatContextForQA's header always asserted something actively
+  // misleading here ("slide 1 of 1" -- Ask Jack's controller reports its
+  // uploaded-FILE count as totalSlides, not a section count -- "Current
+  // slide content: (no extracted text)"). Confirmed live: this confused the
+  // model into answering "slide 5 is not provided in the material" even
+  // when the correctly-retrieved slide-5 content was right there in the
+  // very next paragraph, because the header flatly asserted only 1 slide
+  // exists. Present/Practice's header stays as-is -- it's real and correct
+  // there (an actual current slide is being shown).
+  // context.deckTitle is a placeholder ("Ask Jack") in comprehensive mode --
+  // Ask Jack's controller has no real deck to name, only a mode label. The
+  // actual uploaded document(s) title(s) are right here in `docs`, scoped
+  // the same way retrieval itself is scoped (activeFileId, or every loaded
+  // doc if none is selected).
+  const deckTitleForPrompt = comprehensive ? deckTitleForComprehensivePrompt(docs, activeFileId, context.deckTitle) : context.deckTitle;
+  const materialParts = comprehensive ? [`Deck: "${deckTitleForPrompt}".`] : [formatContextForQA(context)];
   if (matches.length > 0) {
     materialParts.push(
       "Relevant material found in the deck:\n" +

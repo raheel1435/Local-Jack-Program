@@ -14,8 +14,11 @@ const WORD_NUMBERS: Record<string, number> = {
   eighth: 8, ninth: 9, tenth: 10,
 };
 
-/** "slide 5", "page 3", "slide five", "the 2nd slide" -> a 1-based slide number, or null. */
-function extractExplicitNumber(utterance: string): number | null {
+/** "slide 5", "page 3", "slide five", "the 2nd slide" -> a 1-based slide number, or null.
+ * Exported for deckRetrieval.ts, which uses this same extraction for Q&A
+ * questions that reference a slide by number ("what does slide 12 say?"),
+ * not just for jump_to_slide navigation. */
+export function extractExplicitNumber(utterance: string): number | null {
   const lower = utterance.toLowerCase();
 
   const digitMatch = lower.match(/\b(?:slide|page|section)\s*(?:number|num|no\.?)?\s*#?\s*(\d+)\b/);
@@ -25,7 +28,11 @@ function extractExplicitNumber(utterance: string): number | null {
   if (digitOrdinalMatch) return Number(digitOrdinalMatch[1]);
 
   const words = Object.keys(WORD_NUMBERS).join("|");
-  const wordMatch = lower.match(new RegExp(`\\b(?:slide|page|section)\\s*(${words})\\b`));
+  // Same "number"/"no."/"num" infix tolerance as the digit regex above --
+  // confirmed live that "Jack moves to slide number five" failed to resolve
+  // (fell through to the LLM's target guess instead) because this regex
+  // only ever matched "slide five", never "slide number five".
+  const wordMatch = lower.match(new RegExp(`\\b(?:slide|page|section)\\s*(?:number|num|no\\.?)?\\s*(${words})\\b`));
   if (wordMatch) return WORD_NUMBERS[wordMatch[1]];
 
   const wordOrdinalMatch = lower.match(new RegExp(`\\b(${words})\\s*(?:slide|page|section)\\b`));

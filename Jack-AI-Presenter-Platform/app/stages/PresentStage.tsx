@@ -60,6 +60,7 @@ function PresentSession({
   dispatch: (action: SessionAction) => void;
 }) {
   const stageRef = useRef<HTMLDivElement>(null);
+  const autoStartedRef = useRef(false);
   const sections = doc.sections;
   const jack = useJack();
 
@@ -239,6 +240,40 @@ function PresentSession({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // "Jack leads": start narrating as soon as the session mounts, without
+  // waiting for an explicit "Jack, start presenting" command -- controlMode
+  // was previously pure display text fed into the (unused) OpenAI-Realtime
+  // prompt builder, with zero actual behavioral effect anywhere. Routed
+  // through the exact phrase the deterministic router already matches
+  // (no LLM classification uncertainty for this internal, automated
+  // trigger) and through runLocalCommand itself, not a hand-rolled
+  // duplicate of the start_presentation case, so this behaves identically
+  // to a real spoken "Jack, start presentation." -- including the
+  // wake/ack/narration sequencing (deliberately NOT pre-empted here: Jack
+  // is not awake yet at this point, only audio-unlocked -- see below).
+  // unlockSpeech() -- NOT wakeJackLocal() -- was already called
+  // synchronously from the "Start presentation" button's click (see
+  // PresentSetup's handleStart), so audio is unlocked before this effect's
+  // own async chain begins, but Jack's actual wake+greeting still happens
+  // inside runLocalCommand's own start_presentation handling below, exactly
+  // once, with its normal sequencing. Calling wakeJackLocal() here (or from
+  // that click) too would race its greeting against this same command's
+  // takeover acknowledgment on the shared speechPlayer -- confirmed live as
+  // the greeting getting cut off mid-sentence before this was split apart.
+  useEffect(() => {
+    // Guards against firing twice on the same real mount (React StrictMode's
+    // dev-mode double-invoke runs this effect body, its cleanup, then the
+    // body again) -- without it, the second call would still skip
+    // wakeJackLocal() (already awake) but re-run the takeover acknowledgment
+    // and restart narration, overlapping/racing the first.
+    if (autoStartedRef.current) return;
+    if (jack.controlMode === "jackLeads") {
+      autoStartedRef.current = true;
+      void jack.runLocalCommand("Jack, start presentation.", "typed");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     return () => {
       jack.sleep();
@@ -407,6 +442,20 @@ function PresentSession({
         <aside className="notes-panel">
           <h3>Speaker notes</h3>
           <p>{currentSection?.speakerNotes || "No speaker notes were found for this slide."}</p>
+          {/* "Queue for moderated Q&A" holds audience questions here instead
+              of answering them immediately -- shown in the same panel as
+              speaker notes rather than adding new chrome for what's likely
+              an occasional, not constantly-visible, need. */}
+          {jack.questions.length > 0 && (
+            <>
+              <h3>Queued questions</h3>
+              <ul className="notes-panel-questions">
+                {jack.questions.map((q) => (
+                  <li key={q.id}>{q.text}</li>
+                ))}
+              </ul>
+            </>
+          )}
         </aside>
       )}
 

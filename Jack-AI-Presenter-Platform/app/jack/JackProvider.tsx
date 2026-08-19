@@ -243,6 +243,19 @@ export interface JackContextValue {
    * once and stops -- no auto-advance, no persona change.
    */
   readCurrentSlide(text: string): Promise<void>;
+  /**
+   * Unlocks Jack's audio (resumes the shared AudioContext) with NO other
+   * side effect -- call synchronously from inside a real user gesture that
+   * will trigger Jack speech later in the same async chain (see
+   * jackSpeechPlayer.ts's class comment) when that later speech shouldn't
+   * ALSO be preceded by a greeting. wakeJackLocal() itself does this same
+   * unlock as its first statement, but also plays the greeting and sets
+   * jackAwake -- calling it just to unlock, then having something else
+   * immediately trigger the real start_presentation flow (which itself
+   * calls wakeJackLocal()), raced the greeting against the takeover
+   * acknowledgment for the SAME speechPlayer slot.
+   */
+  unlockSpeech(): void;
   /** True once Jack has been explicitly activated for this local-pipeline session (Phase 1/2) -- independent of attentionState's sleeping/standby, which belongs to the unused OpenAI Realtime path in Present mode. */
   jackAwake: boolean;
   /** The ONE authoritative activation function (Phase 2) -- idempotent, greets once per sleeping->awake transition (Phase 5). */
@@ -411,7 +424,10 @@ export function JackProvider({ children }: { children: ReactNode }) {
     },
     [persistPresentSettings],
   );
-  const [questions] = useState<QueuedQuestion[]>([]);
+  const [questions, setQuestions] = useState<QueuedQuestion[]>([]);
+  const queueQuestion = useCallback((text: string) => {
+    setQuestions((qs) => [...qs, { id: crypto.randomUUID(), text, status: "pending", timestamp: Date.now() }]);
+  }, []);
   const [presenterControl, setPresenterControl] = useState<ControlOwner>("presenter");
   // Manual override for ambient listening (Phase 26): the mic button used to
   // be push-to-talk (one click, one utterance, auto-stop on silence).
@@ -852,6 +868,11 @@ export function JackProvider({ children }: { children: ReactNode }) {
     // Jack to take over yet -- cosmetic, but a genuinely new session should
     // start with the presenter in control, same as the very first one does.
     setPresenterControl("presenter");
+    // "Queue for moderated Q&A" audience questions belong to THIS
+    // presentation session -- without this, exiting one presentation and
+    // starting a different, unrelated one still showed the previous
+    // session's queued questions in the notes panel.
+    setQuestions([]);
     if (hadSession) dispatchEvent({ type: "DISCONNECTED" });
   }, [teardownMic, dispatchEvent, wakeWordService]);
 
@@ -968,6 +989,10 @@ export function JackProvider({ children }: { children: ReactNode }) {
     setJackAwake(true);
     await speakAndWait(pickGreeting(humourEnabled));
   }, [speechPlayer, speakAndWait, humourEnabled]);
+
+  const unlockSpeech = useCallback(() => {
+    speechPlayer.unlock();
+  }, [speechPlayer]);
 
   /** Sleep is explicit and local -- stops any current speech/narration and resets the wake guard so the next wake greets again. */
   const sleepJackLocal = useCallback(() => {
@@ -1342,6 +1367,50 @@ export function JackProvider({ children }: { children: ReactNode }) {
           // Any conversational turn pauses autonomy first -- Phase 12: after
           // an answer, Jack stays paused until an explicit "Continue.".
           cancelAutonomousPresenting();
+
+          // Audience question policy applies only when ALL of these hold:
+          // (1) outside Ask Jack -- that mode's entire purpose is Jack
+          //     answering questions directly, so "stays quiet"/"queue for
+          //     later" would defeat it entirely;
+          // (2) not typed input -- there's no way to tell audience speech
+          //     from the presenter's own voice through the mic, but typed
+          //     input can ONLY be the presenter (they're the one at the
+          //     keyboard), so it must always get a real answer regardless
+          //     of what policy is set for the audience;
+          // (3) it actually looks like a question -- intent.type
+          //     "conversation" also covers plain remarks ("Thanks.", "Hi
+          //     Jack.", "Nice job.", see commandRouter.ts's
+          //     CONVERSATION_RULES), and silencing Jack on "thanks" or
+          //     queuing "hi jack" as an unanswered audience question would
+          //     be actively wrong.
+          // The question check is a heuristic, not a real classifier --
+          // deliberately narrow (wh-words and clear "tell me"/"explain"-
+          // style info-requests only, not bare modal verbs like "can"/
+          // "is"/"will", which matched far too many plain reactive remarks
+          // -- "Is that so.", "Will do." -- as if they were questions) since
+          // ASR transcripts rarely carry punctuation either.
+          const trimmedText = text.trim();
+          const looksLikeQuestion =
+            /\?\s*$/.test(trimmedText) ||
+            /^(what|why|how|who|when|where|which)\b/i.test(trimmedText) ||
+            /^(tell me|explain|describe|walk me through|elaborate on|give me)\b/i.test(trimmedText);
+          const audiencePolicyApplies = !inAskJackMode && kind !== "typed" && looksLikeQuestion;
+          if (audiencePolicyApplies && audienceQuestionPolicy === "presenterAnswers") {
+            // Genuinely silent -- no speakThroughPlayer call -- per "I
+            // answer, Jack stays quiet". The outcome message is text-only
+            // (shown in the feedback line/captions if visible) so the
+            // presenter isn't left wondering whether the command landed.
+            dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
+            return finish({ source: intent.source, ok: true, message: "Jack is staying quiet -- audience questions go to you." });
+          }
+          if (audiencePolicyApplies && audienceQuestionPolicy === "moderatedQueue") {
+            queueQuestion(text);
+            dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
+            const ack = "Noted -- I'll leave that one for you to address.";
+            void speakThroughPlayer(ack);
+            return finish({ source: intent.source, ok: true, message: ack });
+          }
+
           const ctx = buildPresentationContext(controller);
           const { parsedDocs, activeFileId } = appSessionRef.current;
           // Ask Jack has no live narration to keep pace with and exists
@@ -1495,6 +1564,8 @@ export function JackProvider({ children }: { children: ReactNode }) {
       wakeJackLocal,
       speakAndWait,
       humourEnabled,
+      audienceQuestionPolicy,
+      queueQuestion,
     ],
   );
 
@@ -1572,6 +1643,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     setCaptionsEnabled,
     setBrowserFallbackEnabled,
     readCurrentSlide,
+    unlockSpeech,
     jackAwake,
     wakeJackLocal,
     sleepJackLocal,

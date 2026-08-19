@@ -29,6 +29,21 @@ export function PresentSetup({ onReady, title }: { onReady: () => void; title: s
   // either, and Present shouldn't be the one mode that becomes unusable
   // when OpenAI (or Jack Local AI) is unreachable.
   const handleStart = () => {
+    // "Jack leads" auto-starts narration once the session mounts (see
+    // PresentStage's own effect) -- but that mount happens asynchronously,
+    // well after this click's own synchronous execution ends, so it can't
+    // be the thing that satisfies the browser's autoplay-gesture
+    // requirement for Jack's first audio. unlockSpeech() runs synchronously
+    // here, inside this real click, and does nothing else -- deliberately
+    // NOT wakeJackLocal(), which would ALSO start playing the greeting
+    // immediately and race it against the takeover acknowledgment the
+    // auto-start effect's own start_presentation flow plays right after
+    // (confirmed live: the greeting was getting cut off mid-sentence by the
+    // ack, since both ultimately share the one-clip-at-a-time speechPlayer).
+    // Leaving the actual wake+greeting to that flow keeps the same
+    // wake-then-wait-then-ack sequencing a real spoken "Jack, start
+    // presentation." already gets.
+    if (jack.controlMode === "jackLeads") jack.unlockSpeech();
     onReady();
   };
 
