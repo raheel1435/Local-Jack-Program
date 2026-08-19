@@ -2,11 +2,16 @@ export type ProviderStatus = "available" | "unavailable";
 
 export type LlmProviderName = "colibri" | "llamacpp";
 
+/** Stable ASR engine ids. "whisper" is APPROVED (default everywhere);
+ * "vibevoice" is TEST (opt-in only, never a silent fallback target). */
+export type AsrProviderId = "whisper" | "vibevoice";
+
 export interface HealthReport {
   gateway: "ok";
   colibri: ProviderStatus;
   llamacpp: ProviderStatus;
   whisper: ProviderStatus;
+  vibevoice: ProviderStatus;
   kokoro: ProviderStatus;
   activeLlmProvider: LlmProviderName;
 }
@@ -45,11 +50,34 @@ export interface JackTranscribeRequest {
   /** Absolute path to a local audio file (wav) already on disk. */
   audioFilePath: string;
   language?: string;
+  /** Which ASR engine to use. Defaults to "whisper" (Approved) when omitted. */
+  provider?: AsrProviderId;
 }
 
+/** Normalized result shape shared by every ASR provider, so callers never
+ * need engine-specific handling. `metadata` carries provider-specific
+ * extras (e.g. VibeVoice's raw language/code-switching info) without
+ * forcing them into the common fields. */
 export interface JackTranscribeResponse {
   text: string;
+  provider: AsrProviderId;
   latencyMs: number;
+  language?: string;
+  confidence?: number;
+  metadata?: Record<string, unknown>;
+}
+
+/** Structural interface every ASR provider implements, so routes depend on
+ * this shape rather than a concrete engine (mirrors LlmProvider). */
+export interface AsrProvider {
+  readonly id: AsrProviderId;
+  readonly name: string;
+  checkHealth(): Promise<ProviderStatus>;
+  transcribe(
+    audioFilePath: string,
+    language?: string,
+    opts?: { hotwords?: string[] }
+  ): Promise<JackTranscribeResponse>;
 }
 
 export interface JackSpeakRequest {

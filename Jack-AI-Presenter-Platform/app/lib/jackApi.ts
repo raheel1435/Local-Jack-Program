@@ -26,8 +26,23 @@ export interface JackHealth {
   colibri: "available" | "unavailable";
   llamacpp: "available" | "unavailable";
   whisper: "available" | "unavailable";
+  vibevoice: "available" | "unavailable";
   kokoro: "available" | "unavailable";
   activeLlmProvider: "colibri" | "llamacpp";
+}
+
+/** Stable ASR engine ids -- "whisper" is Approved (default everywhere),
+ * "vibevoice" is Test (opt-in only, never a silent fallback target). Mirrors
+ * Jack-Local-AI-Service/src/types/jack.ts's AsrProviderId. */
+export type AsrProviderId = "whisper" | "vibevoice";
+
+export interface JackTranscribeResult {
+  text: string;
+  provider: AsrProviderId;
+  latencyMs: number;
+  language?: string;
+  confidence?: number;
+  metadata?: Record<string, unknown>;
 }
 
 export type JackIntentType = "action" | "conversation" | "unknown";
@@ -86,6 +101,7 @@ export const jackApi = {
         colibri: "unavailable",
         llamacpp: "unavailable",
         whisper: "unavailable",
+        vibevoice: "unavailable",
         kokoro: "unavailable",
         activeLlmProvider: "llamacpp",
       };
@@ -105,14 +121,17 @@ export const jackApi = {
     );
   },
 
-  /** Transcribes a local audio file already on disk (the gateway shells out to whisper.cpp by path, not upload). */
-  transcribe(audioFilePath: string, language?: string): Promise<{ text: string; latencyMs: number }> {
-    return postJson("/jack/transcribe", { audioFilePath, language }, 30_000);
+  /** Transcribes a local audio file already on disk (the gateway shells out to the selected ASR engine by path, not upload). `provider` defaults to "whisper" (Approved) when omitted -- never silently falls back if Test fails. */
+  transcribe(audioFilePath: string, language?: string, provider?: AsrProviderId): Promise<JackTranscribeResult> {
+    return postJson("/jack/transcribe", { audioFilePath, language, provider }, 30_000);
   },
 
-  /** Transcribes browser-captured audio (a WAV blob) via whisper.cpp -- no filesystem path ever crosses the browser boundary. */
-  async transcribeAudio(audio: Blob, language?: string): Promise<{ text: string; latencyMs: number }> {
-    const qs = language ? `?language=${encodeURIComponent(language)}` : "";
+  /** Transcribes browser-captured audio (a WAV blob) via the selected ASR engine -- no filesystem path ever crosses the browser boundary. `provider` defaults to "whisper" (Approved) when omitted. */
+  async transcribeAudio(audio: Blob, language?: string, provider?: AsrProviderId): Promise<JackTranscribeResult> {
+    const params = new URLSearchParams();
+    if (language) params.set("language", language);
+    if (provider) params.set("provider", provider);
+    const qs = params.toString() ? `?${params.toString()}` : "";
     const res = await fetch(`${BASE_URL}/jack/transcribe${qs}`, {
       method: "POST",
       headers: { "Content-Type": "audio/wav" },

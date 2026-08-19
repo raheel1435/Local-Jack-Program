@@ -21,4 +21,12 @@ export const config = {
 
   whisperExecutablePath: process.env.WHISPER_EXECUTABLE_PATH ?? "",
   whisperModelPath: process.env.WHISPER_MODEL_PATH ?? "",
+
+  // VibeVoice-ASR-BitNet (TEST engine, via VibeASR.cpp's asr_infer CLI).
+  // Never used unless a request explicitly asks for provider "vibevoice" --
+  // see routes/transcription.ts. All three paths live outside git tracking
+  // (VibeASR.cpp/build/ and the GGUF weights in llm-models/vibeasr/).
+  vibeAsrExecutablePath: process.env.VIBE_ASR_EXECUTABLE_PATH ?? "",
+  vibeAsrVaeModelPath: process.env.VIBE_ASR_VAE_MODEL_PATH ?? "",
+  vibeAsrLmModelPath: process.env.VIBE_ASR_LM_MODEL_PATH ?? "",
 };

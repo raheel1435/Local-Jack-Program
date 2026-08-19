@@ -3,7 +3,7 @@ import { access } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { promisify } from "node:util";
 import { config } from "../../config/services.js";
-import type { ProviderStatus } from "../../types/jack.js";
+import type { AsrProvider, JackTranscribeResponse, ProviderStatus } from "../../types/jack.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -11,8 +11,15 @@ const execFileAsync = promisify(execFile);
  * whisper.cpp in this repo's built configuration exposes no HTTP server —
  * only a CLI executable. This provider shells out to it directly. Swap the
  * implementation for an HTTP client if/when a whisper-server build is used.
+ *
+ * This is the APPROVED (default) ASR engine -- see VibeAsrProvider for the
+ * TEST engine. Both implement the same AsrProvider interface so routes and
+ * the UI never need engine-specific branching.
  */
-export class WhisperProvider {
+export class WhisperProvider implements AsrProvider {
+  readonly id = "whisper" as const;
+  readonly name = "Approved · Whisper";
+
   private readonly executablePath: string;
   private readonly modelPath: string;
 
@@ -40,13 +47,16 @@ export class WhisperProvider {
   async transcribe(
     audioFilePath: string,
     language?: string
-  ): Promise<{ text: string; latencyMs: number }> {
+  ): Promise<JackTranscribeResponse> {
     if (!this.executablePath || !this.modelPath) {
       throw new Error(
         "whisper.cpp is not configured: set WHISPER_EXECUTABLE_PATH and WHISPER_MODEL_PATH"
       );
     }
 
+    // Note: whisper.cpp's CLI has no hotword/context-biasing flag, so the
+    // shared `opts.hotwords` hook is a documented no-op here (honest, not
+    // silently ignored -- see VibeAsrProvider, which does support it).
     const args = [
       "-m",
       this.modelPath,
@@ -66,7 +76,9 @@ export class WhisperProvider {
 
     return {
       text: stdout.trim(),
+      provider: this.id,
       latencyMs: Date.now() - start,
+      language,
     };
   }
 }

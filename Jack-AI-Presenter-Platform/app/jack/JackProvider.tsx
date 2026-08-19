@@ -4,7 +4,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState, ty
 import { OpenAIRealtimeWebRTC, RealtimeAgent, RealtimeSession, type RealtimeItem } from "@openai/agents-realtime";
 import { useLocalRecorder, type LocalRecorderState } from "../hooks/useLocalRecorder";
 import { useSpeech, type UseSpeechResult } from "../hooks/useSpeech";
-import { jackApi, type JackHealth, type JackIntentAction } from "../lib/jackApi";
+import { jackApi, type AsrProviderId, type JackHealth, type JackIntentAction } from "../lib/jackApi";
 import { summarizeDocuments } from "./documentContext";
 import { buildInstructions } from "./instructions";
 import { createJackSpeechPlayer } from "./jackSpeechPlayer";
@@ -83,6 +83,20 @@ export interface LocalCommandOutcome {
   message?: string;
 }
 
+/** One measured transcription attempt, for the local-only Diagnostics panel
+ * (dual-ASR milestone). Session-scoped, in-memory, capped -- never persisted
+ * or uploaded. `downstreamOk` is omitted for transcripts that were discarded
+ * before reaching intent routing (ambient noise never addressed to Jack). */
+export interface AsrDiagnosticEntry {
+  id: string;
+  provider: AsrProviderId;
+  transcript: string;
+  latencyMs: number;
+  success: boolean;
+  downstreamOk?: boolean;
+  timestamp: number;
+}
+
 const REALTIME_MODEL = "gpt-realtime-2";
 
 interface WebkitAudioContextWindow {
@@ -135,6 +149,32 @@ function savePresentSettings(settings: PersistedPresentSettings) {
     window.localStorage.setItem(PRESENT_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
   } catch {
     // Storage unavailable (private browsing, quota) -- settings just won't survive reload.
+  }
+}
+
+// Speech-recognition engine selection (dual-ASR milestone) -- deliberately a
+// separate storage key from PRESENT_SETTINGS_STORAGE_KEY/voice: this picks
+// the ASR engine (speech IN), not the TTS voice (speech OUT), and lives in
+// its own "Voice & Listening" settings section rather than the voice
+// dropdown. Always defaults to "whisper" (Approved), never "vibevoice".
+const ASR_PROVIDER_STORAGE_KEY = "jack:asrProvider";
+
+function loadAsrProvider(): AsrProviderId {
+  if (typeof window === "undefined") return "whisper";
+  try {
+    const raw = window.localStorage.getItem(ASR_PROVIDER_STORAGE_KEY);
+    return raw === "vibevoice" ? "vibevoice" : "whisper";
+  } catch {
+    return "whisper";
+  }
+}
+
+function saveAsrProvider(provider: AsrProviderId) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(ASR_PROVIDER_STORAGE_KEY, provider);
+  } catch {
+    // Storage unavailable -- selection just won't survive reload.
   }
 }
 
@@ -233,9 +273,20 @@ export interface JackContextValue {
   captionsEnabled: boolean;
   /** Default OFF (Phase 10): browser speechSynthesis may only ever be used when explicitly enabled AND Kokoro is unreachable -- never a silent substitute for Jack's real voice. */
   browserFallbackEnabled: boolean;
+  /**
+   * Which ASR engine transcribes every mic capture across the whole app
+   * (ambient listening, push-to-talk, Ask Jack, Practice) -- there is no
+   * per-screen override. Defaults to "whisper" (Approved). "vibevoice"
+   * (Test) is opt-in only and never used as a silent fallback target if it
+   * fails; see runLocalCommand's transcription call sites.
+   */
+  asrProvider: AsrProviderId;
+  /** Last few measured transcriptions (both engines), newest first -- see AsrDiagnosticEntry. */
+  asrDiagnostics: AsrDiagnosticEntry[];
   setVoice(voice: string): void;
   setCaptionsEnabled(enabled: boolean): void;
   setBrowserFallbackEnabled(enabled: boolean): void;
+  setAsrProvider(provider: AsrProviderId): void;
   /**
    * The ONE authoritative "Read this slide" path (Phase 9/11/17): Kokoro with
    * the selected voice, falling back to the browser's speechSynthesis only if
@@ -381,6 +432,19 @@ export function JackProvider({ children }: { children: ReactNode }) {
     },
     [],
   );
+  // Local-only, session-scoped ASR diagnostics (dual-ASR milestone, Phase
+  // 24-26): every real transcription attempt through finishBargeInCapture,
+  // capped so this never grows unbounded. In-memory React state only -- no
+  // upload, no disk persistence, no raw audio retained; cleared on reload.
+  // Feeds the dev-only Diagnostics panel in Settings, nothing else.
+  const [asrDiagnostics, setAsrDiagnostics] = useState<AsrDiagnosticEntry[]>([]);
+  const MAX_ASR_DIAGNOSTICS = 20;
+  const recordAsrDiagnostic = useCallback((entry: Omit<AsrDiagnosticEntry, "id" | "timestamp">) => {
+    setAsrDiagnostics((prev) => [
+      { ...entry, id: crypto.randomUUID(), timestamp: Date.now() },
+      ...prev,
+    ].slice(0, MAX_ASR_DIAGNOSTICS));
+  }, []);
   const [lastError, setLastError] = useState<string | null>(null);
   const [controlMode, setControlModeState] = useState<ControlMode>("presenterLeads");
   const [audienceQuestionPolicy, setAudienceQuestionPolicyState] = useState<AudienceQuestionPolicy>("askPresenterFirst");
@@ -424,6 +488,11 @@ export function JackProvider({ children }: { children: ReactNode }) {
     },
     [persistPresentSettings],
   );
+  const [asrProvider, setAsrProviderState] = useState<AsrProviderId>(() => loadAsrProvider());
+  const setAsrProvider = useCallback((next: AsrProviderId) => {
+    setAsrProviderState(next);
+    saveAsrProvider(next);
+  }, []);
   const [questions, setQuestions] = useState<QueuedQuestion[]>([]);
   const queueQuestion = useCallback((text: string) => {
     setQuestions((qs) => [...qs, { id: crypto.randomUUID(), text, status: "pending", timestamp: Date.now() }]);
@@ -1159,11 +1228,12 @@ export function JackProvider({ children }: { children: ReactNode }) {
     }
     dispatchEvent({ type: "LOCAL_COMMAND_START" });
     try {
-      const { text } = await jackApi.transcribeAudio(audio);
-      const transcript = text.trim();
+      const result = await jackApi.transcribeAudio(audio, undefined, asrProvider);
+      const transcript = result.text.trim();
       if (!transcript || !isAddressedToJack(transcript)) {
         // Ambient noise / background speech that never named Jack -- ignore
         // it entirely rather than surfacing it as a failed "Interruption".
+        recordAsrDiagnostic({ provider: result.provider, transcript, latencyMs: result.latencyMs, success: true });
         dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
         return;
       }
@@ -1172,12 +1242,20 @@ export function JackProvider({ children }: { children: ReactNode }) {
       // runLocalCommand itself records the outcome (kind: "interruption")
       // into the single shared lastCommand* state -- no separate tracking
       // needed here, and nothing about to become stale later.
-      await runLocalCommandRef.current(transcript, "interruption");
+      const outcome = await runLocalCommandRef.current(transcript, "interruption");
+      recordAsrDiagnostic({
+        provider: result.provider,
+        transcript,
+        latencyMs: result.latencyMs,
+        success: true,
+        downstreamOk: outcome.ok,
+      });
     } catch (err) {
       dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
       setLastError(err instanceof Error ? err.message : "Transcription failed.");
+      recordAsrDiagnostic({ provider: asrProvider, transcript: "", latencyMs: 0, success: false });
     }
-  }, [clearBargeInCaptureTimeout, localRecorder, dispatchEvent, setBargeInPhaseBoth, isAddressedToJack]);
+  }, [clearBargeInCaptureTimeout, localRecorder, dispatchEvent, setBargeInPhaseBoth, isAddressedToJack, asrProvider, recordAsrDiagnostic]);
 
   const handleBargeInDetected = useCallback(() => {
     setBargeInPhaseBoth("capturing");
@@ -1639,9 +1717,12 @@ export function JackProvider({ children }: { children: ReactNode }) {
     voice,
     captionsEnabled,
     browserFallbackEnabled,
+    asrProvider,
+    asrDiagnostics,
     setVoice,
     setCaptionsEnabled,
     setBrowserFallbackEnabled,
+    setAsrProvider,
     readCurrentSlide,
     unlockSpeech,
     jackAwake,

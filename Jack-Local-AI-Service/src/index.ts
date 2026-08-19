@@ -4,6 +4,7 @@ import { config } from "./config/services.js";
 import { ColibriProvider } from "./providers/colibri/ColibriProvider.js";
 import { LlamaCppProvider } from "./providers/llamacpp/LlamaCppProvider.js";
 import { WhisperProvider } from "./providers/whisper/WhisperProvider.js";
+import { VibeAsrProvider } from "./providers/vibe/VibeAsrProvider.js";
 import { KokoroProvider } from "./providers/kokoro/KokoroProvider.js";
 import { healthRouter } from "./routes/health.js";
 import { chatRouter } from "./routes/chat.js";
@@ -54,13 +55,18 @@ const llamacpp = new LlamaCppProvider();
 const activeLlm: LlmProvider = config.llmProvider === "colibri" ? colibri : llamacpp;
 
 const whisper = new WhisperProvider();
+// VibeAsrProvider (TEST engine) is always constructed and health-checked,
+// same as the LLM providers above -- but never invoked unless a request
+// explicitly asks for provider "vibevoice". Approved (Whisper) stays the
+// default for every route and every UI surface.
+const vibevoice = new VibeAsrProvider();
 const kokoro = new KokoroProvider();
 
-app.use(healthRouter(colibri, llamacpp, whisper, kokoro));
+app.use(healthRouter(colibri, llamacpp, whisper, kokoro, vibevoice));
 app.use(chatRouter(activeLlm));
 app.use(intentRouter(activeLlm));
 app.use(speechRouter(kokoro));
-app.use(transcriptionRouter(whisper));
+app.use(transcriptionRouter(whisper, vibevoice));
 app.use(pptxConvertRouter());
 
 app.listen(config.port, () => {

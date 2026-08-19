@@ -59,6 +59,57 @@ export function PresentSettingsPopover({ onClose }: { onClose: () => void }) {
       </label>
       <p className="jack-settings-note">Only used if Jack&apos;s own voice (Kokoro) is unreachable, and only when this is on.</p>
 
+      <hr className="jack-settings-divider" />
+      <p className="jack-settings-section-title">Speech Recognition</p>
+      <div className="jack-asr-segmented" role="group" aria-label="Speech recognition engine">
+        <button
+          type="button"
+          className={`jack-asr-option${jack.asrProvider === "whisper" ? " active" : ""}`}
+          onClick={() => jack.setAsrProvider("whisper")}
+          aria-pressed={jack.asrProvider === "whisper"}
+        >
+          <span>Approved · Whisper</span>
+          <span className="jack-asr-option-status">
+            <span className={`jack-asr-status-dot ${jack.jackLocalHealth?.whisper ?? ""}`} />
+            {jack.jackLocalHealth?.whisper === "available" ? "Ready" : jack.jackLocalHealth?.whisper === "unavailable" ? "Unavailable" : "Checking..."}
+          </span>
+        </button>
+        <button
+          type="button"
+          className={`jack-asr-option${jack.asrProvider === "vibevoice" ? " active" : ""}`}
+          onClick={() => jack.setAsrProvider("vibevoice")}
+          aria-pressed={jack.asrProvider === "vibevoice"}
+        >
+          <span>Test · VibeVoice</span>
+          <span className="jack-asr-option-status">
+            <span className={`jack-asr-status-dot ${jack.jackLocalHealth?.vibevoice ?? ""}`} />
+            {jack.jackLocalHealth?.vibevoice === "available" ? "Ready" : jack.jackLocalHealth?.vibevoice === "unavailable" ? "Unavailable" : "Checking..."}
+          </span>
+        </button>
+      </div>
+      <p className="jack-settings-note">
+        Applies everywhere Jack listens (ambient, push-to-talk, Ask Jack, Practice) -- no per-screen override. Test is
+        experimental and never used automatically if unavailable; switch back to Approved if it fails.
+      </p>
+
+      {jack.asrDiagnostics.length > 0 && (
+        <details className="jack-settings-diagnostics">
+          <summary>Diagnostics ({jack.asrDiagnostics.length})</summary>
+          <ul className="jack-asr-diag-list">
+            {jack.asrDiagnostics.map((d) => (
+              <li key={d.id} className="jack-asr-diag-row">
+                <span className="jack-asr-diag-provider">{d.provider}</span>
+                <span className="jack-asr-diag-latency">{d.latencyMs}ms</span>
+                <span className="jack-asr-diag-outcome">
+                  {!d.success ? "failed" : d.downstreamOk === undefined ? "ignored" : d.downstreamOk ? "ok" : "no-match"}
+                </span>
+                <span className="jack-asr-diag-transcript">{d.transcript || "(empty)"}</span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+
       <button type="button" className="jack-settings-close" onClick={onClose} aria-label="Close settings">Done</button>
     </div>
   );

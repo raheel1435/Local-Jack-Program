@@ -1,0 +1,27 @@
+*.o
+*.a
+*.d
+*.obj
+*.lib
+*.exe
+*.dll
+*.pdb
+.cache/
+.vs/
+.vscode/
+.DS_Store
+compile_commands.json
+
+build/
+build-*/
+build_*/
+
+# model weights and downloads — kept outside git entirely (see C:\Users\shani\llm-models\vibeasr)
+models/
+*.gguf
+*.safetensors
+
+.idea/
+__pycache__/
+*.pyc
+*.log

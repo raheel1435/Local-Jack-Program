@@ -142,6 +142,24 @@ button.sync-presence:hover{filter:brightness(1.15)}
 .jack-settings-note{font-size:10px;color:#8aa0c0;margin:0;line-height:1.5}
 .jack-settings-close{align-self:flex-end;background:rgba(0,217,245,.1);border:1px solid rgba(0,217,245,.3);border-radius:8px;color:var(--cyan);padding:6px 14px;font-size:12px;cursor:pointer;margin-top:2px}
 
+/* Speech Recognition section (dual-ASR milestone) -- deliberately separate
+   from the Voice (TTS) row above: this picks the ASR engine, not the Kokoro
+   voice. Segmented Approved/Test control + an honest per-engine status dot. */
+.jack-settings-divider{border:none;border-top:1px solid var(--line);margin:2px 0}
+.jack-settings-section-title{font-size:11px;color:#8aa0c0;text-transform:uppercase;letter-spacing:.04em;margin:0}
+.jack-asr-segmented{display:flex;gap:6px}
+.jack-asr-option{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:8px;color:var(--text);padding:8px 10px;font-size:11px;cursor:pointer}
+.jack-asr-option.active{background:rgba(0,217,245,.14);border-color:rgba(0,217,245,.5);color:var(--cyan)}
+.jack-asr-option-status{display:inline-flex;align-items:center;gap:4px;font-size:10px;color:#8aa0c0}
+.jack-asr-status-dot{width:6px;height:6px;border-radius:50%;background:#5a6b80;flex:none}
+.jack-asr-status-dot.available{background:#3ddc84}
+.jack-asr-status-dot.unavailable{background:#ff5c5c}
+.jack-settings-diagnostics{font-size:11px;color:#8aa0c0}
+.jack-settings-diagnostics summary{cursor:pointer;color:#c3dcea}
+.jack-asr-diag-list{list-style:none;margin:6px 0 0;padding:0;display:flex;flex-direction:column;gap:4px;max-height:160px;overflow-y:auto}
+.jack-asr-diag-row{display:grid;grid-template-columns:64px 48px 56px 1fr;gap:6px;align-items:center;font-family:monospace;font-size:10px;padding:3px 4px;background:rgba(255,255,255,.03);border-radius:4px}
+.jack-asr-diag-transcript{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#dff8ff}
+
 /* Compact Jack control cluster (mic / typed-command toggle / browser-voice fallback) -- lives inline in present-controls */
 .jack-controls-cluster{display:inline-flex;gap:6px;padding:0 4px;border-left:1px solid var(--line);border-right:1px solid var(--line);margin:0 2px}
 .jack-mic-btn,.jack-command-toggle-btn,.jack-voice-fallback-btn{background:rgba(0,217,245,.06);border:1px solid rgba(0,217,245,.25);border-radius:8px;color:var(--text);padding:8px 12px;font-size:14px;line-height:1;cursor:pointer}

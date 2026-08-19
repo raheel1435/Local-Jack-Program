@@ -9,7 +9,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
-    "test": "node --experimental-strip-types --test src/intent/commandRouter.test.ts"
+    "test": "tsx --test src/intent/commandRouter.test.ts src/routes/transcription.test.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
