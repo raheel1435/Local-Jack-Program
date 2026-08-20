@@ -86,6 +86,30 @@ async function postJson<T>(path: string, body: unknown, timeoutMs?: number): Pro
   return res.json() as Promise<T>;
 }
 
+async function rawSpeak(text: string, voice?: string): Promise<Blob> {
+  const res = await fetch(`${BASE_URL}/jack/speak`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, voice }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!res.ok) throw new Error(`Jack Local AI speech request failed: ${res.status}`);
+  return res.blob();
+}
+
+// Single-file-of-record queue (see jackApi.speak's doc comment): every
+// speak() call chains onto this promise, so the actual fetch to Kokoro
+// never overlaps with another one from this client, regardless of how many
+// callers requested speech concurrently. A rejection from one call must
+// never poison the queue for the next -- .catch(() => {}) on the chain
+// link, not on the caller's own returned promise.
+let speakQueue: Promise<unknown> = Promise.resolve();
+function enqueueSpeak<T>(run: () => Promise<T>): Promise<T> {
+  const result = speakQueue.then(run, run);
+  speakQueue = result.catch(() => {});
+  return result;
+}
+
 export const jackApi = {
   baseUrl: BASE_URL,
 
@@ -145,16 +169,22 @@ export const jackApi = {
     return res.json();
   },
 
-  /** Fetches Kokoro-synthesized speech audio for the given text. */
-  async speak(text: string, voice?: string): Promise<Blob> {
-    const res = await fetch(`${BASE_URL}/jack/speak`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, voice }),
-      signal: AbortSignal.timeout(30_000),
-    });
-    if (!res.ok) throw new Error(`Jack Local AI speech request failed: ${res.status}`);
-    return res.blob();
+  /**
+   * Fetches Kokoro-synthesized speech audio for the given text.
+   *
+   * Serialized through speakQueue (latency-fix milestone): progressive
+   * narration now fires more than one speak() concurrently by design (the
+   * current slide's continuation and the next slide's prefetched opening
+   * can both be in flight while the current opening plays). Confirmed live
+   * that Kokoro-FastAPI returns 503 on a genuinely concurrent second
+   * request rather than queuing it itself -- this queue is the fix, on the
+   * client, without touching Kokoro. Callers still get true parallelism for
+   * everything BEFORE this call (LLM generation, context building); only
+   * the TTS requests themselves are serialized, one at a time, in the order
+   * they were issued.
+   */
+  speak(text: string, voice?: string): Promise<Blob> {
+    return enqueueSpeak(() => rawSpeak(text, voice));
   },
 
   /**

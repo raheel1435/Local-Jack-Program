@@ -4,6 +4,7 @@ import { JackOrb } from "../JackOrb";
 import { useJack } from "../jack/JackProvider";
 import type { AudienceQuestionPolicy, ControlMode } from "../jack/types";
 import { LANGUAGE_OPTIONS, VOICE_OPTIONS } from "../jack/voiceSettings";
+import { AsrProviderSelector } from "./AsrProviderSelector";
 
 const CONTROL_MODES: { id: ControlMode; label: string; description: string }[] = [
   { id: "presenterLeads", label: "Presenter leads", description: "You control the slides. Jack speaks only when asked or scheduled." },
@@ -101,6 +102,9 @@ export function PresentSetup({ onReady, title }: { onReady: () => void; title: s
           <select value={jack.voice} onChange={(e) => jack.setVoice(e.target.value)}>
             {VOICE_OPTIONS.map((v) => <option key={v.id} value={v.id}>{v.label} -- {v.gender} · {v.accent}</option>)}
           </select>
+
+          <legend>Speech Recognition</legend>
+          <AsrProviderSelector />
 
           <label className="setup-checkbox">
             <input type="checkbox" checked={jack.captionsEnabled} onChange={(e) => jack.setCaptionsEnabled(e.target.checked)} />

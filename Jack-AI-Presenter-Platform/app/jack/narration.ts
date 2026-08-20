@@ -3,6 +3,25 @@ import type { ParsedDocument } from "../session/types";
 import { retrieveForQuestion } from "./deckRetrieval";
 import { formatContextForPrompt, formatContextForQA, type PresentationContext } from "./presentationContext";
 
+/**
+ * Pure validity check for a prefetched next-slide opening (latency-fix
+ * milestone) -- kept here (not in JackProvider.tsx, which uses it) so it's
+ * importable from a plain .ts test without needing a JSX-capable loader. A
+ * prefetch is only ever usable for the EXACT (generation, slideIndex) it
+ * was started for: generation already changes on every pause/interrupt/
+ * jump/handoff/stop (see JackProvider's cancelAutonomousPresenting), so
+ * this alone is what guarantees a slide is never narrated from a stale
+ * prefetch. Never valid for the very first (isOpening) slide -- nothing
+ * precedes it to prefetch during.
+ */
+export function isPrefetchValid(
+  prefetch: { generation: number; slideIndex: number } | null,
+  current: { isOpening: boolean; generation: number; slideIndex: number },
+): boolean {
+  if (current.isOpening || !prefetch) return false;
+  return prefetch.generation === current.generation && prefetch.slideIndex === current.slideIndex;
+}
+
 // Comprehensive mode (Ask Jack) can include up to 10 full-section matches in
 // one prompt (see deckRetrieval's COMPREHENSIVE_MATCH_LIMIT) -- with no cap,
 // a handful of genuinely long slides could bloat the assembled prompt well
@@ -91,6 +110,97 @@ export async function generateSlideNarration(
     { maxTokens: 160, temperature: 0.5 },
   );
   return result.content.trim();
+}
+
+/**
+ * Progressive narration (latency-fix milestone): generateSlideNarration
+ * above waits for the model to finish the WHOLE narration (up to 160
+ * tokens) before anything can be spoken. jackApi.chat/jackApi.speak are
+ * both single-shot request/response (no token or audio streaming -- see
+ * LlamaCppProvider.chat and KokoroProvider.speak), so the only real lever
+ * for time-to-first-audible-speech is generating and synthesizing LESS
+ * text before speech starts. generateNarrationOpening produces one short,
+ * slide-grounded sentence with a small max_tokens budget (fast on both the
+ * LLM and TTS side); generateNarrationContinuation produces whatever's left
+ * to say, told explicitly what was already spoken so it never repeats it.
+ * The caller (runNarrationStep) speaks the opening immediately and
+ * generates+synthesizes the continuation in parallel with that playback.
+ */
+export async function generateNarrationOpening(
+  context: PresentationContext,
+  isOpening: boolean,
+  humourEnabled: boolean,
+): Promise<string> {
+  const prompt =
+    `${formatContextForPrompt(context)}\n\n` +
+    "Give ONE short opening sentence to start narrating this slide -- grounded in a specific " +
+    "fact or idea actually on the slide (never a generic \"now we're on slide N\" announcement). " +
+    "8-18 words. Nothing else, just that one sentence.";
+  const result = await jackApi.chat(
+    [
+      { role: "system", content: narrationSystemPrompt(isOpening, humourEnabled) },
+      { role: "user", content: prompt },
+    ],
+    { maxTokens: 48, temperature: 0.5 },
+  );
+  return result.content.trim();
+}
+
+export async function generateNarrationContinuation(
+  context: PresentationContext,
+  openingSentence: string,
+  humourEnabled: boolean,
+): Promise<string> {
+  const prompt =
+    `${formatContextForPrompt(context)}\n\n` +
+    `You already said, out loud, to the audience: "${openingSentence}"\n\n` +
+    "They already heard that -- saying it again in different words is a real mistake, not a " +
+    'style choice. For example, if you already said "The market is worth $40 billion by 2030", ' +
+    'do NOT follow it with "The addressable market is estimated at $40 billion by 2030" -- that ' +
+    "is the same fact restated, not new information. Add ONLY facts/details from this slide that " +
+    "were NOT in that opening line (1-2 short sentences). If every fact on this slide is already " +
+    "covered by the opening line, reply with nothing at all -- an empty response is correct and " +
+    "expected here, not a failure.";
+  const result = await jackApi.chat(
+    [
+      // The self-introduction (if any) was already handled by the opening
+      // call -- a continuation must never repeat/redo it, so this always
+      // uses the non-opening system prompt regardless of the slide's own
+      // isOpening flag.
+      { role: "system", content: narrationSystemPrompt(false, humourEnabled) },
+      { role: "user", content: prompt },
+    ],
+    { maxTokens: 120, temperature: 0.5 },
+  );
+  return result.content.trim();
+}
+
+/**
+ * Deterministic backstop for generateNarrationContinuation's prompt
+ * instruction: a small local model (Qwen2.5-1.5B here) does not reliably
+ * follow "don't repeat the opening" -- confirmed live, it sometimes restates
+ * the same fact in paraphrased words instead of adding anything new. Rather
+ * than trust the model's judgment alone, measure real word overlap between
+ * the two sentences; a continuation that's mostly the same words as the
+ * opening is treated as a repeat and dropped by the caller, same as an
+ * empty response. Deliberately simple (normalized word-set overlap, no NLP
+ * dependency) -- this only needs to catch near-duplicates, not paraphrase
+ * detection in general.
+ */
+export function isRedundantContinuation(openingSentence: string, continuation: string): boolean {
+  const words = (s: string) => new Set(s.toLowerCase().match(/[a-z0-9']+/g) ?? []);
+  const a = words(openingSentence);
+  const b = words(continuation);
+  if (a.size === 0 || b.size === 0) return false;
+  let shared = 0;
+  for (const w of b) if (a.has(w)) shared++;
+  // Overlap relative to the SHORTER sentence's word count -- a short
+  // continuation that's almost entirely made of words already in the
+  // (usually longer) opening is the repeat pattern actually observed live;
+  // a longer continuation that happens to share a few common words
+  // (numbers, the slide's own subject) is not.
+  const overlapRatio = shared / Math.min(a.size, b.size);
+  return overlapRatio >= 0.5;
 }
 
 const NOT_COVERED_ANSWER = "That isn't covered in this presentation.";

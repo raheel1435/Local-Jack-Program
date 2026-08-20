@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildPresentationContext } from "../app/jack/presentationContext.ts";
-import { narrationSystemPrompt } from "../app/jack/narration.ts";
+import { narrationSystemPrompt, isRedundantContinuation } from "../app/jack/narration.ts";
 import { ok, fail } from "../app/jack/presentationController.ts";
 
 // Slide-sync regression tests (Phase 28 of the slide-sync milestone) --
@@ -107,4 +107,24 @@ test("humour only changes the opening prompt, never silently added to continuati
   // humour belongs to the opening/greeting/ack lines, not fabricated into
   // ordinary slide narration.
   assert.equal(narrationSystemPrompt(false, true), narrationSystemPrompt(false, false));
+});
+
+// Regression coverage for the latency-fix milestone's progressive-narration
+// backstop -- confirmed live that the small local model (Qwen2.5-1.5B)
+// sometimes paraphrases the opening sentence instead of adding new
+// information, despite being explicitly told not to.
+test("isRedundantContinuation catches a paraphrased restatement of the opening fact", () => {
+  const opening = "The addressable market for last-mile delivery automation is estimated at $40 billion by 2030.";
+  const paraphrase = "The addressable market is expected to reach $40 billion by 2030, highlighting significant growth potential.";
+  assert.equal(isRedundantContinuation(opening, paraphrase), true);
+});
+
+test("isRedundantContinuation allows a genuinely new sentence through", () => {
+  const opening = "The addressable market for last-mile delivery automation is estimated at $40 billion by 2030.";
+  const newInfo = "Regulatory approval in the EU is expected to open an additional 12 billion dollars of that market by 2027.";
+  assert.equal(isRedundantContinuation(opening, newInfo), false);
+});
+
+test("isRedundantContinuation treats an empty continuation as not redundant (the caller already drops empties separately)", () => {
+  assert.equal(isRedundantContinuation("Some opening sentence.", ""), false);
 });

@@ -20,7 +20,13 @@ import { summarizeDocuments } from "./documentContext";
 import { buildInstructions } from "./instructions";
 import { createJackSpeechPlayer } from "./jackSpeechPlayer";
 import { nextAttentionState } from "./jackStateMachine";
-import { answerDeckQuestion, generateSlideNarration } from "./narration";
+import {
+  answerDeckQuestion,
+  generateNarrationContinuation,
+  generateNarrationOpening,
+  isPrefetchValid,
+  isRedundantContinuation,
+} from "./narration";
 import { toOrbPresentation, type OrbPresentation } from "./orbStateMap";
 import { buildPresentationContext, formatContextForPrompt, type PresentationContext } from "./presentationContext";
 import { unsupportedController, type PresentationController } from "./presentationController";
@@ -558,6 +564,19 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const [speechPlayer] = useState(() => createJackSpeechPlayer());
   const narrationGenerationRef = useRef(0);
   const narrationActiveRef = useRef(false);
+  // Next-slide narration-opening prefetch (latency-fix milestone): started
+  // while the CURRENT slide's clip is playing, so slide N+1's opening
+  // sentence (text + synthesized audio) is often already available the
+  // instant slide N+1 becomes current. Keyed by (generation, slideIndex) --
+  // narrationGenerationRef already increments on every pause/interrupt/jump/
+  // handoff/stop (see cancelAutonomousPresenting), so a stale prefetch from
+  // before any of those can never match a later runNarrationStep call's
+  // generation and is simply discarded, never spoken.
+  const narrationPrefetchRef = useRef<{
+    generation: number;
+    slideIndex: number;
+    promise: Promise<{ text: string; audio: Blob } | null>;
+  } | null>(null);
   // Distinct from jackAwake (Phase 8): waking Jack up is a private moment
   // with the presenter; delivering the audience-facing opening happens once
   // per presentation session, the first time Jack actually starts
@@ -1193,6 +1212,34 @@ export function JackProvider({ children }: { children: ReactNode }) {
     }
   }, [stopJackAudio, clearBargeInArmTimers, clearBargeInCaptureTimeout, localRecorder, setBargeInPhaseBoth]);
 
+  // Speculatively generates + synthesizes the NEXT slide's opening sentence
+  // now, so it's (often) already sitting ready by the time that slide
+  // actually becomes current. Never used for slide 0's own opening (nothing
+  // precedes it to prefetch during) -- runNarrationStep's isOpening check
+  // already gates that. Best-effort: any failure just means the next step
+  // falls back to generating fresh, exactly as before this milestone.
+  const prefetchNextSlideOpening = useCallback(
+    (generation: number, slideIndex: number) => {
+      const controller = controllerRef.current.controller;
+      const context = buildPresentationContext(controller, slideIndex);
+      if (!context) {
+        narrationPrefetchRef.current = null;
+        return;
+      }
+      const promise = (async () => {
+        try {
+          const text = await generateNarrationOpening(context, false, humourEnabled);
+          const audio = await jackApi.speak(text, voice);
+          return { text, audio };
+        } catch {
+          return null;
+        }
+      })();
+      narrationPrefetchRef.current = { generation, slideIndex, promise };
+    },
+    [humourEnabled, voice],
+  );
+
   const runNarrationStep = useCallback(
     // slideIndex (0-based), when given, is the AUTHORITATIVE slide to
     // narrate -- required for the auto-advance call below, which just moved
@@ -1223,6 +1270,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
         finishTrace(traceId, false);
         return;
       }
+      const resolvedSlideIndex = context.currentSlideNumber - 1;
 
       dispatchEvent({ type: "LOCAL_COMMAND_START" }); // -> thinking
       // Decided (not just checked) here, before generation: the model is
@@ -1231,52 +1279,93 @@ export function JackProvider({ children }: { children: ReactNode }) {
       // point on, even if this specific narration attempt later fails.
       const isOpening = !presentationOpeningDeliveredRef.current;
       presentationOpeningDeliveredRef.current = true;
-      let narrationText: string;
-      mark(traceId, "llmRequestStart"); // T12 -- llmFirstToken (T13) is not measurable: jackApi.chat is a single non-streaming JSON response, not SSE
-      try {
-        narrationText = await generateSlideNarration(context, isOpening, humourEnabled);
-      } catch (err) {
-        // Phase 17: LLM failure during autonomy -- stop, don't guess, stay put.
-        cancelAutonomousPresenting();
-        setLastError(err instanceof Error ? err.message : "Jack couldn't prepare narration for this slide.");
-        finishTrace(traceId, false);
-        return;
+
+      // Progressive narration (latency-fix milestone): speak a short,
+      // slide-grounded OPENING sentence the moment it's ready, instead of
+      // waiting for the model to finish the entire narration first. A
+      // matching prefetch (started while the PREVIOUS slide's clip was
+      // playing -- see prefetchNextSlideOpening) skips this opening's
+      // LLM+TTS round trip entirely; it's consumed here either way (used or
+      // discarded), so a slide is never narrated from a stale prefetch.
+      const prefetch = narrationPrefetchRef.current;
+      const prefetchHit = isPrefetchValid(prefetch, { isOpening, generation, slideIndex: resolvedSlideIndex });
+      narrationPrefetchRef.current = null;
+
+      let opening: { text: string; audio: Blob } | null = null;
+      mark(traceId, "llmRequestStart"); // T12
+      if (prefetchHit && prefetch) {
+        const result = await prefetch.promise;
+        if (!stillCurrent()) {
+          finishTrace(traceId, false);
+          return;
+        }
+        if (result) {
+          // These stages genuinely cost ~0ms of THIS narration step's
+          // latency -- the work already happened during the previous
+          // slide's playback. setTraceLabel below marks the trace as a
+          // prefetch hit so the Diagnostics panel never misrepresents this
+          // as suspiciously-fast fresh generation.
+          mark(traceId, "llmFirstToken"); // T13 -- opening text was ready via prefetch
+          mark(traceId, "ttsRequestStart"); // T15
+          mark(traceId, "ttsResponseReady");
+          opening = result;
+          setTraceLabel(traceId, `[prefetched] ${result.text}`);
+        }
       }
-      mark(traceId, "llmResponseReady"); // T14
-      setTraceLabel(traceId, narrationText);
+      if (!opening) {
+        try {
+          const text = await generateNarrationOpening(context, isOpening, humourEnabled);
+          mark(traceId, "llmFirstToken"); // T13 -- opening sentence text ready (genuinely measurable now, unlike the old single-shot call)
+          if (!stillCurrent()) {
+            finishTrace(traceId, false);
+            return;
+          }
+          mark(traceId, "ttsRequestStart"); // T15
+          const audio = await jackApi.speak(text, voice);
+          mark(traceId, "ttsResponseReady");
+          opening = { text, audio };
+          setTraceLabel(traceId, text);
+        } catch (err) {
+          // Phase 17: LLM/TTS failure during autonomy -- stop, don't guess, stay put.
+          cancelAutonomousPresenting();
+          setLastError(err instanceof Error ? err.message : "Jack couldn't prepare narration for this slide.");
+          finishTrace(traceId, false);
+          return;
+        }
+      }
       if (!stillCurrent()) {
         finishTrace(traceId, false);
         return;
       }
 
-      let audio: Blob;
-      mark(traceId, "ttsRequestStart"); // T15 -- ttsFirstAudio (T16) is not measurable: jackApi.speak resolves only once the whole audio blob is downloaded
-      try {
-        audio = await jackApi.speak(narrationText, voice);
-      } catch (err) {
-        // Phase 17: Kokoro failure -- show the text, stop autonomy, hand control back safely.
-        setCurrentCaption(narrationText);
-        cancelAutonomousPresenting();
-        setLastError(err instanceof Error ? err.message : "Jack's voice is unavailable right now.");
-        finishTrace(traceId, false);
-        return;
-      }
-      mark(traceId, "ttsResponseReady");
-      if (!stillCurrent()) {
-        finishTrace(traceId, false);
-        return;
-      }
-
-      setCurrentCaption(narrationText);
+      setCurrentCaption(opening.text);
       dispatchEvent({ type: "AUDIO_START" });
       mark(traceId, "playbackStart"); // T17 -- closest available proxy for first audible sample (no lower-level playback-started callback exists)
       activeSpeechTraceIdRef.current = traceId;
-      speechPlayer.play(audio, () => {
-        activeSpeechTraceIdRef.current = undefined;
-        mark(traceId, "playbackComplete"); // T19
-        finishTrace(traceId);
-        dispatchEvent({ type: "AUDIO_STOPPED" });
-        if (!stillCurrent()) return; // cancelled/interrupted during playback -- do NOT advance
+
+      // Fired alongside the opening's playback, not after it: the rest of
+      // this slide's narration (if any) and the NEXT slide's opening
+      // prefetch both happen concurrently with what the audience is
+      // currently hearing, never blocking it.
+      const continuationPromise = (async () => {
+        try {
+          const text = await generateNarrationContinuation(context, opening!.text, humourEnabled);
+          // Empty (model judged the opening already complete) or a
+          // near-duplicate of the opening (the model didn't reliably follow
+          // that instruction -- see isRedundantContinuation's comment) are
+          // both treated the same way: no continuation, opening alone is a
+          // complete, honest utterance.
+          if (!text || isRedundantContinuation(opening!.text, text)) return null;
+          const audio = await jackApi.speak(text, voice);
+          return { text, audio };
+        } catch {
+          return null; // best-effort -- losing the continuation still leaves a real (if shorter) narration
+        }
+      })();
+      prefetchNextSlideOpening(generation, resolvedSlideIndex + 1);
+
+      const advanceToNextSlide = () => {
+        if (!stillCurrent()) return;
         const advance = controller.goToNextSlide();
         if (!advance.success) {
           // Phase 5: end of deck -- finish cleanly, do not wrap to slide 1.
@@ -1287,9 +1376,44 @@ export function JackProvider({ children }: { children: ReactNode }) {
         // Pass the index goToNextSlide() just returned, not "whatever
         // current looks like now" -- see runNarrationStep's param comment.
         void runNarrationStep(generation, advance.data.index);
+      };
+
+      speechPlayer.play(opening.audio, () => {
+        void (async () => {
+          if (!stillCurrent()) {
+            activeSpeechTraceIdRef.current = undefined;
+            finishTrace(traceId, false);
+            dispatchEvent({ type: "AUDIO_STOPPED" });
+            return;
+          }
+          const continuation = await continuationPromise;
+          if (!stillCurrent()) {
+            activeSpeechTraceIdRef.current = undefined;
+            finishTrace(traceId, false);
+            dispatchEvent({ type: "AUDIO_STOPPED" });
+            return;
+          }
+          if (!continuation) {
+            activeSpeechTraceIdRef.current = undefined;
+            mark(traceId, "playbackComplete"); // T19
+            finishTrace(traceId);
+            dispatchEvent({ type: "AUDIO_STOPPED" });
+            advanceToNextSlide();
+            return;
+          }
+          setCurrentCaption(`${opening!.text} ${continuation.text}`);
+          activeSpeechTraceIdRef.current = traceId;
+          speechPlayer.play(continuation.audio, () => {
+            activeSpeechTraceIdRef.current = undefined;
+            mark(traceId, "playbackComplete"); // T19
+            finishTrace(traceId);
+            dispatchEvent({ type: "AUDIO_STOPPED" });
+            advanceToNextSlide();
+          });
+        })();
       });
     },
-    [cancelAutonomousPresenting, dispatchEvent, speechPlayer, voice, humourEnabled],
+    [cancelAutonomousPresenting, dispatchEvent, speechPlayer, voice, humourEnabled, prefetchNextSlideOpening],
   );
 
   const startAutonomousPresenting = useCallback(() => {
@@ -1369,14 +1493,20 @@ export function JackProvider({ children }: { children: ReactNode }) {
     }
   }, [clearBargeInCaptureTimeout, localRecorder, dispatchEvent, setBargeInPhaseBoth, isAddressedToJack, asrProvider, recordAsrDiagnostic]);
 
+  // Safe-interruption fix (latency-fix milestone): detecting sound crossing
+  // the barge-in threshold must NOT touch Jack's in-progress narration --
+  // any ambient noise/background speech would otherwise cut Jack off before
+  // we even know whether it named him (confirmed live: real background
+  // audio in a noisy room repeatedly stopped narration this way, discarding
+  // it every time as "not addressed"). Capturing/transcribing happens
+  // silently in the background; only finishBargeInCapture, once
+  // isAddressedToJack(transcript) is confirmed true, is allowed to
+  // interrupt -- and it already does, via cancelAutonomousPresenting()
+  // inside every runLocalCommand branch a real command reaches.
   const handleBargeInDetected = useCallback(() => {
     setBargeInPhaseBoth("capturing");
     bargeInSilenceStartRef.current = null;
-    narrationGenerationRef.current += 1; // invalidate the in-flight narration step
-    narrationActiveRef.current = false;
-    setIsPresentingAutonomously(false);
-    stopJackAudio(); // cancel, not natural completion -- no auto-advance
-    dispatchEvent({ type: "USER_SPEECH_DETECTED" }); // speaking -> listening (existing transition)
+    dispatchEvent({ type: "USER_SPEECH_DETECTED" }); // speaking -> listening (existing transition) -- UI only, does not touch audio/narration
     clearBargeInArmTimers();
     clearBargeInCaptureTimeout();
     const traceId = startTrace("voice_command");
@@ -1411,7 +1541,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
         void finishBargeInCapture();
       }
     }, 150);
-  }, [stopJackAudio, dispatchEvent, clearBargeInArmTimers, clearBargeInCaptureTimeout, finishBargeInCapture]);
+  }, [dispatchEvent, clearBargeInArmTimers, clearBargeInCaptureTimeout, finishBargeInCapture]);
 
   // Arm/disarm ambient listening. Two independent reasons to be armed:
   // (1) automatic -- Jack holds the floor (presenterControl === "jack") and
