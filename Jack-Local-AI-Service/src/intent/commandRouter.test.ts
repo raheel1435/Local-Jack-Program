@@ -31,6 +31,25 @@ test("all Phase 9 handoff phrasings resolve to handoff_to_presenter deterministi
   }
 });
 
+// Regression coverage for the Whisper-approved-baseline audit: "Jack, I'll
+// take it from here." (verbatim from this milestone's own test corpus)
+// transcribed perfectly but fell through to the LLM fallback un-anchored by
+// "jack,", which classified it as plain conversation -- control was never
+// handed back. Confirmed live via curl and the real browser UI after adding
+// the same "Hey/Ok/Okay/Yo Jack" prefix tolerance already used elsewhere.
+test("leading 'Jack,' / 'Hey Jack,' handoff phrasings resolve to handoff_to_presenter deterministically", () => {
+  const phrases = [
+    "Jack, I'll take it from here.",
+    "Hey Jack, I'll take it from here.",
+    "Jack, I'll take over.",
+    "Jack, I'll take over now.",
+  ];
+  for (const phrase of phrases) {
+    const result = matchDeterministicCommand(phrase);
+    assert.deepEqual(result, { type: "action", action: "handoff_to_presenter" }, `expected handoff_to_presenter for "${phrase}"`);
+  }
+});
+
 test("'Jack take over again.' resolves to start_presentation, not handoff -- confirmed live the LLM fallback inverted this", () => {
   assert.deepEqual(matchDeterministicCommand("Jack take over again."), { type: "action", action: "start_presentation" });
   assert.deepEqual(matchDeterministicCommand("Take over again, Jack."), { type: "action", action: "start_presentation" });

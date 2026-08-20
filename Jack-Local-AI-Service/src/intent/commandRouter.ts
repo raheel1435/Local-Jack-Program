@@ -124,11 +124,13 @@ const ACTION_RULES: ActionRule[] = [
     type: "action",
     action: "handoff_to_presenter",
     patterns: [
-      /^i('| wi)ll take ?over( now)?\.?$/,
-      /^i('| wi)ll take it from (here|there)\.?$/,
-      // Optional "Jack," prefix -- confirmed live the LLM fallback
-      // misclassified "Jack, I'll continue." as start_presentation (backwards)
-      // when it fell through un-anchored by "jack,".
+      // Optional "Jack," prefix on all three -- confirmed live (Whisper
+      // baseline audit) that "Jack, I'll take it from here." transcribes
+      // perfectly but was falling through to the LLM fallback un-anchored
+      // by "jack,", which classified it as plain "conversation" (no action
+      // at all), same failure class as "Jack, I'll continue." below.
+      withHey("^(JACK,?\\s+)?i('| wi)ll take ?over( now)?\\.?$"),
+      withHey("^(JACK,?\\s+)?i('| wi)ll take it from (here|there)\\.?$"),
       withHey("^(JACK,?\\s+)?i('| wi)ll continue\\.?$"),
       /^(give|hand)( me| back)? (the )?control( back)?\.?$/,
       // "Give it back to me." -- confirmed live the LLM fallback returned a
