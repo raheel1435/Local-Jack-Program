@@ -21,19 +21,61 @@ const execFileAsync = promisify(execFile);
  *
  * whisper.cpp's --prompt flag (an initial decoder prompt, NOT a spoken
  * prefix -- see whisper-cli --help) primes the language-model side of
- * decoding toward expected vocabulary. Passing this fixed command
- * vocabulary eliminated all three failures in every reproduction (verified
- * against the full Phase-3 command corpus, 20/20 phrases correct with the
- * prompt vs. 3/20 broken without it) and produced ZERO false insertions
- * into unrelated speech (verified against an unrelated control sentence,
- * transcribed byte-identical with and without the prompt). This is the one
- * fix this audit found evidence for; capture/VAD timing, thread count, and
- * the model itself all measured fine and were left untouched.
+ * decoding toward expected vocabulary. Passing a fixed command vocabulary
+ * eliminated all three failures in every reproduction and produced ZERO
+ * false insertions into unrelated speech.
+ *
+ * WHISPER FALSE-DESTRUCTIVE-COMMAND ROOT-CAUSE milestone: the ORIGINAL
+ * version of this prompt (kept below in this comment for the record) was
+ * complete example sentences -- "Jack, stop.", "Jack, take over again.",
+ * "I'll take it from here." verbatim. Root-caused live: real-hardware
+ * microphone testing reproduced repeated false stop_presentation/
+ * start_presentation/handoff_to_presenter actions from ambient audio with
+ * NO one speaking, and a controlled experiment proved the mechanism --
+ * identical synthetic broadband noise (no speech at all), fed to
+ * whisper-cli 3x across 2 amplitude/seed variants: WITH that full-sentence
+ * prompt, produced "Jack, stop." byte-identical every single time (6/6
+ * runs) -- a clean, well-formed, deterministically-matching destructive
+ * command from pure noise. WITHOUT any prompt, the same noise produced
+ * "(machine whirring)" -- already safe (caught by isNonSpeechArtifact
+ * below). whisper.cpp's initial-prompt mechanism primes the decoder's
+ * language-model side hard enough that on low-confidence/ambiguous audio,
+ * it can regurgitate the prompt's own complete example sentences verbatim
+ * rather than transcribing the actual (near-silent/noisy) input.
+ *
+ * This word-list-only replacement keeps the vocabulary-priming benefit
+ * (verified: still correctly transcribes "Jack, stop." / "Jack, pause." /
+ * "Jack, explain this slide." / "Jack, take over again." / "I'll take it
+ * from here." / "Jack, go to slide three." from real Kokoro-synthesized
+ * audio, and every one still resolves to the same action via
+ * matchDeterministicCommand's existing comma/period-tolerant patterns) but
+ * removes the complete-sentence regurgitation target: the SAME noise test
+ * (both seeds, 3 runs each) now produces only the single bare word "slide"
+ * -- already safe via the existing bare-word-fragment check
+ * (isBareWordFragment) AND the address gate (no "jack" in it at all).
+ *
+ * A per-token confidence gate (whisper.cpp's --print-confidence/-ojf) was
+ * evaluated and explicitly NOT implemented: under this new prompt, the
+ * noise-hallucinated "slide" measured 0.91-0.97 average token confidence --
+ * HIGHER than several genuine real-command recordings under the same new
+ * prompt (0.48-0.91 average across 5 samples). Confidence does not reliably
+ * separate real speech from hallucination once the prompt no longer
+ * strongly primes one specific phrase, so a threshold gate here would be
+ * unreliable at best and could false-reject genuine quiet/urgent commands
+ * at worst. See WHISPER_APPROVED_BASELINE.md's root-cause section for the
+ * full data. Self-echo (Jack's own TTS leaking through the browser's
+ * imperfect echo cancellation) is a SEPARATE mechanism this prompt change
+ * does not address -- see addressing.ts / JackProvider.tsx's self-echo
+ * guard for that.
+ *
+ * Original full-sentence prompt, for the record:
+ * "Jack, next slide. Jack, previous slide. Jack, go back. Jack, pause.
+ * Jack, continue. Jack, stop. Jack, take over. Jack, take over again. I'll
+ * take it from here. Jack, explain this slide. Jack, summarize this slide.
+ * Jack, go to slide three."
  */
 export const COMMAND_VOCABULARY_PROMPT =
-  "Jack, next slide. Jack, previous slide. Jack, go back. Jack, pause. Jack, continue. Jack, stop. " +
-  "Jack, take over. Jack, take over again. I'll take it from here. Jack, explain this slide. " +
-  "Jack, summarize this slide. Jack, go to slide three.";
+  "Jack next previous pause continue stop take over explain summarize slide pricing roadmap presentation";
 
 // WHISPER SAFETY CORRECTION milestone, Part 10: whisper.cpp's own CLI
 // default happened to already be 4 (confirmed via repeated timed runs, byte-

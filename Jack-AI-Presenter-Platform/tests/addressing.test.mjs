@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyJackAddress, isDirectlyAddressedToJack } from "../app/jack/addressing.ts";
+import { classifyJackAddress, isDirectlyAddressedToJack, isSelfEcho } from "../app/jack/addressing.ts";
 
 // WHISPER SAFETY CORRECTION milestone: regression coverage for the fix to
 // the ambient barge-in gate, which used to be a bare `/\bjack\b/i` test --
@@ -51,4 +51,63 @@ test("isDirectlyAddressedToJack is true only for 'direct', false for 'mention'/'
   assert.equal(isDirectlyAddressedToJack("Jack, stop."), true);
   assert.equal(isDirectlyAddressedToJack("The next slide explains why Jack stopped."), false);
   assert.equal(isDirectlyAddressedToJack("Next slide please."), false);
+});
+
+// WHISPER FALSE-DESTRUCTIVE-COMMAND ROOT-CAUSE milestone: regression
+// coverage for the self-echo guard, added after live real-hardware-mic
+// testing captured "Jack, I'll take it from here." (a real command match)
+// moments after Jack himself said "Got it. I'll take it from here." via TTS.
+
+test("self-echo: a near-verbatim echo of Jack's own recent speech is flagged", () => {
+  const recent = [{ text: "Got it. I'll take it from here.", at: Date.now() }];
+  assert.equal(isSelfEcho("Jack, I'll take it from here.", recent), true);
+});
+
+test("self-echo: a genuinely independent short command is never flagged, even with incidental word overlap", () => {
+  const recent = [{ text: "Let's look at the next slide about our roadmap.", at: Date.now() }];
+  // Shares "next"/"slide" with Jack's own narration, but only 2 content
+  // words total -- below the minimum-shared-words floor, so short commands
+  // can never be self-echo-suppressed no matter what Jack just said.
+  assert.equal(isSelfEcho("Jack, next slide.", recent), false);
+  assert.equal(isSelfEcho("Jack, stop.", recent), false);
+});
+
+test("self-echo: a longer independent utterance with only partial/incidental overlap is not flagged", () => {
+  const recent = [{ text: "This slide covers our pricing strategy for the enterprise tier.", at: Date.now() }];
+  assert.equal(isSelfEcho("Jack, what is the refund policy for annual plans?", recent), false);
+});
+
+test("self-echo: history entries older than the retention window are the caller's responsibility to prune, not silently ignored by content alone", () => {
+  // isSelfEcho itself doesn't look at timestamps -- callers (JackProvider)
+  // are expected to prune old entries before calling. Confirms it still
+  // matches purely on text if a stale entry is passed in.
+  const recent = [{ text: "Got it. I'll take it from here.", at: Date.now() - 10 * 60_000 }];
+  assert.equal(isSelfEcho("Jack, I'll take it from here.", recent), true);
+});
+
+test("self-echo: empty history never flags anything", () => {
+  assert.equal(isSelfEcho("Jack, I'll take it from here.", []), false);
+});
+
+// Independent-attack-review finding: a real, independent navigation command
+// that happens to reuse the same low-impact deck-navigation vocabulary as
+// Jack's own narration (both legitimately talk about "next"/"slide"/
+// "continue" -- this app's whole domain) must NOT be silently swallowed as
+// self-echo just because every one of its content words also appears in
+// Jack's last utterance. Fixed via GENERIC_OVERLAP_WORDS -- see the module
+// comment on isSelfEcho.
+test("self-echo: a real command sharing only generic navigation/deck-topic vocabulary with narration is never flagged", () => {
+  const recent = [{ text: "Let's continue to the next slide now.", at: Date.now() }];
+  assert.equal(isSelfEcho("Jack, continue to the next slide.", recent), false);
+
+  const recent2 = [{ text: "This slide covers our pricing and the product roadmap.", at: Date.now() }];
+  assert.equal(isSelfEcho("Jack, summarize the pricing and roadmap slide.", recent2), false);
+});
+
+// The generic-vocabulary exclusion must not blind the guard to the actual
+// motivating case -- "take"/"from"/"i'll" are not navigation/deck-topic
+// words, so this must still be caught.
+test("self-echo: the exclusion list does not defeat detection of the original motivating case", () => {
+  const recent = [{ text: "Got it. I'll take it from here.", at: Date.now() }];
+  assert.equal(isSelfEcho("Jack, I'll take it from here.", recent), true);
 });

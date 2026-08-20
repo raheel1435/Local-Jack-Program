@@ -4,7 +4,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { OpenAIRealtimeWebRTC, RealtimeAgent, RealtimeSession, type RealtimeItem } from "@openai/agents-realtime";
 import { useLocalRecorder, type CaptureCloseReason, type LocalRecorderState } from "../hooks/useLocalRecorder";
 import { capturePolicyFor } from "./capturePolicy";
-import { isDirectlyAddressedToJack } from "./addressing";
+import { isDirectlyAddressedToJack, isSelfEcho, type RecentSpeech } from "./addressing";
 import { useSpeech, type UseSpeechResult } from "../hooks/useSpeech";
 import { jackApi, type AsrProviderId, type JackHealth, type JackIntentAction } from "../lib/jackApi";
 import {
@@ -409,6 +409,37 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const [micLevel, setMicLevel] = useState(0);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [currentCaption, setCurrentCaption] = useState("");
+  // Self-echo guard history (WHISPER FALSE-DESTRUCTIVE-COMMAND ROOT-CAUSE
+  // milestone): every real thing Jack has spoken recently, so an incoming
+  // barge-in transcript that's substantially HIS OWN speech leaking back
+  // through the mic (imperfect echo cancellation) can be told apart from a
+  // real independent command -- see addressing.ts's isSelfEcho. Capped by
+  // both count and age; a ref (not state) because finishBargeInCapture needs
+  // a synchronous read at the moment a transcript arrives, not a value that
+  // might still be mid-render.
+  const recentJackSpeechRef = useRef<RecentSpeech[]>([]);
+  const SELF_ECHO_HISTORY_MS = 90_000;
+  const setCurrentCaptionTracked = useCallback((text: string) => {
+    setCurrentCaption(text);
+    if (text.trim()) {
+      const now = Date.now();
+      recentJackSpeechRef.current = [
+        ...recentJackSpeechRef.current.filter((e) => now - e.at < SELF_ECHO_HISTORY_MS),
+        { text, at: now },
+      ].slice(-5);
+    }
+  }, []);
+  // Independent-review fix: the write-time filter above only prunes stale
+  // entries when Jack next speaks -- if he goes quiet for a while, a
+  // transcript arriving well past SELF_ECHO_HISTORY_MS was still being
+  // checked against speech from outside that window (and, equivalently,
+  // against a just-ended session's leftover history, since nothing ever
+  // explicitly clears this ref). Reading through this getter instead of the
+  // ref directly re-filters by age at the actual moment of use.
+  const getRecentJackSpeech = useCallback((): RecentSpeech[] => {
+    const now = Date.now();
+    return recentJackSpeechRef.current.filter((e) => now - e.at < SELF_ECHO_HISTORY_MS);
+  }, []);
   const [lastCommandOutcome, setLastCommandOutcome] = useState<LocalCommandOutcome | null>(null);
   const [lastCommandTranscript, setLastCommandTranscript] = useState<string | null>(null);
   const [lastCommandKind, setLastCommandKind] = useState<"typed" | "voice" | "interruption" | null>(null);
@@ -742,7 +773,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     const entries = textFromHistory(history);
     setTranscript(entries);
     const lastJack = [...entries].reverse().find((e) => e.role === "jack");
-    setCurrentCaption(lastJack?.text ?? "");
+    setCurrentCaptionTracked(lastJack?.text ?? "");
   }, []);
 
   const wireSessionEvents = useCallback(
@@ -961,7 +992,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     setMicStatus("off");
     setConnectionStatus("disconnected");
     setTranscript([]);
-    setCurrentCaption("");
+    setCurrentCaptionTracked("");
     humourUsedRef.current = false;
     openingPendingRef.current = false;
     presentationOpeningDeliveredRef.current = false; // Phase 18: ending the presentation is a genuinely new session next time
@@ -1008,7 +1039,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     // the unknown-command fallback), so it's the only place that actually
     // knows when audio starts/finishes playing.
     async (text: string, traceId?: string) => {
-      setCurrentCaption(text);
+      setCurrentCaptionTracked(text);
       mark(traceId, "ttsRequestStart"); // T15 -- ttsFirstAudio (T16) not measurable, non-streaming
       try {
         const audio = await jackApi.speak(text, voice);
@@ -1045,7 +1076,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const speakAndWait = useCallback(
     (text: string, traceId?: string): Promise<void> =>
       new Promise((resolve) => {
-        setCurrentCaption(text);
+        setCurrentCaptionTracked(text);
         mark(traceId, "ttsRequestStart"); // T15
         jackApi
           .speak(text, voice)
@@ -1087,7 +1118,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       if (!trimmed) return;
       speechPlayer.unlock(); // must run synchronously inside this click -- see jackSpeechPlayer.ts
       cancelAutonomousPresentingRef.current(); // stop whatever Jack was doing; reading a slide takes over cleanly, no resume-after
-      setCurrentCaption(trimmed);
+      setCurrentCaptionTracked(trimmed);
       try {
         const audio = await jackApi.speak(trimmed, voice);
         dispatchEvent({ type: "AUDIO_START" });
@@ -1180,7 +1211,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     // is cancelled -- callers that immediately speak something new (pause's
     // acknowledgement, readCurrentSlide, etc.) set their own caption right
     // after this runs, so this only ever clears a caption nothing replaces.
-    setCurrentCaption("");
+    setCurrentCaptionTracked("");
     if (bargeInPhaseRef.current !== "idle") {
       setBargeInPhaseBoth("idle");
       clearBargeInArmTimers();
@@ -1316,7 +1347,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      setCurrentCaption(opening.text);
+      setCurrentCaptionTracked(opening.text);
       dispatchEvent({ type: "AUDIO_START" });
       mark(traceId, "playbackStart"); // T17 -- closest available proxy for first audible sample (no lower-level playback-started callback exists)
       activeSpeechTraceIdRef.current = traceId;
@@ -1379,7 +1410,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
             advanceToNextSlide();
             return;
           }
-          setCurrentCaption(`${opening!.text} ${continuation.text}`);
+          setCurrentCaptionTracked(`${opening!.text} ${continuation.text}`);
           activeSpeechTraceIdRef.current = traceId;
           speechPlayer.play(continuation.audio, () => {
             activeSpeechTraceIdRef.current = undefined;
@@ -1459,9 +1490,18 @@ export function JackProvider({ children }: { children: ReactNode }) {
       if (traceId) setTraceProvider(traceId, result.provider);
       const transcript = result.text.trim();
       if (traceId) setTraceLabel(traceId, transcript);
-      if (!transcript || !isAddressedToJack(transcript)) {
-        // Ambient noise / background speech that never named Jack -- ignore
-        // it entirely rather than surfacing it as a failed "Interruption".
+      // Self-echo guard (WHISPER FALSE-DESTRUCTIVE-COMMAND ROOT-CAUSE
+      // milestone): checked alongside the address gate, same fail-safe
+      // treatment as an unaddressed transcript -- see addressing.ts's
+      // isSelfEcho for why (a well-captured self-echo of Jack's own recent
+      // TTS is genuinely high-confidence/well-formed, so it would otherwise
+      // sail through both the address gate AND commandRouter.ts's
+      // deterministic patterns exactly like a real command).
+      const selfEcho = transcript ? isSelfEcho(transcript, getRecentJackSpeech()) : false;
+      if (!transcript || !isAddressedToJack(transcript) || selfEcho) {
+        // Ambient noise / background speech that never named Jack, or
+        // Jack's own voice leaking back into the mic -- ignore it entirely
+        // rather than surfacing it as a failed "Interruption".
         recordAsrDiagnostic({ provider: result.provider, transcript, latencyMs: result.latencyMs, success: true });
         finishTrace(traceId, false);
         bargeInTraceIdRef.current = undefined;
@@ -1494,7 +1534,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       setLastError(err instanceof Error ? err.message : "Transcription failed.");
       recordAsrDiagnostic({ provider: asrProvider, transcript: "", latencyMs: 0, success: false });
     }
-  }, [clearBargeInCaptureTimeout, localRecorder, dispatchEvent, setBargeInPhaseBoth, isAddressedToJack, asrProvider, recordAsrDiagnostic]);
+  }, [clearBargeInCaptureTimeout, localRecorder, dispatchEvent, setBargeInPhaseBoth, isAddressedToJack, getRecentJackSpeech, asrProvider, recordAsrDiagnostic]);
 
   // Safe-interruption fix (latency-fix milestone): detecting sound crossing
   // the barge-in threshold must NOT touch Jack's in-progress narration --

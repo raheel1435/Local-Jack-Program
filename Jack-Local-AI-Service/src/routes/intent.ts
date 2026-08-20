@@ -21,20 +21,26 @@ const VALID_ACTIONS = new Set([
   "stop_presentation",
 ]);
 
-// WHISPER SAFETY CORRECTION milestone, Part 16: presentation-state-changing
-// actions the LLM fallback must not be allowed to fire on weak evidence --
-// deliberately excludes explain_slide/summarize_slide, which are read-only
-// and can't exit/derail a presentation the way these can. This is exactly
-// Codex's reproduced incident's action (stop_presentation), reached via this
-// same fallback because the hallucinated repeated-"Jack" transcript doesn't
-// match any anchored commandRouter.ts pattern.
+// WHISPER SAFETY CORRECTION milestone, Part 16, refined by the WHISPER
+// FALSE-DESTRUCTIVE-COMMAND ROOT-CAUSE milestone's Part 15: not every
+// action has equal cost -- a false stop_presentation ends the whole session,
+// a false next_slide is a one-word "back" away from undone. next_slide/
+// previous_slide are excluded (Part 15's own LOW-IMPACT list, and genuinely
+// a one-command undo). pause_presentation/resume_presentation were
+// excluded too in an earlier pass of this milestone, then put back after an
+// independent attack review: Jack presents autonomously and unattended, so
+// an unguarded false pause -- unlike a false next_slide -- produces silent
+// dead air with nobody watching to notice and correct it, which is closer
+// to stop_presentation's failure mode than to next_slide's. This gate only
+// runs on the LLM-fallback path (ambiguous, non-deterministic matches), so
+// genuine fast "Jack, pause."/"Jack, continue." commands -- which match
+// commandRouter.ts deterministically -- are completely unaffected either
+// way; this only adds friction to ambiguous guesses.
 const HIGH_IMPACT_ACTIONS = new Set([
   "start_presentation",
-  "next_slide",
-  "previous_slide",
-  "jump_to_slide",
   "pause_presentation",
   "resume_presentation",
+  "jump_to_slide",
   "handoff_to_presenter",
   "stop_presentation",
 ]);

@@ -167,6 +167,26 @@ test("a direct, non-repeated address proposing a destructive action is allowed t
   });
 });
 
+// WHISPER FALSE-DESTRUCTIVE-COMMAND ROOT-CAUSE milestone: pause_presentation/
+// resume_presentation were briefly excluded from HIGH_IMPACT_ACTIONS, then
+// put back after an independent attack review pointed out that Jack
+// presents unattended -- an ungated false pause produces silent dead air
+// with nobody watching to notice, unlike a false next_slide.
+test("pause_presentation IS downgraded from a mention-only utterance (re-added to the high-impact set)", async () => {
+  const llm = new ScriptedLlmProvider("pause_presentation");
+  await withServer(llm, async (base) => {
+    const res = await fetch(`${base}/jack/intent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "This graph shows what Jack described." }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.type, "conversation");
+    assert.equal(body.downgradedFrom, "pause_presentation");
+  });
+});
+
 test("explain_slide (not high-impact) is never downgraded, even from a mention-only utterance", async () => {
   const llm = new ScriptedLlmProvider("explain_slide");
   await withServer(llm, async (base) => {
