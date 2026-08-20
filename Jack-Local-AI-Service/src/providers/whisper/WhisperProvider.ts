@@ -30,7 +30,7 @@ const execFileAsync = promisify(execFile);
  * fix this audit found evidence for; capture/VAD timing, thread count, and
  * the model itself all measured fine and were left untouched.
  */
-const COMMAND_VOCABULARY_PROMPT =
+export const COMMAND_VOCABULARY_PROMPT =
   "Jack, next slide. Jack, previous slide. Jack, go back. Jack, pause. Jack, continue. Jack, stop. " +
   "Jack, take over. Jack, take over again. I'll take it from here. Jack, explain this slide. " +
   "Jack, summarize this slide. Jack, go to slide three.";

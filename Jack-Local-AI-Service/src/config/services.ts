@@ -29,4 +29,8 @@ export const config = {
   vibeAsrExecutablePath: process.env.VIBE_ASR_EXECUTABLE_PATH ?? "",
   vibeAsrVaeModelPath: process.env.VIBE_ASR_VAE_MODEL_PATH ?? "",
   vibeAsrLmModelPath: process.env.VIBE_ASR_LM_MODEL_PATH ?? "",
+  // Persistent, officially-supported streaming server build (asr_stream_server.exe,
+  // "loads models once, processes audio via stdin") -- see VibeWarmServer.ts
+  // and VibeVoiceTestConfig.warmRuntime. Same build directory as asr_infer.exe.
+  vibeAsrStreamServerExecutablePath: process.env.VIBE_ASR_STREAM_SERVER_EXECUTABLE_PATH ?? "",
 };
