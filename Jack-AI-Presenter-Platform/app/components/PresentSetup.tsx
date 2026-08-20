@@ -45,6 +45,16 @@ export function PresentSetup({ onReady, title }: { onReady: () => void; title: s
     // wake-then-wait-then-ack sequencing a real spoken "Jack, start
     // presentation." already gets.
     if (jack.controlMode === "jackLeads") jack.unlockSpeech();
+    // Mic on by default the moment a presentation session starts (latency-
+    // fix milestone follow-up), in EVERY control mode -- not just once the
+    // user clicks the mic button. Purely arming ambient listening; Jack
+    // still never speaks a word on his own from this -- finishBargeInCapture
+    // discards every transcript that doesn't name him. setAmbientListening
+    // Enabled(true) also unlocks Jack's speech output (same real click),
+    // needed the moment the user addresses him in ANY mode, not just
+    // "Jack leads". This runs once per session start; the user's own
+    // subsequent mic toggle is the only thing that changes it after this.
+    jack.setAmbientListeningEnabled(true);
     onReady();
   };
 

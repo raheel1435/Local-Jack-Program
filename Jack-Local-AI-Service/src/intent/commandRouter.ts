@@ -21,22 +21,40 @@ interface ConversationRule {
   patterns: RegExp[];
 }
 
+// Every pattern below that addresses Jack by name used to require the
+// utterance to start with the bare word "jack" -- "Jack, take over" matched,
+// "Hey Jack, take over" did not. Confirmed live: that gap sent "Hey Jack,
+// take over" past the deterministic router entirely, into the LLM fallback,
+// which then inverted it to handoff_to_presenter ("Absolutely. It's yours.")
+// -- the OPPOSITE action, and Jack went silent because control had just been
+// handed to the presenter. "Hey Jack"/"Ok Jack"/"Okay Jack"/"Yo Jack" are
+// completely ordinary ways to address a voice assistant, so this greeting
+// filler is now accepted everywhere a leading "jack" address was already
+// recognized, as a plain string substitution into each pattern source
+// (regex literals can't interpolate a shared fragment directly).
+const HEY = "(?:(?:hey|ok(?:ay)?|yo)[,]?\\s+)?";
+function withHey(source: string): RegExp {
+  return new RegExp(source.replace(/JACK/g, `${HEY}jack`));
+}
+
 const ACTION_RULES: ActionRule[] = [
   {
     type: "action",
     action: "start_presentation",
     patterns: [
-      /^(jack,?\s+)?(start|begin)( the)? presentation\.?$/,
+      withHey("^(JACK,?\\s+)?(start|begin)( the)? presentation\\.?$"),
       // "Jack, take over" hands presenting duties TO Jack -- distinct from
       // "I'll take over"/"give me control" below, which hand them back.
       // "take ?over" (space optional): whisper.cpp reproducibly transcribes
       // this exact phrase as the compound word "takeover" -- observed live
       // during real-hardware voice testing, not a hypothetical.
-      /^jack,?\s+(take ?over|you (take it|present this|take ?over|handle it)|please present)( now| again)?\.?$/,
+      withHey("^JACK,?\\s+(take ?over|you (take it|present this|take ?over|handle it)|please present)( now| again)?\\.?$"),
       // "again" specifically -- confirmed live the LLM fallback inverted
       // "Jack take over again." to handoff_to_presenter (the OPPOSITE
       // meaning) when it fell through un-anchored by an explicit pattern;
       // this is the same repeat-takeover-in-one-session case as Phase 14/17.
+      // Name trails here ("...again, Jack") so the HEY filler (a greeting,
+      // always leads) doesn't apply to this one.
       /^take ?over again,?\s*jack\.?$/,
       // Realistic phrasing variants, all still addressed TO Jack (subject is
       // "you"/"Jack", never "I"/"I'll") -- confirmed live that without these,
@@ -44,16 +62,16 @@ const ACTION_RULES: ActionRule[] = [
       // misclassified it as handoff_to_presenter (the OPPOSITE of what it
       // means) by pattern-matching on "take it/take over from here" too
       // loosely against "I'll take it from here" below.
-      /^(jack,?\s+)?take ?over from (here|there)\.?$/,
+      withHey("^(JACK,?\\s+)?take ?over from (here|there)\\.?$"),
       /^you (can )?take it from (here|there)\.?$/,
-      /^jack,?\s+you present( this)?( now)?\.?$/,
-      /^jack,?\s+continue( the presentation)?\.?$/,
+      withHey("^JACK,?\\s+you present( this)?( now)?\\.?$"),
+      withHey("^JACK,?\\s+continue( the presentation)?\\.?$"),
       // "Jack, present this." (no "you"), "Take over, Jack." (name trails,
       // not leads), "You can present from here." -- confirmed live via
       // direct /jack/intent calls that the LLM fallback either inverted
       // these (returned handoff_to_presenter, the opposite meaning) or
       // classified them as non-actionable "conversation".
-      /^jack,?\s+present( this)?( now)?\.?$/,
+      withHey("^JACK,?\\s+present( this)?( now)?\\.?$"),
       /^take ?over,?\s*jack\.?$/,
       /^you (can )?present( this)? from (here|there)\.?$/,
     ],
@@ -61,29 +79,45 @@ const ACTION_RULES: ActionRule[] = [
   {
     type: "action",
     action: "next_slide",
-    patterns: [/^next( slide)?\.?$/, /^(go|move) (to the )?next( slide)?\.?$/],
+    patterns: [
+      withHey("^(JACK,?\\s+)?next( slide)?\\.?$"),
+      withHey("^(JACK,?\\s+)?(go|move) (to the )?next( slide)?\\.?$"),
+    ],
   },
   {
     type: "action",
     action: "previous_slide",
     patterns: [
-      /^(go )?back\.?$/,
-      /^previous( slide)?\.?$/,
-      /^(go|move) (to the )?previous( slide)?\.?$/,
+      withHey("^(JACK,?\\s+)?(go )?back\\.?$"),
+      withHey("^(JACK,?\\s+)?previous( slide)?\\.?$"),
+      withHey("^(JACK,?\\s+)?(go|move) (to the )?previous( slide)?\\.?$"),
     ],
   },
   {
     type: "action",
     action: "pause_presentation",
-    patterns: [/^pause\.?$/, /^pause( the)? presentation\.?$/, /^jack,?\s+wait\.?$/, /^wait\.?$/, /^hold on\.?$/],
+    patterns: [
+      withHey("^(JACK,?\\s+)?pause\\.?$"),
+      withHey("^(JACK,?\\s+)?pause( the)? presentation\\.?$"),
+      withHey("^JACK,?\\s+wait\\.?$"),
+      /^wait\.?$/,
+      /^hold on\.?$/,
+    ],
   },
   {
     type: "action",
     action: "resume_presentation",
     patterns: [
+      // Bare "continue" here is deliberately NOT given a jack-prefix
+      // variant: "Jack, continue" already matches start_presentation's own
+      // "jack continue" pattern above (checked first, in ACTION_RULES
+      // order) -- adding a duplicate here would just be unreachable dead
+      // code, not a behavior change. "Resume"/"keep going"/"carry on" have
+      // no such conflict.
       /^(continue|resume)\.?$/,
-      /^(keep going|carry on)\.?$/,
-      /^resume( the)? presentation\.?$/,
+      withHey("^(JACK,?\\s+)?resume\\.?$"),
+      withHey("^(JACK,?\\s+)?(keep going|carry on)\\.?$"),
+      withHey("^(JACK,?\\s+)?resume( the)? presentation\\.?$"),
     ],
   },
   {
@@ -95,7 +129,7 @@ const ACTION_RULES: ActionRule[] = [
       // Optional "Jack," prefix -- confirmed live the LLM fallback
       // misclassified "Jack, I'll continue." as start_presentation (backwards)
       // when it fell through un-anchored by "jack,".
-      /^(jack,?\s+)?i('| wi)ll continue\.?$/,
+      withHey("^(JACK,?\\s+)?i('| wi)ll continue\\.?$"),
       /^(give|hand)( me| back)? (the )?control( back)?\.?$/,
       // "Give it back to me." -- confirmed live the LLM fallback returned a
       // bare "conversation" with no action at all for this phrasing.
@@ -108,7 +142,7 @@ const ACTION_RULES: ActionRule[] = [
     type: "action",
     action: "stop_presentation",
     patterns: [
-      /^(jack,?\s+)?stop( presenting)?\.?$/,
+      withHey("^(JACK,?\\s+)?stop( presenting)?\\.?$"),
       /^end( the)? presentation\.?$/,
     ],
   },

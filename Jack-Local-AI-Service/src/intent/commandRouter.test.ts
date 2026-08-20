@@ -36,6 +36,33 @@ test("'Jack take over again.' resolves to start_presentation, not handoff -- con
   assert.deepEqual(matchDeterministicCommand("Take over again, Jack."), { type: "action", action: "start_presentation" });
 });
 
+// Regression coverage for the real user-reported bug (latency-fix
+// milestone follow-up): "Hey Jack, take over" fell through the
+// deterministic router entirely (only a bare leading "jack" was
+// recognized), landed in the LLM fallback, which inverted it to
+// handoff_to_presenter -- "Absolutely. It's yours.", then silence, because
+// control had just been handed BACK to the presenter instead of TO Jack.
+test("'Hey Jack, take over' resolves to start_presentation deterministically, not the LLM's inverted handoff_to_presenter", () => {
+  const phrases = [
+    "Hey Jack, take over",
+    "Hey Jack take over.",
+    "Ok Jack, take over.",
+    "Okay Jack, take over.",
+    "Yo Jack, take over.",
+  ];
+  for (const phrase of phrases) {
+    assert.deepEqual(matchDeterministicCommand(phrase), { type: "action", action: "start_presentation" }, `expected start_presentation for "${phrase}"`);
+  }
+});
+
+test("a 'hey/ok/okay/yo Jack' greeting prefix is accepted on every jack-addressed action, not just start_presentation", () => {
+  assert.deepEqual(matchDeterministicCommand("Hey Jack, next slide."), { type: "action", action: "next_slide" });
+  assert.deepEqual(matchDeterministicCommand("Hey Jack, pause."), { type: "action", action: "pause_presentation" });
+  assert.deepEqual(matchDeterministicCommand("Hey Jack, previous slide."), { type: "action", action: "previous_slide" });
+  assert.deepEqual(matchDeterministicCommand("Okay Jack, stop presenting."), { type: "action", action: "stop_presentation" });
+  assert.deepEqual(matchDeterministicCommand("Hey Jack, resume the presentation."), { type: "action", action: "resume_presentation" });
+});
+
 test("bracketed non-speech Whisper artifacts fail safe to unknown, never reach the LLM -- confirmed live via barge-in picking up real ambient noise", () => {
   const artifacts = [
     "(screams) (screams) (screams)",
