@@ -1,4 +1,4 @@
-import { COMMAND_VOCABULARY_PROMPT } from "../providers/whisper/WhisperProvider.js";
+import { COMMAND_VOCABULARY_PROMPT, WHISPER_THREADS } from "../providers/whisper/WhisperProvider.js";
 import { config } from "./services.js";
 
 /**
@@ -17,9 +17,13 @@ export const WhisperApprovedConfig = {
   status: "APPROVED_FROZEN" as const,
   executablePath: config.whisperExecutablePath,
   modelPath: config.whisperModelPath,
-  // whisper.cpp's own CLI default -- WhisperProvider.ts never passes -t,
-  // so this documents the effective value rather than driving it.
-  threads: 4,
+  // Imported from WhisperProvider.ts, not copied -- WHISPER SAFETY
+  // CORRECTION milestone, Part 10: this used to be a bare literal 4 that
+  // merely documented whisper.cpp's own CLI default (never actually passed
+  // as -t). Now explicitly pinned in buildWhisperArgs, confirmed via
+  // repeated timed runs to produce byte-identical transcripts and
+  // statistically indistinguishable latency vs. the old implicit default.
+  threads: WHISPER_THREADS,
   timeoutMs: 60_000,
   commandVocabularyPrompt: COMMAND_VOCABULARY_PROMPT,
 } as const;

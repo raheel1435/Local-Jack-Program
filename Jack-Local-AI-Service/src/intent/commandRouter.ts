@@ -1,3 +1,5 @@
+import { hasNegation } from "./addressing.js";
+
 export type IntentType = "action" | "conversation" | "unknown";
 
 export interface DeterministicMatch {
@@ -148,6 +150,24 @@ const ACTION_RULES: ActionRule[] = [
       /^end( the)? presentation\.?$/,
     ],
   },
+  {
+    // Added by the WHISPER SAFETY CORRECTION milestone (Part 15): these two
+    // used to reach the LLM fallback ONLY, and the Vibe-milestone corpus
+    // run counted "Jack, summarize this slide." transcribing perfectly but
+    // still failing as an LLM-classification miss -- that's a routing gap,
+    // not an ASR problem (see VIBEVOICE_BASELINE.md's corrected accounting).
+    // Both are read-only/informational, not presentation-state-changing --
+    // deliberately NOT in the high-impact set the LLM-fallback confidence
+    // gate in routes/intent.ts applies to.
+    type: "action",
+    action: "explain_slide",
+    patterns: [withHey("^JACK,?\\s+explain( this| the)? slide\\.?$")],
+  },
+  {
+    type: "action",
+    action: "summarize_slide",
+    patterns: [withHey("^JACK,?\\s+summar(ize|ise)( this| the)? slide\\.?$")],
+  },
 ];
 
 // Common conversational filler that must never be allowed to reach the
@@ -223,6 +243,17 @@ function isNonSpeechArtifact(normalized: string): boolean {
 export function matchDeterministicCommand(text: string): DeterministicMatch | null {
   const normalized = text.trim().toLowerCase();
   if (!normalized) return { type: "unknown" };
+
+  // WHISPER SAFETY CORRECTION milestone, Part 4: checked BEFORE any
+  // ACTION_RULES pattern, not after -- "Jack, don't stop." must never
+  // execute stop_presentation. Deterministic and fast (no LLM round trip),
+  // and deliberately fails safe to "conversation" rather than falling
+  // through to the LLM's own action grammar, which has no negation handling
+  // of its own and could just as easily invert the meaning the way it did
+  // for "take over again" (see this file's own history/comments above).
+  if (hasNegation(normalized)) {
+    return { type: "conversation" };
+  }
 
   for (const rule of ACTION_RULES) {
     if (rule.patterns.some((p) => p.test(normalized))) {

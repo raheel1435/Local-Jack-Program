@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildWhisperArgs } from "./WhisperProvider.ts";
+import { buildWhisperArgs, WHISPER_THREADS } from "./WhisperProvider.ts";
 
 // Regression coverage for the Whisper-approved-baseline audit's confirmed
 // fix: without --prompt, ggml-base.en mis-transcribed "Jack, stop." as
@@ -12,7 +12,16 @@ import { buildWhisperArgs } from "./WhisperProvider.ts";
 
 test("buildWhisperArgs always includes --prompt with the command-vocabulary bias", () => {
   const args = buildWhisperArgs("models/ggml-base.en.bin", "C:/tmp/audio.wav");
-  assert.deepEqual(args.slice(0, 6), ["-m", "models/ggml-base.en.bin", "-f", "C:/tmp/audio.wav", "-nt", "-np"]);
+  assert.deepEqual(args.slice(0, 8), [
+    "-m",
+    "models/ggml-base.en.bin",
+    "-f",
+    "C:/tmp/audio.wav",
+    "-nt",
+    "-np",
+    "-t",
+    String(WHISPER_THREADS),
+  ]);
   const promptIndex = args.indexOf("--prompt");
   assert.notEqual(promptIndex, -1, "--prompt must always be passed");
   const prompt = args[promptIndex + 1];
@@ -45,4 +54,16 @@ test("buildWhisperArgs with empty hotwords behaves the same as no hotwords at al
   const withEmpty = buildWhisperArgs("model.bin", "audio.wav", undefined, { hotwords: [] });
   const withNone = buildWhisperArgs("model.bin", "audio.wav");
   assert.deepEqual(withEmpty, withNone);
+});
+
+// WHISPER SAFETY CORRECTION milestone, Part 10: -t is now explicitly pinned
+// (confirmed via repeated timed real whisper-cli runs to be byte-identical
+// output and statistically indistinguishable latency vs. the old implicit
+// default) rather than left to whisper.cpp's own CLI default.
+test("buildWhisperArgs explicitly pins the thread count", () => {
+  assert.equal(WHISPER_THREADS, 4);
+  const args = buildWhisperArgs("model.bin", "audio.wav");
+  const tIndex = args.indexOf("-t");
+  assert.notEqual(tIndex, -1, "-t must always be passed");
+  assert.equal(args[tIndex + 1], "4");
 });

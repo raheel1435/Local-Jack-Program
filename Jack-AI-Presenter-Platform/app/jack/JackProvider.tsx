@@ -1,8 +1,10 @@
 ﻿"use client";
 
-import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { OpenAIRealtimeWebRTC, RealtimeAgent, RealtimeSession, type RealtimeItem } from "@openai/agents-realtime";
-import { useLocalRecorder, type LocalRecorderState } from "../hooks/useLocalRecorder";
+import { useLocalRecorder, type CaptureCloseReason, type LocalRecorderState } from "../hooks/useLocalRecorder";
+import { capturePolicyFor } from "./capturePolicy";
+import { isDirectlyAddressedToJack } from "./addressing";
 import { useSpeech, type UseSpeechResult } from "../hooks/useSpeech";
 import { jackApi, type AsrProviderId, type JackHealth, type JackIntentAction } from "../lib/jackApi";
 import {
@@ -49,48 +51,15 @@ import type {
 
 const JACK_LOCAL_HEALTH_POLL_MS = 8000;
 
-// Barge-in tuning: level is a 0..1 RMS-derived value from the existing mic
-// meter code. These are first-pass thresholds (see the "Real-Hardware
-// Limitation" section of the milestone report) -- algorithmic hardening
-// against OBVIOUS self-triggering (the loudest, most predictable false-
-// positive source: Jack's own TTS output starting up), not a substitute for
-// real acoustic verification with real speaker/mic hardware.
-const BARGE_IN_LEVEL = 0.12;
-// 4 ticks (~64ms at the level-loop's ~60fps) was long enough for a brief
-// transient (a click, a cough onset, a chair creak) to trip a full
-// interruption -- confirmed live as Jack's own narration getting cut off
-// mid-sentence ("I can hear only part of his sentence") from things that
-// were never a real attempt to talk to him. 10 ticks (~160ms) still catches
-// genuine speech onset quickly but requires it to actually sustain.
-const BARGE_IN_SUSTAIN_TICKS = 10;
-// 900ms of quiet was tight enough to cut off a real utterance during an
-// ordinary mid-sentence thinking pause -- confirmed live as Jack only
-// hearing a fragment ("Jack?" instead of the rest of the question). 1500ms
-// gives a real pause room without making a finished utterance feel slow to
-// send.
-const BARGE_IN_SILENCE_MS = 1500;
-const BARGE_IN_MAX_CAPTURE_MS = 8000; // hard cap so a stuck capture can't hang forever
-// Jack's TTS output has the loudest, least-adapted transient in the first
-// instant of playback (volume ramp-up, echo-cancellation filter not yet
-// converged) -- arming the mic for interruption detection immediately at
-// AUDIO_START made that transient itself the single likeliest false trigger.
-// This guard simply doesn't START WATCHING for a burst until Jack has been
-// speaking for a moment; it does not silence or gate the mic itself.
-const BARGE_IN_ARM_GUARD_MS = 350;
-// After the guard, sample the mic level for a short window while Jack is
-// already speaking to estimate a per-utterance noise floor (room noise +
-// whatever of Jack's own voice leaks through despite echoCancellation). The
-// trigger threshold is raised above this floor by a margin, so a merely
-// elevated baseline (echo cancellation working imperfectly, a noisy room)
-// needs a real spike on top of it to count as an interruption, rather than
-// arming exactly at the fixed BARGE_IN_LEVEL regardless of conditions.
-const BARGE_IN_CALIBRATION_MS = 250;
-// Raised from .06 alongside the sustain-tick increase above -- the same
-// false-triggering-on-Jack's-own-narration reports motivated both: a wider
-// margin above the calibrated floor means moderate background noise/echo
-// bleed-through needs a real spike, not just a slightly-elevated baseline,
-// to count as a genuine interruption.
-const BARGE_IN_FLOOR_MARGIN = 0.09;
+// Barge-in VAD tuning (level, sustain ticks, silence timeout, arm guard,
+// calibration window, floor margin) and capture bounding (pre-roll, active
+// cap, max submitted WAV) now live in capturePolicy.ts, split into
+// WhisperApprovedCapturePolicy (frozen) and VibeVoiceTestCapturePolicy
+// (isolated, currently identical values) -- see that file's module comment.
+// The values themselves are unchanged from the pre-existing frozen Whisper
+// baseline; only where they live moved, so a future Vibe-only tuning pass
+// structurally cannot mutate Whisper's numbers. `capturePolicy` below is
+// selected per-render from the current `asrProvider`.
 
 export interface LocalCommandOutcome {
   source: "deterministic" | "llm";
@@ -550,7 +519,13 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // its reactive mirror for the UI.
   const jackAwakeRef = useRef(false);
   const [jackAwake, setJackAwake] = useState(false);
-  const localRecorder = useLocalRecorder();
+  // Structurally isolated per provider (Part 9/24 of the WHISPER SAFETY
+  // CORRECTION milestone) -- see capturePolicy.ts. Recomputed whenever
+  // asrProvider changes; useLocalRecorder reads the latest value on every
+  // frame via its own ref, so switching providers mid-session takes effect
+  // on the next start() without needing to remount the hook.
+  const capturePolicy = useMemo(() => capturePolicyFor(asrProvider), [asrProvider]);
+  const localRecorder = useLocalRecorder(capturePolicy);
   const offlineSpeech: UseSpeechResult = useSpeech();
   // Destructured (not accessed as offlineSpeech.foo inline) so useCallback
   // deps below can name exactly what they use, per this codebase's stricter
@@ -621,15 +596,16 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const bargeInArmGuardTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const bargeInCalibrationIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const bargeInCalibrationSamplesRef = useRef<number[]>([]);
-  // Effective trigger threshold for the CURRENT utterance -- BARGE_IN_LEVEL
-  // floor, raised if the calibrated ambient level is already elevated.
-  const bargeInEffectiveThresholdRef = useRef(BARGE_IN_LEVEL);
+  // Effective trigger threshold for the CURRENT utterance -- capturePolicy's
+  // bargeInLevel floor, raised if the calibrated ambient level is already
+  // elevated.
+  const bargeInEffectiveThresholdRef = useRef(capturePolicy.bargeInLevel);
   // Reactive mirrors of the calibrated floor/threshold, for the dev status
   // indicator only (Phase 2 of the real-hardware milestone) -- lets a real
   // tester see exactly what the mic measured and what it was compared
   // against, not just the pass/fail outcome.
   const [bargeInNoiseFloor, setBargeInNoiseFloor] = useState(0);
-  const [bargeInThreshold, setBargeInThreshold] = useState(BARGE_IN_LEVEL);
+  const [bargeInThreshold, setBargeInThreshold] = useState(capturePolicy.bargeInLevel);
   // Kept in sync with localRecorder.level so the interval-based silence
   // poll below can read the CURRENT level without depending on a React
   // effect re-running -- level settling at an exactly-constant value (e.g.
@@ -1210,7 +1186,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       clearBargeInArmTimers();
       clearBargeInCaptureTimeout();
       console.log("[mic] stop() called from: cancelAutonomousPresenting");
-      void localRecorder.stop(); // discard whatever was captured -- cancellation, not a command
+      void localRecorder.stop("cancel"); // discard whatever was captured -- cancellation, not a command
     }
   }, [stopJackAudio, clearBargeInArmTimers, clearBargeInCaptureTimeout, localRecorder, setBargeInPhaseBoth]);
 
@@ -1434,10 +1410,16 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // Ambient barge-in picks up EVERY sustained sound over threshold -- room
   // noise, someone else talking, a cough -- not just remarks actually meant
   // for Jack. Unlike push-to-talk (an explicit button press, always meant
-  // for Jack) or typed text, a barge-in transcript must actually name Jack
-  // before it's treated as a command/question; otherwise it's silently
-  // discarded here, before ever reaching runLocalCommand or the UI.
-  const isAddressedToJack = useCallback((transcript: string) => /\bjack\b/i.test(transcript), []);
+  // for Jack) or typed text, a barge-in transcript must actually ADDRESS
+  // Jack (not just mention him) before it's treated as a command/question;
+  // otherwise it's silently discarded here, before ever reaching
+  // runLocalCommand or the UI. WHISPER SAFETY CORRECTION milestone: this was
+  // a bare `/\bjack\b/i` test -- an independent Codex review found that let
+  // an incidental MENTION of "Jack" (not an address) through exactly like a
+  // real command; see addressing.ts's module comment for the live false-stop
+  // it reproduced. classifyJackAddress distinguishes "Jack, stop." (direct)
+  // from "the slide explains why Jack stopped" (mention) structurally.
+  const isAddressedToJack = useCallback((transcript: string) => isDirectlyAddressedToJack(transcript), []);
 
   // --- Barge-in: capture finished (silence/timeout) -> transcribe -> route ---
   //
@@ -1455,12 +1437,12 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // not "idle") for this whole function's duration, on every exit path --
   // one capture is always fully resolved before the next one can start,
   // regardless of which ASR engine is selected.
-  const finishBargeInCapture = useCallback(async () => {
+  const finishBargeInCapture = useCallback(async (closeReason: CaptureCloseReason) => {
     const traceId = bargeInTraceIdRef.current;
     setBargeInPhaseBoth("processing");
     clearBargeInCaptureTimeout();
-    console.log("[mic] stop() called from: finishBargeInCapture");
-    const audio = await localRecorder.stop();
+    console.log("[mic] stop() called from: finishBargeInCapture", { closeReason });
+    const audio = await localRecorder.stop(closeReason);
     mark(traceId, "captureFinalized"); // T3
     if (!audio) {
       abortTrace(traceId);
@@ -1530,6 +1512,12 @@ export function JackProvider({ children }: { children: ReactNode }) {
     dispatchEvent({ type: "USER_SPEECH_DETECTED" }); // speaking -> listening (existing transition) -- UI only, does not touch audio/narration
     clearBargeInArmTimers();
     clearBargeInCaptureTimeout();
+    // Freezes the bounded pre-roll ring buffer NOW, at the real VAD trigger
+    // instant -- not at localRecorder.start() (arm time), which is what let
+    // pre-trigger idle-listening audio accumulate unboundedly into the
+    // final WAV before this fix (see capturePolicy.ts's module comment /
+    // WHISPER SAFETY CORRECTION milestone, Part 6).
+    localRecorder.markCaptureTriggered();
     const traceId = startTrace("voice_command");
     bargeInTraceIdRef.current = traceId;
     mark(traceId, "speechStart"); // T0 -- VAD crossing the barge-in threshold is the earliest signal available
@@ -1542,14 +1530,14 @@ export function JackProvider({ children }: { children: ReactNode }) {
     bargeInCaptureTimeoutRef.current = setInterval(() => {
       const now = Date.now();
       const level = localMicLevelRef.current;
-      if (level < BARGE_IN_LEVEL) {
+      if (level < capturePolicy.bargeInLevel) {
         if (bargeInSilenceStartRef.current === null) bargeInSilenceStartRef.current = now;
       } else {
         bargeInSilenceStartRef.current = null;
       }
       const sustainedSilence =
-        bargeInSilenceStartRef.current !== null && now - bargeInSilenceStartRef.current > BARGE_IN_SILENCE_MS;
-      const hardCap = now - captureStarted > BARGE_IN_MAX_CAPTURE_MS;
+        bargeInSilenceStartRef.current !== null && now - bargeInSilenceStartRef.current > capturePolicy.silenceMs;
+      const hardCap = now - captureStarted > capturePolicy.activeCaptureMaxMs;
       if ((sustainedSilence || hardCap) && !finished) {
         finished = true;
         // T1: the moment silence actually started (sustainedSilence case),
@@ -1559,10 +1547,10 @@ export function JackProvider({ children }: { children: ReactNode }) {
         mark(bargeInTraceIdRef.current, "speechEnd", sustainedSilence ? (bargeInSilenceStartRef.current ?? now) : now);
         mark(bargeInTraceIdRef.current, "vadEndOfTurn"); // T2
         clearBargeInCaptureTimeout();
-        void finishBargeInCapture();
+        void finishBargeInCapture(sustainedSilence ? "silence" : "hard_cap");
       }
     }, 150);
-  }, [dispatchEvent, clearBargeInArmTimers, clearBargeInCaptureTimeout, finishBargeInCapture]);
+  }, [dispatchEvent, clearBargeInArmTimers, clearBargeInCaptureTimeout, finishBargeInCapture, localRecorder, capturePolicy]);
 
   // Arm/disarm ambient listening. Two independent reasons to be armed:
   // (1) automatic -- Jack holds the floor (presenterControl === "jack") and
@@ -1623,14 +1611,14 @@ export function JackProvider({ children }: { children: ReactNode }) {
           clearBargeInArmTimers();
           const samples = bargeInCalibrationSamplesRef.current;
           const floor = samples.length > 0 ? samples.reduce((a, b) => a + b, 0) / samples.length : 0;
-          const threshold = Math.max(BARGE_IN_LEVEL, floor + BARGE_IN_FLOOR_MARGIN);
+          const threshold = Math.max(capturePolicy.bargeInLevel, floor + capturePolicy.floorMargin);
           bargeInEffectiveThresholdRef.current = threshold;
           setBargeInNoiseFloor(floor);
           setBargeInThreshold(threshold);
           bargeInLoudTicksRef.current = 0;
           setBargeInPhaseBoth("armed");
-        }, BARGE_IN_CALIBRATION_MS);
-      }, BARGE_IN_ARM_GUARD_MS);
+        }, capturePolicy.calibrationMs);
+      }, capturePolicy.armGuardMs);
     } else if (
       !shouldArm &&
       bargeInPhaseRef.current !== "idle" &&
@@ -1645,14 +1633,14 @@ export function JackProvider({ children }: { children: ReactNode }) {
       setBargeInPhaseBoth("idle");
       clearBargeInArmTimers();
       console.log("[mic] stop() called from: disarm effect", { attentionState, presenterControl });
-      void localRecorder.stop();
+      void localRecorder.stop("route_change");
     }
     // "capturing" and "processing" are left alone here; handleBargeInDetected/finishBargeInCapture own those transitions.
-  }, [attentionState, presenterControl, ambientListeningEnabled, localRecorder, clearBargeInArmTimers, setBargeInPhaseBoth]);
+  }, [attentionState, presenterControl, ambientListeningEnabled, localRecorder, clearBargeInArmTimers, setBargeInPhaseBoth, capturePolicy]);
 
   // Watches mic level while armed for a sustained loud burst -> real
   // interruption, against this utterance's calibrated effective threshold
-  // (see the arm/disarm effect above), not the bare BARGE_IN_LEVEL constant.
+  // (see the arm/disarm effect above), not the bare capturePolicy.bargeInLevel default.
   // (Silence detection during "capturing" is handled by the interval started
   // in handleBargeInDetected, not here -- see its comment.) First-pass
   // level-threshold VAD, not perfect acoustic echo cancellation -- see the
@@ -1661,14 +1649,14 @@ export function JackProvider({ children }: { children: ReactNode }) {
     if (bargeInPhaseRef.current !== "armed") return;
     if (localRecorder.level > bargeInEffectiveThresholdRef.current) {
       bargeInLoudTicksRef.current += 1;
-      if (bargeInLoudTicksRef.current >= BARGE_IN_SUSTAIN_TICKS) {
+      if (bargeInLoudTicksRef.current >= capturePolicy.sustainTicks) {
         bargeInLoudTicksRef.current = 0;
         handleBargeInDetected();
       }
     } else {
       bargeInLoudTicksRef.current = 0;
     }
-  }, [localRecorder.level, handleBargeInDetected]);
+  }, [localRecorder.level, handleBargeInDetected, capturePolicy]);
 
   const runLocalCommand = useCallback(
     async (

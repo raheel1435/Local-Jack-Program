@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { CaptureBoundaryPolicy } from "../jack/capturePolicy";
 
 /**
  * Push-to-talk capture producing a WAV blob for Jack-Local-AI-Service's
@@ -26,6 +27,12 @@ export type LocalRecorderState =
   | "listening"
   | "processing"
   | "error";
+
+/** Why a capture ended -- Part 7 of the WHISPER SAFETY CORRECTION milestone:
+ * every completed capture should say why it stopped, not just how long it
+ * was, so a false-trigger or runaway-capture pattern is diagnosable from the
+ * console alone. */
+export type CaptureCloseReason = "silence" | "hard_cap" | "cancel" | "route_change" | "session_end";
 
 /** Dev-only diagnostics for the most recently completed recording. Never
  * includes the actual audio samples -- see Phase 10/11 of the AudioWorklet
@@ -53,6 +60,12 @@ export interface RecorderMetrics {
   analyserPeak: number;
   analyserAvgRms: number;
   wavBytes: number;
+  /** How much of the final WAV is bounded pre-trigger ring-buffer audio vs. active post-trigger capture -- 0/0 for a capture that never called markCaptureTriggered() (e.g. push-to-talk). */
+  preRollMs: number;
+  activeCaptureMs: number;
+  /** Always equal to durationMs -- kept as its own explicit field so the capture contract (preRollMs + activeCaptureMs <= policy.maxSubmittedWavMs) is checkable directly off metrics without recomputing it. */
+  submittedWavMs: number;
+  closeReason: CaptureCloseReason | null;
 }
 
 export interface UseLocalRecorderResult {
@@ -62,8 +75,14 @@ export interface UseLocalRecorderResult {
   /** Diagnostics for the most recently completed (stop()-resolved) recording. */
   metrics: RecorderMetrics | null;
   start(): Promise<void>;
+  /** Call the instant a real VAD trigger fires (not at arm/listen time).
+   * Freezes the bounded pre-roll ring buffer accumulated so far and switches
+   * the recorder into capped active-capture accounting for everything after.
+   * Never calling this (push-to-talk's explicit start/stop) leaves capture
+   * unbounded, matching the pre-existing push-to-talk contract. */
+  markCaptureTriggered(): void;
   /** Stops capture and resolves with a WAV blob, or null if nothing was captured. */
-  stop(): Promise<Blob | null>;
+  stop(reason: CaptureCloseReason): Promise<Blob | null>;
 }
 
 interface WebkitAudioContextWindow {
@@ -81,13 +100,6 @@ const WORKLET_NODE_NAME = "pcm-recorder-processor";
 // something is unusually slow; proceed rather than hang the mic button
 // forever, but this should be rare in practice.
 const FIRST_FRAME_TIMEOUT_MS = 2000;
-
-// Silent-PCM safety (Phase 13): int16 quantization/analog noise floor is
-// never exactly zero, but real speech peaks far above this -- a captured
-// peak below it means the microphone signal was effectively lost somewhere
-// in the pipeline (device, permission-granted-but-muted, wrong device),
-// not that the user spoke quietly.
-const SILENT_PEAK_THRESHOLD = 0.005;
 
 function mark(label: string, extra?: Record<string, unknown>) {
   // Always-on, not gated behind a flag: this is a local-only dev/diagnostic
@@ -138,6 +150,32 @@ function encodeWav(samples: Float32Array, sampleRate: number): Blob {
   return new Blob([buffer], { type: "audio/wav" });
 }
 
+function totalSampleCount(chunks: Float32Array[]): number {
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  return total;
+}
+
+/** Keeps only the newest `maxSamples` worth of audio, dropping/truncating
+ * whole or partial chunks from the front (oldest). This is the capture-
+ * bounding fix's core primitive: used both to continuously ring-buffer the
+ * pre-trigger window (called on every frame while un-triggered) and to
+ * freeze a bounded pre-roll snapshot the instant a real capture triggers. */
+function trimToMaxSamples(chunks: Float32Array[], maxSamples: number): Float32Array[] {
+  let total = totalSampleCount(chunks);
+  if (total <= maxSamples) return chunks;
+  const out = chunks.slice();
+  while (out.length > 0 && total - out[0].length >= maxSamples) {
+    total -= out[0].length;
+    out.shift();
+  }
+  if (out.length > 0 && total > maxSamples) {
+    const excess = total - maxSamples;
+    out[0] = out[0].subarray(excess);
+  }
+  return out;
+}
+
 function concatFloat32(chunks: Float32Array[]): Float32Array {
   const total = chunks.reduce((sum, c) => sum + c.length, 0);
   const out = new Float32Array(total);
@@ -166,7 +204,7 @@ function maskDeviceId(id: string | undefined): string {
   return id.length <= 8 ? "***" : `${id.slice(0, 8)}…`;
 }
 
-export function useLocalRecorder(): UseLocalRecorderResult {
+export function useLocalRecorder(capturePolicy: CaptureBoundaryPolicy): UseLocalRecorderResult {
   const [state, setState] = useState<LocalRecorderState>("idle");
   const [level, setLevel] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -181,6 +219,18 @@ export function useLocalRecorder(): UseLocalRecorderResult {
   const rafRef = useRef<number | null>(null);
   const chunksRef = useRef<Float32Array[]>([]);
   const frameMessageCountRef = useRef(0);
+  // Capture-bounding state (Part 6): while un-triggered, chunksRef is a
+  // continuously-trimmed ring buffer holding only the last
+  // capturePolicy.preRollMs of audio. markCaptureTriggered() freezes that
+  // snapshot and flips this to true; from then on new frames are appended
+  // and capped at preRollMs+activeCaptureMaxMs total, never trimmed from
+  // the front again. capturePolicyRef exists so the onmessage closure
+  // (created once per start()) always reads the CURRENT policy even if the
+  // caller's asrProvider selection changes between renders.
+  const triggeredRef = useRef(false);
+  const preRollSamplesAtTriggerRef = useRef(0);
+  const capturePolicyRef = useRef(capturePolicy);
+  capturePolicyRef.current = capturePolicy;
   // Analyser-stage peak/RMS across the whole session, for direct comparison
   // against the worklet/PCM-stage peak/RMS at stop() -- Phase 16 of the
   // activation milestone: isolate whether a zero-signal capture is lost
@@ -283,6 +333,8 @@ export function useLocalRecorder(): UseLocalRecorderResult {
     setState("requesting");
     setError(null);
     chunksRef.current = [];
+    triggeredRef.current = false;
+    preRollSamplesAtTriggerRef.current = 0;
     try {
       // Best-effort suppression of Jack's own speaker output being picked
       // back up as "user speech" during barge-in monitoring. Not validated
@@ -379,7 +431,7 @@ export function useLocalRecorder(): UseLocalRecorderResult {
         resolveFirstFrame = resolve;
       });
       workletNode.port.onmessage = (event: MessageEvent<Float32Array>) => {
-        chunksRef.current.push(event.data);
+        const frame = event.data;
         frameMessageCountRef.current += 1;
         if (!firstFrameSeen) {
           firstFrameSeen = true;
@@ -388,6 +440,36 @@ export function useLocalRecorder(): UseLocalRecorderResult {
             captureStartLatencyMs: Math.round(firstFrameAtRef.current - clickedAtRef.current),
           });
           resolveFirstFrame?.();
+        }
+        const sampleRate = audioContextRef.current?.sampleRate ?? 48000;
+        if (!triggeredRef.current) {
+          // Pre-trigger: continuous bounded ring buffer. This is the actual
+          // capture-bounding fix -- previously every frame accumulated here
+          // unconditionally from start() (arm time) all the way to stop(),
+          // so an utterance that armed long before a real VAD trigger fired
+          // could submit an arbitrarily long WAV despite the documented
+          // 8-second cap only ever bounding the POST-trigger timer.
+          chunksRef.current.push(frame);
+          const maxPreRollSamples = Math.round((capturePolicyRef.current.preRollMs / 1000) * sampleRate);
+          chunksRef.current = trimToMaxSamples(chunksRef.current, maxPreRollSamples);
+        } else {
+          // Post-trigger: append and cap the TOTAL (pre-roll + active) at
+          // preRollMs+activeCaptureMaxMs worth of samples -- enforced here,
+          // inside the recorder itself, not only by the caller's wall-clock
+          // setInterval timer (which calls stop() around the same time in
+          // the normal case, but this is the structural guarantee Part 6
+          // asks for: the SUBMITTED WAV itself is bounded, not just "usually
+          // bounded because a timer fires on schedule").
+          const maxTotalSamples = Math.round(
+            ((capturePolicyRef.current.preRollMs + capturePolicyRef.current.activeCaptureMaxMs) / 1000) * sampleRate,
+          );
+          const currentTotal = totalSampleCount(chunksRef.current);
+          if (currentTotal < maxTotalSamples) {
+            const room = maxTotalSamples - currentTotal;
+            chunksRef.current.push(room >= frame.length ? frame : frame.subarray(0, room));
+          }
+          // else: already at the hard ceiling -- drop further frames rather
+          // than grow past the documented maximum submitted WAV duration.
         }
       };
       source.connect(workletNode);
@@ -425,12 +507,28 @@ export function useLocalRecorder(): UseLocalRecorderResult {
     }
   }, [runLevelLoop, teardown]);
 
-  const stop = useCallback(async (): Promise<Blob | null> => {
-    mark("recording stopped");
+  const markCaptureTriggered = useCallback(() => {
+    triggeredRef.current = true;
+    const sampleRate = audioContextRef.current?.sampleRate ?? 48000;
+    const maxPreRollSamples = Math.round((capturePolicyRef.current.preRollMs / 1000) * sampleRate);
+    chunksRef.current = trimToMaxSamples(chunksRef.current, maxPreRollSamples);
+    preRollSamplesAtTriggerRef.current = totalSampleCount(chunksRef.current);
+    mark("capture triggered -- pre-roll frozen", {
+      preRollMs: capturePolicyRef.current.preRollMs,
+      preRollSamples: preRollSamplesAtTriggerRef.current,
+    });
+  }, []);
+
+  const stop = useCallback(async (reason: CaptureCloseReason): Promise<Blob | null> => {
+    mark("recording stopped", { reason });
     setState("processing");
     const sampleRate = audioContextRef.current?.sampleRate ?? 48000;
     const chunks = chunksRef.current;
     chunksRef.current = [];
+    const wasTriggered = triggeredRef.current;
+    const preRollSamplesAtTrigger = preRollSamplesAtTriggerRef.current;
+    triggeredRef.current = false;
+    preRollSamplesAtTriggerRef.current = 0;
     const frameMessageCount = frameMessageCountRef.current;
     const stoppedAt = performance.now();
     const analyserPeak = Number(analyserPeakRef.current.toFixed(4));
@@ -456,8 +554,12 @@ export function useLocalRecorder(): UseLocalRecorderResult {
         analyserPeak,
         analyserAvgRms,
         wavBytes: 0,
+        preRollMs: 0,
+        activeCaptureMs: 0,
+        submittedWavMs: 0,
+        closeReason: reason,
       });
-      mark("stop() resolved with no captured audio", { analyserPeak, analyserAvgRms });
+      mark("stop() resolved with no captured audio", { analyserPeak, analyserAvgRms, reason });
       return null;
     }
     const samples = concatFloat32(chunks);
@@ -465,6 +567,13 @@ export function useLocalRecorder(): UseLocalRecorderResult {
     const { peak, rms } = computePeakAndRms(samples);
     const durationMs = Math.round((samples.length / sampleRate) * 1000);
     const wav = encodeWav(samples, sampleRate);
+    // wasTriggered false (push-to-talk/explicit capture that never called
+    // markCaptureTriggered) => the whole thing is reported as "active", not
+    // "pre-roll" -- there was no ring-buffer/freeze step for it at all.
+    const preRollMs = wasTriggered
+      ? Math.round((Math.min(preRollSamplesAtTrigger, samples.length) / sampleRate) * 1000)
+      : 0;
+    const activeCaptureMs = Math.max(0, durationMs - preRollMs);
 
     const recorderMetrics: RecorderMetrics = {
       sampleRate,
@@ -482,6 +591,10 @@ export function useLocalRecorder(): UseLocalRecorderResult {
       analyserAvgRms,
       rmsAmplitude: Number(rms.toFixed(4)),
       wavBytes: wav.size,
+      preRollMs,
+      activeCaptureMs,
+      submittedWavMs: durationMs,
+      closeReason: reason,
     };
     setMetrics(recorderMetrics);
     mark("WAV encoded, ready to send", recorderMetrics as unknown as Record<string, unknown>);
@@ -489,8 +602,18 @@ export function useLocalRecorder(): UseLocalRecorderResult {
     // hundred ms) is the concrete real-hardware failure signature this
     // migration exists to fix -- flag it loudly rather than silently
     // shipping a doomed transcription request.
-    if (durationMs < 700) {
+    if (durationMs < capturePolicyRef.current.shortCaptureWarningMs) {
       mark("WARNING: captured audio is very short -- possible clipped/failed capture", { durationMs });
+    }
+    if (durationMs > capturePolicyRef.current.maxSubmittedWavMs) {
+      // Should be structurally unreachable given the per-frame caps above --
+      // logged loudly rather than silently trusted, since this is exactly
+      // the contract Part 6/7 of the WHISPER SAFETY CORRECTION milestone
+      // exist to guarantee.
+      mark("WARNING: submitted WAV exceeded the declared capture contract", {
+        durationMs,
+        maxSubmittedWavMs: capturePolicyRef.current.maxSubmittedWavMs,
+      });
     }
     // Silent-PCM safety (Phase 13): a real quantization/analog noise floor
     // is never exactly zero, but effectively-silent capture (wrong/muted
@@ -498,7 +621,7 @@ export function useLocalRecorder(): UseLocalRecorderResult {
     // below any real speech peak. Sending that to Whisper is exactly how a
     // "you." hallucination happens on genuinely empty input -- refuse
     // instead of guessing.
-    if (peak < SILENT_PEAK_THRESHOLD) {
+    if (peak < capturePolicyRef.current.silentPeakThreshold) {
       mark("WARNING: captured audio is effectively silent -- refusing to send to Whisper", { peak, rms });
       setError("No microphone audio was detected. Check your microphone input.");
       return null;
@@ -508,5 +631,5 @@ export function useLocalRecorder(): UseLocalRecorderResult {
 
   useEffect(() => teardown, [teardown]);
 
-  return { state, level, error, metrics, start, stop };
+  return { state, level, error, metrics, start, markCaptureTriggered, stop };
 }

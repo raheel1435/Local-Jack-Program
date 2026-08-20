@@ -80,3 +80,105 @@ test("a genuinely ambiguous phrase (no deterministic match) DOES fall through to
     assert.equal(llm.chatCallCount, 1);
   });
 });
+
+// WHISPER SAFETY CORRECTION milestone, Part 16/17/27: the LLM-fallback
+// destructive-action confidence gate. A ScriptedLlmProvider always returns
+// the same action regardless of input, isolating the assertion to the
+// gate's own logic (classifyAddress + hasSuspiciousRepetition), not to
+// whether a real model would have proposed that action in the first place.
+class ScriptedLlmProvider implements LlmProvider {
+  constructor(private readonly action: string) {}
+
+  async checkHealth(): Promise<ProviderStatus> {
+    return "available";
+  }
+
+  async chat(_req: JackChatRequest): Promise<JackChatResponse> {
+    return {
+      content: JSON.stringify({ type: "action", action: this.action }),
+      model: "fake",
+      latencyMs: 1,
+      raw: null,
+    };
+  }
+}
+
+test("Codex's reproduced incident: a hallucinated repeated-'Jack' transcript proposing stop_presentation is downgraded to conversation", async () => {
+  const llm = new ScriptedLlmProvider("stop_presentation");
+  await withServer(llm, async (base) => {
+    const res = await fetch(`${base}/jack/intent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "Jack, stop. Jack, stop. Jack, stop." }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.source, "llm");
+    assert.equal(body.type, "conversation", "must NOT execute the destructive action from a suspicious repeated-address transcript");
+    assert.equal(body.action, undefined);
+    assert.equal(body.downgradedFrom, "stop_presentation");
+  });
+});
+
+test("a genuine urgent repeated command word (name said once) is NOT penalized by the repetition guard", async () => {
+  const llm = new ScriptedLlmProvider("stop_presentation");
+  await withServer(llm, async (base) => {
+    const res = await fetch(`${base}/jack/intent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "Jack, stop, stop, stop!" }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.type, "action");
+    assert.equal(body.action, "stop_presentation");
+    assert.equal(body.downgradedFrom, undefined);
+  });
+});
+
+test("an incidental mention of Jack proposing a destructive action is downgraded to conversation", async () => {
+  const llm = new ScriptedLlmProvider("stop_presentation");
+  await withServer(llm, async (base) => {
+    const res = await fetch(`${base}/jack/intent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "The next slide explains why Jack stopped." }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.type, "conversation");
+    assert.equal(body.action, undefined);
+    assert.equal(body.downgradedFrom, "stop_presentation");
+  });
+});
+
+test("a direct, non-repeated address proposing a destructive action is allowed through", async () => {
+  const llm = new ScriptedLlmProvider("pause_presentation");
+  await withServer(llm, async (base) => {
+    const res = await fetch(`${base}/jack/intent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "Jack, could you pause for a second?" }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.type, "action");
+    assert.equal(body.action, "pause_presentation");
+  });
+});
+
+test("explain_slide (not high-impact) is never downgraded, even from a mention-only utterance", async () => {
+  const llm = new ScriptedLlmProvider("explain_slide");
+  await withServer(llm, async (base) => {
+    const res = await fetch(`${base}/jack/intent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "This graph shows what Jack described." }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.type, "action");
+    assert.equal(body.action, "explain_slide");
+    assert.equal(body.downgradedFrom, undefined);
+  });
+});

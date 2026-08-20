@@ -35,6 +35,16 @@ export const COMMAND_VOCABULARY_PROMPT =
   "Jack, take over. Jack, take over again. I'll take it from here. Jack, explain this slide. " +
   "Jack, summarize this slide. Jack, go to slide three.";
 
+// WHISPER SAFETY CORRECTION milestone, Part 10: whisper.cpp's own CLI
+// default happened to already be 4 (confirmed via repeated timed runs, byte-
+// identical transcript and statistically indistinguishable latency with vs.
+// without this flag -- see VIBEVOICE_BASELINE-adjacent measurement notes in
+// this milestone's report). Explicitly pinning it turns "documents the
+// effective value" (whisperApprovedConfig.ts's old caveat) into something
+// actually true and reproducible if a future whisper.cpp upgrade ever
+// changes its own default.
+export const WHISPER_THREADS = 4;
+
 /** Pure arg-builder, pulled out of transcribe() so the --prompt fix (and the
  * hotwords-append behavior) is directly unit-testable without shelling out
  * to a real whisper-cli binary. */
@@ -48,7 +58,7 @@ export function buildWhisperArgs(
     ? `${COMMAND_VOCABULARY_PROMPT} ${opts.hotwords.join(", ")}.`
     : COMMAND_VOCABULARY_PROMPT;
 
-  const args = ["-m", modelPath, "-f", audioFilePath, "-nt", "-np", "--prompt", prompt];
+  const args = ["-m", modelPath, "-f", audioFilePath, "-nt", "-np", "-t", String(WHISPER_THREADS), "--prompt", prompt];
   if (language) {
     args.push("-l", language);
   }

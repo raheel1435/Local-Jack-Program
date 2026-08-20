@@ -114,3 +114,48 @@ test("legitimate one-word commands are unaffected by the fragment/artifact safet
   assert.deepEqual(matchDeterministicCommand("Continue."), { type: "action", action: "resume_presentation" });
   assert.deepEqual(matchDeterministicCommand("Back."), { type: "action", action: "previous_slide" });
 });
+
+// WHISPER SAFETY CORRECTION milestone, Part 4: none of these may execute the
+// positive command -- checked BEFORE ACTION_RULES, deterministically, so
+// they never even reach the LLM (which has no negation handling of its
+// own and could invert the meaning, the same class of bug this file's
+// history already documents for un-negated phrasings).
+test("negated commands never execute the positive action -- deterministic, fails safe to conversation", () => {
+  const phrases = [
+    "Jack, don't stop.",
+    "Jack, do not stop.",
+    "Jack, don't pause.",
+    "Jack, do not continue.",
+    "Jack, don't go to the next slide.",
+    "Jack, I don't want you to take over.",
+    "Jack, please don't hand it back to me.",
+  ];
+  for (const phrase of phrases) {
+    assert.deepEqual(matchDeterministicCommand(phrase), { type: "conversation" }, `expected conversation (not an action) for "${phrase}"`);
+  }
+});
+
+// Part 15: "Jack, summarize this slide." previously reached the LLM
+// fallback only, where the Vibe-milestone corpus run recorded it as a
+// classification miss on a perfect transcript -- a routing gap, not an ASR
+// failure. Both explain/summarize are now deterministic, matching
+// explain_slide's existing (correct) deterministic status implicitly
+// expected by that corpus.
+test("'Jack, explain this slide.' and 'Jack, summarize this slide.' resolve deterministically", () => {
+  assert.deepEqual(matchDeterministicCommand("Jack, explain this slide."), { type: "action", action: "explain_slide" });
+  assert.deepEqual(matchDeterministicCommand("Jack, explain the slide."), { type: "action", action: "explain_slide" });
+  assert.deepEqual(matchDeterministicCommand("Hey Jack, summarize this slide."), { type: "action", action: "summarize_slide" });
+  assert.deepEqual(matchDeterministicCommand("Jack, summarise this slide."), { type: "action", action: "summarize_slide" });
+});
+
+// Part 3/14 adversarial corpus: Jackson/Jackie are a different word
+// entirely (word-boundary regex), and plain "next slide"/"pause" with no
+// Jack at all are the pre-existing, intentional one-word-command UX -- both
+// must keep resolving exactly as before, not be broken by this milestone's
+// negation/addressing work.
+test("adversarial corpus: no false destructive action from name-confusables or bare non-addressed commands", () => {
+  assert.deepEqual(matchDeterministicCommand("Jackson, next slide."), null);
+  assert.deepEqual(matchDeterministicCommand("Jackie, pause."), null);
+  assert.deepEqual(matchDeterministicCommand("next slide"), { type: "action", action: "next_slide" });
+  assert.deepEqual(matchDeterministicCommand("pause"), { type: "action", action: "pause_presentation" });
+});
