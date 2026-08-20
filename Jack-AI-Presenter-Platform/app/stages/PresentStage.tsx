@@ -326,7 +326,7 @@ function PresentSession({
   // whether the user has the persistent toggle on.
   const micToggledOn = jack.ambientListeningEnabled;
   const presentMicLabel: "off" | "preparing" | "listening" | "processing" =
-    jack.bargeInPhase === "capturing"
+    jack.bargeInPhase === "capturing" || jack.bargeInPhase === "processing"
       ? "processing"
       : jack.bargeInPhase === "armed"
         ? "listening"

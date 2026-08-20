@@ -408,7 +408,7 @@ export interface JackContextValue {
   lastCommandKind: "typed" | "voice" | "interruption" | null;
 
   /** Barge-in ambient-listening phase -- for a subtle dev/status indicator only (Phase 13), not part of the main presentation UI. */
-  bargeInPhase: "idle" | "guarding" | "calibrating" | "armed" | "capturing";
+  bargeInPhase: "idle" | "guarding" | "calibrating" | "armed" | "capturing" | "processing";
   /** Calibrated ambient level and effective trigger threshold for the current/last utterance -- dev diagnostics only. */
   bargeInNoiseFloor: number;
   bargeInThreshold: number;
@@ -591,7 +591,9 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // "calibrating": sampling ambient level to set an effective threshold for
   // this utterance. "armed": watching for a sustained burst above that
   // threshold. "capturing": interruption detected, recording the utterance.
-  type BargeInPhase = "idle" | "guarding" | "calibrating" | "armed" | "capturing";
+  // "processing": recording stopped, transcribing + (if addressed) routing
+  // the command -- see finishBargeInCapture's comment for why this exists.
+  type BargeInPhase = "idle" | "guarding" | "calibrating" | "armed" | "capturing" | "processing";
   const bargeInPhaseRef = useRef<BargeInPhase>("idle");
   // Reactive mirror of bargeInPhaseRef, for the dev status indicator only --
   // all logic reads/writes the ref (see the capture-silence-poll comment for
@@ -1438,9 +1440,24 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const isAddressedToJack = useCallback((transcript: string) => /\bjack\b/i.test(transcript), []);
 
   // --- Barge-in: capture finished (silence/timeout) -> transcribe -> route ---
+  //
+  // Real bug fixed here: this used to set the phase straight to "idle"
+  // BEFORE transcribing, which let the arm/disarm effect below re-arm the
+  // mic (bargeInPhaseRef.current === "idle" is its re-arm condition) and
+  // start a SECOND overlapping capture while the first one's transcription
+  // was still in flight. With Whisper (~1s) that race window was narrow
+  // enough to rarely matter; with VibeVoice (~10s on this machine) it was
+  // wide open, and two (or more) concurrent transcribe->intent->action
+  // cycles genuinely interleaving explains exactly what was reported live:
+  // commands executing incorrectly and Jack's speech cutting off mid-
+  // sentence from a second, unrelated cancelAutonomousPresenting() firing
+  // moments after the first. The mic now stays disarmed (phase "processing",
+  // not "idle") for this whole function's duration, on every exit path --
+  // one capture is always fully resolved before the next one can start,
+  // regardless of which ASR engine is selected.
   const finishBargeInCapture = useCallback(async () => {
     const traceId = bargeInTraceIdRef.current;
-    setBargeInPhaseBoth("idle");
+    setBargeInPhaseBoth("processing");
     clearBargeInCaptureTimeout();
     console.log("[mic] stop() called from: finishBargeInCapture");
     const audio = await localRecorder.stop();
@@ -1448,6 +1465,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     if (!audio) {
       abortTrace(traceId);
       bargeInTraceIdRef.current = undefined;
+      setBargeInPhaseBoth("idle");
       dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
       return;
     }
@@ -1465,6 +1483,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
         recordAsrDiagnostic({ provider: result.provider, transcript, latencyMs: result.latencyMs, success: true });
         finishTrace(traceId, false);
         bargeInTraceIdRef.current = undefined;
+        setBargeInPhaseBoth("idle");
         dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
         return;
       }
@@ -1477,6 +1496,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       // nothing about to become stale later.
       const outcome = await runLocalCommandRef.current(transcript, "interruption", traceId);
       bargeInTraceIdRef.current = undefined;
+      setBargeInPhaseBoth("idle");
       recordAsrDiagnostic({
         provider: result.provider,
         transcript,
@@ -1487,6 +1507,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     } catch (err) {
       finishTrace(traceId, false);
       bargeInTraceIdRef.current = undefined;
+      setBargeInPhaseBoth("idle");
       dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
       setLastError(err instanceof Error ? err.message : "Transcription failed.");
       recordAsrDiagnostic({ provider: asrProvider, transcript: "", latencyMs: 0, success: false });
@@ -1610,15 +1631,23 @@ export function JackProvider({ children }: { children: ReactNode }) {
           setBargeInPhaseBoth("armed");
         }, BARGE_IN_CALIBRATION_MS);
       }, BARGE_IN_ARM_GUARD_MS);
-    } else if (!shouldArm && bargeInPhaseRef.current !== "idle" && bargeInPhaseRef.current !== "capturing") {
+    } else if (
+      !shouldArm &&
+      bargeInPhaseRef.current !== "idle" &&
+      bargeInPhaseRef.current !== "capturing" &&
+      bargeInPhaseRef.current !== "processing"
+    ) {
       // Jack finished/was stopped before completing calibration or without a
-      // detected interruption -- disarm and discard.
+      // detected interruption -- disarm and discard. "processing" is left
+      // alone here too, same as "capturing" -- finishBargeInCapture owns
+      // that transition (back to "idle") once transcription+routing for the
+      // CURRENT capture is fully done, not before.
       setBargeInPhaseBoth("idle");
       clearBargeInArmTimers();
       console.log("[mic] stop() called from: disarm effect", { attentionState, presenterControl });
       void localRecorder.stop();
     }
-    // "capturing" is left alone here; handleBargeInDetected/finishBargeInCapture own that transition.
+    // "capturing" and "processing" are left alone here; handleBargeInDetected/finishBargeInCapture own those transitions.
   }, [attentionState, presenterControl, ambientListeningEnabled, localRecorder, clearBargeInArmTimers, setBargeInPhaseBoth]);
 
   // Watches mic level while armed for a sustained loud burst -> real
