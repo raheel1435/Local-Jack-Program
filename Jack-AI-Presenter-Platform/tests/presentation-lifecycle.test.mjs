@@ -20,9 +20,9 @@ function makeController(currentIndex = 2) {
   return {
     modeName: "Test",
     getPresentationContext: () => ok({ title: "Test Deck", totalSlides: TITLES.length, currentSlideIndex: currentIndex, mode: "present" }),
-    startPresentation: () => ok({ started: true }),
+    startPresentation: () => ok({ started: true, index: currentIndex }),
     pausePresentation: () => ok({ paused: true }),
-    resumePresentation: () => ok({ resumed: true }),
+    resumePresentation: () => ok({ resumed: true, index: currentIndex }),
     endPresentation: () => ok({ ended: true }),
     goToNextSlide: () => fail("not needed"),
     goToPreviousSlide: () => fail("not needed"),
@@ -74,6 +74,42 @@ test("buildPresentationContext with explicit index pulls THAT slide's title/text
   const ctx = buildPresentationContext(makeController(0), 3); // controller says slide 1, explicit says slide 4
   assert.equal(ctx.currentSlideTitle, "Roadmap");
   assert.equal(ctx.currentSlideText, "Roadmap content");
+});
+
+// Resume/start-race regression (the "jumped to slide 8, but it narrated a
+// different slide" bug): startPresentation()/resumePresentation() now return
+// the slide that was actually current the instant they were called, exactly
+// like goToNextSlide() already did. A caller that captures THAT index and
+// threads it through buildPresentationContext survives a slide change that
+// happens later (e.g. during the acknowledgement line's TTS playback,
+// or a second jump arriving before the first resume's narration restarts)
+// -- calling buildPresentationContext() with no explicit index at that later
+// point would instead pick up whatever slide is "current" by then, which is
+// exactly the desync this milestone fixes.
+test("resumePresentation's returned index survives a slide change that happens afterward, when threaded through explicitly", () => {
+  const controller = makeController(2); // slide 3 is current when resume is called
+  const resumeResult = controller.resumePresentation();
+  assert.equal(resumeResult.success, true);
+  const capturedIndex = resumeResult.data.index;
+  assert.equal(capturedIndex, 2);
+
+  // Simulate a jump landing (e.g. the user speaks a second command) after
+  // resume() was called but before narration actually reads context --
+  // the controller's own "current" has moved on to slide 5 (index 4).
+  controller.getPresentationContext = () => ok({ title: "Test Deck", totalSlides: TITLES.length, currentSlideIndex: 4, mode: "present" });
+
+  const staleRead = buildPresentationContext(controller); // the old, buggy call pattern
+  assert.equal(staleRead.currentSlideTitle, "Thank You", "re-querying 'current' late picks up the slide that arrived afterward -- not what resume actually resumed");
+
+  const fixedRead = buildPresentationContext(controller, capturedIndex); // the fix
+  assert.equal(fixedRead.currentSlideTitle, "Pricing", "the captured index must still describe the slide resume() actually resumed, regardless of what happened later");
+});
+
+test("startPresentation's returned index is likewise the slide current at call time, not a fixed/zero default", () => {
+  const controller = makeController(3);
+  const startResult = controller.startPresentation();
+  assert.equal(startResult.success, true);
+  assert.equal(startResult.data.index, 3);
 });
 
 test("narration prompt for the opening includes a self-introduction instruction", () => {

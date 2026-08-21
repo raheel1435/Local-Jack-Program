@@ -30,9 +30,17 @@ export interface PresentationController {
   readonly modeName: string;
 
   getPresentationContext(): ToolResult<{ title: string; totalSlides: number; currentSlideIndex: number; mode: string }>;
-  startPresentation(): ToolResult<{ started: true }>;
+  // `index` is the slide that's actually current the instant this call
+  // returns -- callers that go on to (re)start autonomous narration after an
+  // await (e.g. an acknowledgement line) must thread it through explicitly
+  // rather than re-querying getPresentationContext() later, for the same
+  // reason goToNextSlide()'s returned index is threaded through the
+  // auto-advance loop instead of re-read: the "current slide" ref only
+  // updates after React commits a render, so a later read can race a
+  // same-tick or near-simultaneous slide change.
+  startPresentation(): ToolResult<{ started: true; index: number }>;
   pausePresentation(): ToolResult<{ paused: true }>;
-  resumePresentation(): ToolResult<{ resumed: true }>;
+  resumePresentation(): ToolResult<{ resumed: true; index: number }>;
   endPresentation(): ToolResult<{ ended: true }>;
 
   goToNextSlide(): ToolResult<SlideInfo>;

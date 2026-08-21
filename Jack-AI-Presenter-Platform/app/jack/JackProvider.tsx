@@ -653,7 +653,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // for the manual Pause/Resume buttons) to reach the autonomy controls
   // (defined later, since they depend on the speech player/narration deps).
   const cancelAutonomousPresentingRef = useRef<() => void>(() => {});
-  const startAutonomousPresentingRef = useRef<() => void>(() => {});
+  const startAutonomousPresentingRef = useRef<(slideIndex?: number) => void>(() => {});
   // Same forward-reference pattern, for pause()/interrupt()'s short spoken
   // acknowledgement (Phase 14) -- speakThroughPlayer is defined later since
   // it depends on speechPlayer/voice. Optional traceId (perf tracing,
@@ -933,14 +933,24 @@ export function JackProvider({ children }: { children: ReactNode }) {
 
   const resume = useCallback(() => {
     speechPlayer.unlock();
-    controllerRef.current.controller.resumePresentation();
+    const resumeResult = controllerRef.current.controller.resumePresentation();
     dispatchEvent({ type: "RESUME" });
-    if (presenterControlRef.current === "jack") {
+    if (resumeResult.success && presenterControlRef.current === "jack") {
       // Short continuity line, not the full opening (Phase 13/14) -- narration
       // only starts once it's actually finished, so they never overlap.
+      // The slide index is captured now, before that await, and threaded
+      // through -- see startAutonomousPresenting's param comment for why
+      // re-reading "current" after the await would be a race.
+      const resumedIndex = resumeResult.data.index;
+      // See the matching comment in runLocalCommand's "start_presentation"
+      // case: a newer command arriving while this resume line is still
+      // being spoken must supersede it, not have this stale request
+      // restart narration once its own ack finally finishes.
+      const requestGeneration = narrationGenerationRef.current;
       void (async () => {
         await speakAndWaitRef.current(pickResumeLine(humourEnabled));
-        startAutonomousPresentingRef.current();
+        if (narrationGenerationRef.current !== requestGeneration) return;
+        startAutonomousPresentingRef.current(resumedIndex);
       })();
     }
   }, [dispatchEvent, speechPlayer, humourEnabled]);
@@ -1425,13 +1435,22 @@ export function JackProvider({ children }: { children: ReactNode }) {
     [cancelAutonomousPresenting, dispatchEvent, speechPlayer, voice, humourEnabled, prefetchNextSlideOpening],
   );
 
-  const startAutonomousPresenting = useCallback(() => {
-    narrationGenerationRef.current += 1;
-    const generation = narrationGenerationRef.current;
-    narrationActiveRef.current = true;
-    setIsPresentingAutonomously(true);
-    void runNarrationStep(generation);
-  }, [runNarrationStep]);
+  // `slideIndex`, when given, is the AUTHORITATIVE slide to resume/start
+  // narrating on -- required by any caller whose own action already knows
+  // the target slide but reaches this call after an await (e.g. speaking an
+  // acknowledgement line first). Omitting it falls back to runNarrationStep's
+  // own "current" read, which is only safe when nothing could have changed
+  // the slide since this same tick started.
+  const startAutonomousPresenting = useCallback(
+    (slideIndex?: number) => {
+      narrationGenerationRef.current += 1;
+      const generation = narrationGenerationRef.current;
+      narrationActiveRef.current = true;
+      setIsPresentingAutonomously(true);
+      void runNarrationStep(generation, slideIndex);
+    },
+    [runNarrationStep],
+  );
 
   useEffect(() => {
     cancelAutonomousPresentingRef.current = cancelAutonomousPresenting;
@@ -1860,10 +1879,11 @@ export function JackProvider({ children }: { children: ReactNode }) {
         let result: { success: boolean; error?: string } | null = null;
         mark(traceId, "slideMutationStart"); // T8 -- covers every controller.xxx() call below, action-mutating or not
         switch (action) {
-          case "start_presentation":
-            result = controller.startPresentation();
+          case "start_presentation": {
+            const startResult = controller.startPresentation();
+            result = startResult;
             mark(traceId, "slideMutationDone"); // T9
-            if (result.success) {
+            if (startResult.success) {
               setPresenterControl("jack");
               // Wake (with greeting) first if Jack was still asleep -- Phase
               // 2's "starting Jack presentation if currently sleeping" wake
@@ -1878,13 +1898,27 @@ export function JackProvider({ children }: { children: ReactNode }) {
               // decide whether to actually deliver the audience intro.
               const ack = presentationOpeningDeliveredRef.current ? pickTakeoverAgainAck() : pickTakeoverAck();
               traceHandedOff = true; // this trace now measures voice-command -> spoken acknowledgement latency
+              // Captured now, before the awaits below -- see
+              // startAutonomousPresenting's param comment.
+              const startedIndex = startResult.data.index;
+              // Snapshot of the generation counter at request time: if a
+              // jump/pause/another start-or-resume arrives while the
+              // wake/ack lines are still being spoken, cancelAutonomousPresenting
+              // (or a fresh startAutonomousPresenting) bumps this counter,
+              // and this request must NOT go on to restart narration on the
+              // now-superseded slide once its own ack finally finishes --
+              // the exact mechanism behind Jack narrating a slide the
+              // display had already moved past.
+              const requestGeneration = narrationGenerationRef.current;
               void (async () => {
                 if (!jackAwakeRef.current) await wakeJackLocal();
                 await speakAndWait(ack, traceId);
-                startAutonomousPresenting(); // starts its own separate slide_narration trace
+                if (narrationGenerationRef.current !== requestGeneration) return;
+                startAutonomousPresenting(startedIndex); // starts its own separate slide_narration trace
               })();
             }
             break;
+          }
           case "next_slide":
             cancelAutonomousPresenting();
             result = controller.goToNextSlide();
@@ -1920,21 +1954,32 @@ export function JackProvider({ children }: { children: ReactNode }) {
               void speakThroughPlayer("Of course. I'll pause here.", traceId);
             }
             break;
-          case "resume_presentation":
-            result = controller.resumePresentation();
+          case "resume_presentation": {
+            const resumeResult = controller.resumePresentation();
+            result = resumeResult;
             mark(traceId, "slideMutationDone"); // T9
-            if (result.success && presenterControlRef.current === "jack") {
+            if (resumeResult.success && presenterControlRef.current === "jack") {
               // Phase 13/14: short continuity line, NOT the full opening --
               // narration only starts once it's actually finished speaking,
               // so they never overlap. Regenerates for the CURRENT slide,
               // never skips ahead.
               traceHandedOff = true;
+              // Captured now, before the await below -- see
+              // startAutonomousPresenting's param comment.
+              const resumedIndex = resumeResult.data.index;
+              // See the matching comment in "start_presentation": a newer
+              // command arriving while this resume line is still being
+              // spoken must supersede it, not have this stale request
+              // restart narration once its own ack finally finishes.
+              const requestGeneration = narrationGenerationRef.current;
               void (async () => {
                 await speakAndWait(pickResumeLine(humourEnabled), traceId);
-                startAutonomousPresenting(); // starts its own separate slide_narration trace
+                if (narrationGenerationRef.current !== requestGeneration) return;
+                startAutonomousPresenting(resumedIndex); // starts its own separate slide_narration trace
               })();
             }
             break;
+          }
           case "handoff_to_presenter":
             cancelAutonomousPresenting(); // stops current audio/narration before the acknowledgement below fires
             result = controller.handControlToPresenter();

@@ -52,7 +52,7 @@ export function PracticeStage() {
     },
     startPresentation: () => {
       start();
-      return ok({ started: true as const });
+      return ok({ started: true as const, index: latest.current.sectionIndex });
     },
     pausePresentation: () => {
       pause();
@@ -60,7 +60,7 @@ export function PracticeStage() {
     },
     resumePresentation: () => {
       start();
-      return ok({ resumed: true as const });
+      return ok({ resumed: true as const, index: latest.current.sectionIndex });
     },
     endPresentation: () => {
       finish();
