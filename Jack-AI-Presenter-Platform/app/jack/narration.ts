@@ -55,6 +55,18 @@ function truncateForPrompt(text: string): string {
   return `${safe}…`;
 }
 
+// Multi-persona milestone: the assistant introduces itself and answers to
+// whichever name is currently selected (Bella/Adam/Nova/Sarah/George/Emma/
+// Jack/...), not always literally "Jack" -- see voiceSettings.ts's
+// VOICE_OPTIONS, which the name is resolved from in JackProvider. Every
+// prompt below is templated with the literal word "Jack" and swapped via
+// this helper at build time, rather than restructuring each string, so the
+// prompts keep reading naturally for any name.
+function withAssistantName(template: string, name: string): string {
+  const n = name.trim() || "Jack";
+  return template.replace(/\bJack\b/g, n);
+}
+
 const NARRATION_SYSTEM_PROMPT_BASE =
   "You are Jack, an AI co-presenter narrating a slide deck out loud to a live audience. " +
   "Given the current slide's content, generate a short, natural spoken narration -- present " +
@@ -75,23 +87,25 @@ const NARRATION_SYSTEM_PROMPT_BASE =
  * could produce a fresh "Hello everyone, today we're excited to..." because
  * nothing ever told the model it had already introduced itself.
  */
-export function narrationSystemPrompt(isOpening: boolean, humourEnabled: boolean): string {
+export function narrationSystemPrompt(isOpening: boolean, humourEnabled: boolean, assistantName = "Jack"): string {
   if (isOpening) {
-    return (
+    return withAssistantName(
       NARRATION_SYSTEM_PROMPT_BASE +
-      " This is the very first thing you will say to the audience for this presentation -- " +
-      "start with one brief self-introduction (e.g. \"Hello everyone, I'm Jack, and I'll be " +
-      "helping present today.\")" +
-      (humourEnabled ? ", with one light touch of humour if it fits naturally" : "") +
-      ", then move straight into narrating this slide. Keep the introduction to one short sentence."
+        " This is the very first thing you will say to the audience for this presentation -- " +
+        "start with one brief self-introduction (e.g. \"Hello everyone, I'm Jack, and I'll be " +
+        "helping present today.\")" +
+        (humourEnabled ? ", with one light touch of humour if it fits naturally" : "") +
+        ", then move straight into narrating this slide. Keep the introduction to one short sentence.",
+      assistantName,
     );
   }
-  return (
+  return withAssistantName(
     NARRATION_SYSTEM_PROMPT_BASE +
-    " You have ALREADY introduced yourself for this presentation earlier -- do NOT say hello to " +
-    "the audience again, do NOT reintroduce yourself as Jack, do NOT say anything like \"today " +
-    "we're excited to...\" or any other opening-style line. Go straight into narrating this " +
-    "slide's content as a natural continuation of an already-running presentation."
+      " You have ALREADY introduced yourself for this presentation earlier -- do NOT say hello to " +
+      "the audience again, do NOT reintroduce yourself as Jack, do NOT say anything like \"today " +
+      "we're excited to...\" or any other opening-style line. Go straight into narrating this " +
+      "slide's content as a natural continuation of an already-running presentation.",
+    assistantName,
   );
 }
 
@@ -100,11 +114,12 @@ export async function generateSlideNarration(
   context: PresentationContext,
   isOpening: boolean,
   humourEnabled: boolean,
+  assistantName = "Jack",
 ): Promise<string> {
   const prompt = `${formatContextForPrompt(context)}\n\nNarrate this slide now.`;
   const result = await jackApi.chat(
     [
-      { role: "system", content: narrationSystemPrompt(isOpening, humourEnabled) },
+      { role: "system", content: narrationSystemPrompt(isOpening, humourEnabled, assistantName) },
       { role: "user", content: prompt },
     ],
     { maxTokens: 160, temperature: 0.5 },
@@ -130,6 +145,7 @@ export async function generateNarrationOpening(
   context: PresentationContext,
   isOpening: boolean,
   humourEnabled: boolean,
+  assistantName = "Jack",
 ): Promise<string> {
   const prompt =
     `${formatContextForPrompt(context)}\n\n` +
@@ -138,7 +154,7 @@ export async function generateNarrationOpening(
     "8-18 words. Nothing else, just that one sentence.";
   const result = await jackApi.chat(
     [
-      { role: "system", content: narrationSystemPrompt(isOpening, humourEnabled) },
+      { role: "system", content: narrationSystemPrompt(isOpening, humourEnabled, assistantName) },
       { role: "user", content: prompt },
     ],
     { maxTokens: 48, temperature: 0.5 },
@@ -150,6 +166,7 @@ export async function generateNarrationContinuation(
   context: PresentationContext,
   openingSentence: string,
   humourEnabled: boolean,
+  assistantName = "Jack",
 ): Promise<string> {
   const prompt =
     `${formatContextForPrompt(context)}\n\n` +
@@ -167,7 +184,7 @@ export async function generateNarrationContinuation(
       // call -- a continuation must never repeat/redo it, so this always
       // uses the non-opening system prompt regardless of the slide's own
       // isOpening flag.
-      { role: "system", content: narrationSystemPrompt(false, humourEnabled) },
+      { role: "system", content: narrationSystemPrompt(false, humourEnabled, assistantName) },
       { role: "user", content: prompt },
     ],
     { maxTokens: 120, temperature: 0.5 },
@@ -300,6 +317,7 @@ export async function answerDeckQuestion(
   docs: ParsedDocument[],
   activeFileId: string | null,
   comprehensive = false,
+  assistantName = "Jack",
 ): Promise<DeckAnswer> {
   const retrieval = retrieveForQuestion(question, context, docs, activeFileId, comprehensive);
   const matches = retrieval.matches;
@@ -309,7 +327,10 @@ export async function answerDeckQuestion(
   // at Jack was never a deck question in the first place.
   if (retrieval.confidence === "low") {
     const soundsLikeDeckQuestion = DECK_REFERENCE_RE.test(question);
-    const systemPrompt = soundsLikeDeckQuestion ? QA_SYSTEM_PROMPT_NO_MATERIAL : QA_SYSTEM_PROMPT_CONVERSATIONAL;
+    const systemPrompt = withAssistantName(
+      soundsLikeDeckQuestion ? QA_SYSTEM_PROMPT_NO_MATERIAL : QA_SYSTEM_PROMPT_CONVERSATIONAL,
+      assistantName,
+    );
     const prompt = soundsLikeDeckQuestion
       ? `${formatContextForQA(context)}\n\nSomething was said that didn't match any deck content:\n"${question}"`
       : `Something was just said to you during the presentation:\n"${question}"`;
@@ -348,7 +369,10 @@ export async function answerDeckQuestion(
     );
   }
   const prompt = `${materialParts.join("\n\n")}\n\nQuestion: ${question}`;
-  const systemPrompt = retrieval.confidence === "high" ? QA_SYSTEM_PROMPT_HIGH : QA_SYSTEM_PROMPT_MEDIUM;
+  const systemPrompt = withAssistantName(
+    retrieval.confidence === "high" ? QA_SYSTEM_PROMPT_HIGH : QA_SYSTEM_PROMPT_MEDIUM,
+    assistantName,
+  );
   const result = await jackApi.chat(
     [
       { role: "system", content: systemPrompt },

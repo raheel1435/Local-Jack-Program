@@ -19,7 +19,7 @@ function points(count:number, radius:number) {
   return Array.from({length:count},(_,i)=>{const theta=Math.acos(1-(2*(i+.5))/count), a=(2*Math.PI*i)/phi; return {x:radius*Math.sin(theta)*Math.cos(a),y:radius*Math.sin(theta)*Math.sin(a),z:radius*Math.cos(theta),spark:0};});
 }
 
-export function JackOrb({state="available",size=240}:{state?:JackState;size?:number}) {
+export function JackOrb({state="available",size=240,name="Jack"}:{state?:JackState;size?:number;name?:string}) {
   const ref=useRef<HTMLCanvasElement>(null), stateRef=useRef(state);
   useEffect(()=>{stateRef.current=state},[state]);
   useEffect(()=>{
@@ -43,5 +43,5 @@ export function JackOrb({state="available",size=240}:{state?:JackState;size?:num
       raf=requestAnimationFrame(frame);
     }; raf=requestAnimationFrame(frame); return()=>cancelAnimationFrame(raf);
   },[size]);
-  return <canvas ref={ref} aria-label={`Jack is ${JACK_STATES[state].label}`} />;
+  return <canvas ref={ref} aria-label={`${name} is ${JACK_STATES[state].label}`} />;
 }

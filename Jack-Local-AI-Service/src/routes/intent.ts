@@ -1,11 +1,15 @@
 import { Router } from "express";
 import { matchDeterministicCommand, type IntentType } from "../intent/commandRouter.js";
 import { classifyAddress, hasSuspiciousRepetition } from "../intent/addressing.js";
-import { ACTION_GRAMMAR, ACTION_SYSTEM_PROMPT } from "../intent/actionGrammar.js";
+import { ACTION_GRAMMAR, buildActionSystemPrompt } from "../intent/actionGrammar.js";
 import type { JackErrorResponse, LlmProvider } from "../types/jack.js";
 
 interface JackIntentRequest {
   text: string;
+  /** Multi-persona milestone: the currently selected assistant name
+   * (Bella/Adam/Nova/Sarah/George/Emma/Jack/...) -- defaults to "Jack" when
+   * omitted so older/typed-only clients keep working unchanged. */
+  assistantName?: string;
 }
 
 const VALID_ACTIONS = new Set([
@@ -59,8 +63,10 @@ export function intentRouter(llm: LlmProvider): Router {
       return;
     }
 
+    const assistantName = typeof body.assistantName === "string" && body.assistantName.trim() ? body.assistantName : "Jack";
+
     const start = Date.now();
-    const deterministic = matchDeterministicCommand(body.text);
+    const deterministic = matchDeterministicCommand(body.text, assistantName);
     if (deterministic) {
       res.json({
         source: "deterministic",
@@ -86,7 +92,7 @@ export function intentRouter(llm: LlmProvider): Router {
     try {
       const result = await llm.chat({
         messages: [
-          { role: "system", content: ACTION_SYSTEM_PROMPT },
+          { role: "system", content: buildActionSystemPrompt(assistantName) },
           { role: "user", content: body.text },
         ],
         max_tokens: 40,
@@ -138,8 +144,8 @@ export function intentRouter(llm: LlmProvider): Router {
       // "Jack, stop, stop, stop!").
       let downgradedFrom: string | undefined;
       if (type === "action" && action && HIGH_IMPACT_ACTIONS.has(action)) {
-        const address = classifyAddress(body.text);
-        const suspicious = hasSuspiciousRepetition(body.text);
+        const address = classifyAddress(body.text, assistantName);
+        const suspicious = hasSuspiciousRepetition(body.text, assistantName);
         if (address !== "direct" || suspicious) {
           downgradedFrom = action;
           type = "conversation";

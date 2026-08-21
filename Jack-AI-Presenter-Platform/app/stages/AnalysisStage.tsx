@@ -2,6 +2,8 @@
 
 import { useEffect, useRef } from "react";
 import { JackOrb } from "../JackOrb";
+import { NarrationPrepOverlay } from "../components/NarrationPrepOverlay";
+import { useJack } from "../jack/JackProvider";
 import { isUnsupportedFormat, parseFile } from "../lib/parsers";
 import { useSession } from "../session/SessionContext";
 import type { AnalysisStep } from "../session/types";
@@ -11,6 +13,7 @@ const STEP_LABEL: Record<AnalysisStep, string> = {
   "detecting-structure": "Detecting structure",
   "preparing-guidance": "Preparing speaker guidance",
   "identifying-questions": "Identifying likely questions",
+  "preparing-narration": "Preparing narration",
   done: "Done",
   failed: "Couldn't finish",
 };
@@ -23,6 +26,7 @@ function sleep(ms: number) {
 
 export function AnalysisStage() {
   const { session, dispatch } = useSession();
+  const jack = useJack();
   const processingRef = useRef(false);
   const completedRef = useRef(false);
 
@@ -44,6 +48,32 @@ export function AnalysisStage() {
         if (isUnsupportedFormat(doc)) {
           dispatch({ type: "ANALYSIS_FILE_UNSUPPORTED", fileId: next.id, doc });
         } else {
+          // Upload-time milestone: generate every slide's narration now,
+          // while the presenter is still uploading, instead of one slide
+          // ahead during the live presentation -- see
+          // pregenerateDeckNarration's own comment. This file only counts as
+          // "ready" (ANALYSIS_FILE_DONE below) once it's done, matching "the
+          // presentation shows on screen once preparation is finished."
+          if (doc.sections.length > 0) {
+            dispatch({
+              type: "ANALYSIS_STEP",
+              fileId: next.id,
+              step: "preparing-narration",
+              detail: `0/${doc.sections.length} slides`,
+              narrationDone: 0,
+              narrationTotal: doc.sections.length,
+            });
+            await jack.pregenerateDeckNarration(doc, (done, total) => {
+              dispatch({
+                type: "ANALYSIS_STEP",
+                fileId: next.id,
+                step: "preparing-narration",
+                detail: `${done}/${total} slides`,
+                narrationDone: done,
+                narrationTotal: total,
+              });
+            });
+          }
           dispatch({ type: "ANALYSIS_FILE_DONE", fileId: next.id, doc });
         }
       } catch (err) {
@@ -56,7 +86,15 @@ export function AnalysisStage() {
         processingRef.current = false;
       }
     })();
-  }, [session.files, dispatch]);
+    // Deliberately depends on jack.pregenerateDeckNarration specifically,
+    // not the whole `jack` context value -- that object is a fresh reference
+    // on every JackProvider render (e.g. every mic-level animation frame
+    // while listening), which would re-fire this effect dozens of times a
+    // second during parsing/pregeneration; processingRef's early-return
+    // guard makes that merely wasteful rather than actually broken, but
+    // there's no reason to pay the cost.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.files, dispatch, jack.pregenerateDeckNarration]);
 
   useEffect(() => {
     if (completedRef.current) return;
@@ -72,13 +110,27 @@ export function AnalysisStage() {
   }, [session.files, session.analysis.started, session.analysis.failedFileIds, dispatch]);
 
   const activeId = session.analysis.activeFileId;
+  const activeFile = session.files.find((f) => f.id === activeId);
+  const activeProgress = activeId ? session.analysis.progressByFile[activeId] : undefined;
+  const narrationPrep =
+    activeFile && activeProgress?.step === "preparing-narration" && activeProgress.narrationTotal
+      ? { file: activeFile, done: activeProgress.narrationDone ?? 0, total: activeProgress.narrationTotal }
+      : null;
 
   return (
     <section className="stage-shell analysis-stage">
+      {narrationPrep && (
+        <NarrationPrepOverlay
+          assistantName={jack.assistantName}
+          fileName={narrationPrep.file.name}
+          done={narrationPrep.done}
+          total={narrationPrep.total}
+        />
+      )}
       <div className="jack-stage compact">
-        <div className="orb-wrap"><JackOrb state="thinking" size={140} /></div>
+        <div className="orb-wrap"><JackOrb state="thinking" size={140} name={jack.assistantName} /></div>
         <div className="jack-status">
-          <i /> <strong>JACK IS THINKING</strong>
+          <i /> <strong>{jack.assistantName.toUpperCase()} IS THINKING</strong>
           <small>Reading what you uploaded</small>
         </div>
       </div>
@@ -98,7 +150,9 @@ export function AnalysisStage() {
                   {f.status === "error"
                     ? f.error
                     : progress
-                      ? STEP_LABEL[progress.step]
+                      ? progress.detail
+                        ? `${STEP_LABEL[progress.step]} (${progress.detail})`
+                        : STEP_LABEL[progress.step]
                       : "Waiting…"}
                   {isActive && <span className="analysis-spinner" aria-hidden="true" />}
                 </small>

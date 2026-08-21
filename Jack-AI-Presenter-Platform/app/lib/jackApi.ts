@@ -132,9 +132,12 @@ export const jackApi = {
     }
   },
 
-  /** Runs the deterministic-command-router-then-LLM-fallback intent classifier. */
-  detectIntent(text: string): Promise<JackIntentResult> {
-    return postJson<JackIntentResult>("/jack/intent", { text }, 15_000);
+  /** Runs the deterministic-command-router-then-LLM-fallback intent classifier.
+   * `assistantName` is the currently selected persona (Bella/Adam/Nova/Sarah/
+   * George/Emma/Jack/...) that the gateway treats as the wake word -- defaults
+   * server-side to "Jack" when omitted. */
+  detectIntent(text: string, assistantName?: string): Promise<JackIntentResult> {
+    return postJson<JackIntentResult>("/jack/intent", { text, assistantName }, 15_000);
   },
 
   chat(messages: JackChatMessage[], opts?: { maxTokens?: number; temperature?: number }): Promise<JackChatResult> {

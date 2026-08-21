@@ -18,6 +18,7 @@ import type { ParsedDocument, PresentationStatus, SessionAction, UploadedFile } 
 
 export function PresentStage() {
   const { session, dispatch } = useSession();
+  const jack = useJack();
   const activeFile = session.files.find((f) => f.id === session.activeFileId) ?? session.files[0];
   const doc = activeFile ? session.parsedDocs[activeFile.id] : undefined;
 
@@ -32,7 +33,7 @@ export function PresentStage() {
   if (doc.sections.length === 0) {
     return (
       <section className="stage-shell present-stage">
-        <div className="jack-stage compact"><div className="orb-wrap"><JackOrb state="alert" size={120} /></div></div>
+        <div className="jack-stage compact"><div className="orb-wrap"><JackOrb state="alert" size={120} name={jack.assistantName} /></div></div>
         <h2>{activeFile.name} can&apos;t be presented</h2>
         <p>{doc.warnings[0] ?? "This file's content couldn't be extracted."}</p>
         <button type="button" className="secondary" onClick={() => dispatch({ type: "BACK_TO_MODE_SELECT" })}>← Back to mode select</button>
@@ -269,7 +270,16 @@ function PresentSession({
     if (autoStartedRef.current) return;
     if (jack.controlMode === "jackLeads") {
       autoStartedRef.current = true;
-      void jack.runLocalCommand("Jack, start presentation.", "typed");
+      // Multi-persona milestone: this used to hardcode "Jack, start
+      // presentation." -- with a different assistant name selected, that
+      // phrase no longer matches commandRouter.ts's deterministic
+      // start_presentation pattern (which now requires the ACTUAL selected
+      // name), so it fell through to the LLM fallback, which then
+      // downgraded the high-impact action right back to "conversation"
+      // since the address check saw "Jack" wasn't the selected name --
+      // "Jack leads" mode would silently never auto-start. Using the real
+      // assistantName keeps this exactly as deterministic as it always was.
+      void jack.runLocalCommand(`${jack.assistantName}, start presentation.`, "typed");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -353,6 +363,7 @@ function PresentSession({
     <div ref={stageRef} className="present-stage-root">
       <div className={`present-topbar ${chromeVisible ? "" : "controls-hidden"}`}>
         <JackStatusBar
+          name={jack.assistantName}
           jackState={jack.orb.orbState}
           jackLabel={jack.orb.label}
           localHealth={localHealth}
@@ -373,12 +384,12 @@ function PresentSession({
       <div className="present-content">
         <SlideVisual doc={doc} activeFile={activeFile} sectionIndex={sectionIndex} currentSection={currentSection} />
         <div className="present-orb-corner">
-          <JackOrb state={jack.orb.orbState} size={192} />
+          <JackOrb state={jack.orb.orbState} size={192} name={jack.assistantName} />
         </div>
       </div>
 
       {overlaysVisible && doc.warnings.length > 0 && <p className="present-warning">{doc.warnings[0]}</p>}
-      {overlaysVisible && paused && <p className="present-warning">Paused · Say &ldquo;Jack, continue&rdquo;</p>}
+      {overlaysVisible && paused && <p className="present-warning">Paused · Say &ldquo;{jack.assistantName}, continue&rdquo;</p>}
 
       {/* Captions default OFF (Phase 3/26): audience hears Jack, doesn't see the
           full narration/Q&A/acknowledgement paragraph, unless explicitly enabled. */}
@@ -404,7 +415,7 @@ function PresentSession({
       )}
       {overlaysVisible && micToggledOn && jack.bargeInPhase === "idle" && (
         <p className="jack-mic-feedback" aria-live="polite">
-          Mic on -- listening for &ldquo;Jack&rdquo;. Press 🎤 again to turn it off.
+          Mic on -- listening for &ldquo;{jack.assistantName}&rdquo;. Press 🎤 again to turn it off.
         </p>
       )}
       {overlaysVisible && jack.localMicError && <p className="jack-mic-feedback speech-error">{jack.localMicError}</p>}
@@ -423,7 +434,7 @@ function PresentSession({
             value={commandInput}
             onChange={(e) => setCommandInput(e.target.value)}
             placeholder='Type a command, e.g. "Next slide." or "Summarize this slide."'
-            aria-label="Type a command for Jack"
+            aria-label={`Type a command for ${jack.assistantName}`}
             disabled={commandBusy}
             autoFocus
           />
@@ -468,8 +479,8 @@ function PresentSession({
         <button
           type="button"
           onClick={paused ? jack.resume : jack.pause}
-          aria-label={paused ? "Resume" : "Pause Jack"}
-          title={paused ? "Resume Jack's presentation" : "Pause Jack's presentation"}
+          aria-label={paused ? "Resume" : `Pause ${jack.assistantName}`}
+          title={paused ? `Resume ${jack.assistantName}'s presentation` : `Pause ${jack.assistantName}'s presentation`}
         >
           {paused ? "▶ Resume" : "❚❚ Pause"}
         </button>
@@ -477,8 +488,8 @@ function PresentSession({
           type="button"
           onClick={jack.interrupt}
           disabled={jack.attentionState !== "speaking"}
-          aria-label="Stop Jack speaking"
-          title="Stop Jack speaking"
+          aria-label={`Stop ${jack.assistantName} speaking`}
+          title={`Stop ${jack.assistantName} speaking`}
         >
           ■ Stop
         </button>
@@ -490,13 +501,13 @@ function PresentSession({
             onClick={handleLocalMicClick}
             disabled={whisperUnavailable || jack.localMicState === "requesting" || jack.localMicState === "initializing"}
             aria-pressed={micToggledOn}
-            aria-label={micToggledOn ? "Turn mic off" : "Turn mic on -- listens for “Jack” until you turn it off"}
+            aria-label={micToggledOn ? "Turn mic off" : `Turn mic on -- listens for "${jack.assistantName}" until you turn it off`}
             title={
               whisperUnavailable
                 ? "Local Whisper transcription is unavailable"
                 : micToggledOn
                   ? "Turn mic off"
-                  : "Turn mic on -- Jack listens for his name until you turn it off"
+                  : `Turn mic on -- ${jack.assistantName} listens for its name until you turn it off`
             }
           >
             {jack.localMicState === "requesting" || jack.localMicState === "initializing" ? "…" : "🎤"}
@@ -506,7 +517,7 @@ function PresentSession({
             className={`jack-command-toggle-btn ${commandPanelOpen ? "active" : ""}`}
             onClick={() => setCommandPanelOpen((v) => !v)}
             aria-pressed={commandPanelOpen}
-            aria-label="Type a command for Jack"
+            aria-label={`Type a command for ${jack.assistantName}`}
             title="Type a command instead of speaking"
           >
             ⌨
@@ -517,7 +528,7 @@ function PresentSession({
             onClick={() => currentSection && void jack.readCurrentSlide(currentSection.text)}
             disabled={!currentSection}
             aria-label="Read this slide"
-            title="Read this slide aloud, once, with Jack's voice"
+            title={`Read this slide aloud, once, with ${jack.assistantName}'s voice`}
           >
             ▶
           </button>

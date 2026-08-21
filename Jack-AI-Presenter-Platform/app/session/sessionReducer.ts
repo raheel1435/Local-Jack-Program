@@ -79,7 +79,13 @@ export function sessionReducer(
           ...state.analysis,
           progressByFile: {
             ...state.analysis.progressByFile,
-            [action.fileId]: { fileId: action.fileId, step: action.step },
+            [action.fileId]: {
+              fileId: action.fileId,
+              step: action.step,
+              detail: action.detail,
+              narrationDone: action.narrationDone,
+              narrationTotal: action.narrationTotal,
+            },
           },
         },
       };

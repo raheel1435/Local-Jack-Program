@@ -26,23 +26,35 @@
 export type AddressClassification = "direct" | "mention" | "none";
 
 const GREETING = "(?:hey|ok(?:ay)?|yo)[,]?\\s+";
-const LEADING_JACK = new RegExp(`^(?:${GREETING})?jack\\b`);
-const TRAILING_JACK = /,\s*jack[.?!]?$/;
-const BARE_JACK = /^jack[.?!]?$/;
-const ANY_JACK = /\bjack\b/;
 
-export function classifyJackAddress(rawText: string): AddressClassification {
+// Multi-persona milestone: the wake word is whichever assistant name is
+// currently selected (Bella/Adam/Nova/Sarah/George/Emma/Jack/...), not
+// always literally "Jack" -- see voiceSettings.ts's VOICE_OPTIONS, which
+// this name is resolved from in JackProvider. Regex-escaped since a label
+// is presenter-facing text, not a hand-written pattern. Kept in sync by
+// hand with Jack-Local-AI-Service/src/intent/addressing.ts's classifyAddress
+// (see this module's own header comment on why it's duplicated, not shared).
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function classifyJackAddress(rawText: string, name = "jack"): AddressClassification {
   const text = rawText.trim().toLowerCase();
-  if (!ANY_JACK.test(text)) return "none";
-  if (BARE_JACK.test(text)) return "direct";
-  if (LEADING_JACK.test(text)) return "direct";
-  if (TRAILING_JACK.test(text)) return "direct";
+  const n = escapeRegExp(name.trim().toLowerCase());
+  const leading = new RegExp(`^(?:${GREETING})?${n}\\b`);
+  const trailing = new RegExp(`,\\s*${n}[.?!]?$`);
+  const bare = new RegExp(`^${n}[.?!]?$`);
+  const any = new RegExp(`\\b${n}\\b`);
+  if (!any.test(text)) return "none";
+  if (bare.test(text)) return "direct";
+  if (leading.test(text)) return "direct";
+  if (trailing.test(text)) return "direct";
   return "mention";
 }
 
 /** Convenience wrapper matching the old boolean gate's call sites. */
-export function isDirectlyAddressedToJack(rawText: string): boolean {
-  return classifyJackAddress(rawText) === "direct";
+export function isDirectlyAddressedToJack(rawText: string, name = "jack"): boolean {
+  return classifyJackAddress(rawText, name) === "direct";
 }
 
 /**
@@ -115,12 +127,12 @@ const GENERIC_OVERLAP_WORDS = new Set([
   "presentation",
 ]);
 
-function contentWords(text: string): string[] {
+function contentWords(text: string, name: string): string[] {
   return text
     .toLowerCase()
     .replace(/[^a-z0-9\s']/g, "")
     .split(/\s+/)
-    .filter((w) => w && !TRIVIAL_WORDS.has(w) && !GENERIC_OVERLAP_WORDS.has(w));
+    .filter((w) => w && w !== name.trim().toLowerCase() && !TRIVIAL_WORDS.has(w) && !GENERIC_OVERLAP_WORDS.has(w));
 }
 
 export interface RecentSpeech {
@@ -132,11 +144,11 @@ export interface RecentSpeech {
 const SELF_ECHO_MIN_SHARED_WORDS = 3;
 const SELF_ECHO_MIN_CONTAINMENT = 0.6;
 
-export function isSelfEcho(transcript: string, recentSpeech: readonly RecentSpeech[]): boolean {
-  const transcriptWords = contentWords(transcript);
+export function isSelfEcho(transcript: string, recentSpeech: readonly RecentSpeech[], name = "jack"): boolean {
+  const transcriptWords = contentWords(transcript, name);
   if (transcriptWords.length < SELF_ECHO_MIN_SHARED_WORDS) return false;
   for (const { text } of recentSpeech) {
-    const spokenWordSet = new Set(contentWords(text));
+    const spokenWordSet = new Set(contentWords(text, name));
     const shared = transcriptWords.filter((w) => spokenWordSet.has(w));
     if (shared.length >= SELF_ECHO_MIN_SHARED_WORDS && shared.length / transcriptWords.length >= SELF_ECHO_MIN_CONTAINMENT) {
       return true;

@@ -24,18 +24,27 @@
 export type AddressClassification = "direct" | "mention" | "none";
 
 const GREETING = "(?:hey|ok(?:ay)?|yo)[,]?\\s+";
-const LEADING_JACK = new RegExp(`^(?:${GREETING})?jack\\b`);
-const TRAILING_JACK = /,\s*jack[.?!]?$/;
-const BARE_JACK = /^jack[.?!]?$/;
-const ANY_JACK = /\bjack\b/;
-const ALL_JACK_OCCURRENCES = /\bjack\b/g;
 
-export function classifyAddress(rawText: string): AddressClassification {
+// Multi-persona milestone: the wake word is whichever assistant name is
+// currently selected (Bella/Adam/Nova/Sarah/George/Emma/Jack/...), not
+// always literally "Jack" -- see voiceSettings.ts's VOICE_OPTIONS on the
+// frontend, which this name is resolved from. Regex-escaped since a label
+// is presenter-facing text, not a hand-written pattern.
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function classifyAddress(rawText: string, name = "jack"): AddressClassification {
   const text = rawText.trim().toLowerCase();
-  if (!ANY_JACK.test(text)) return "none";
-  if (BARE_JACK.test(text)) return "direct";
-  if (LEADING_JACK.test(text)) return "direct";
-  if (TRAILING_JACK.test(text)) return "direct";
+  const n = escapeRegExp(name.trim().toLowerCase());
+  const leading = new RegExp(`^(?:${GREETING})?${n}\\b`);
+  const trailing = new RegExp(`,\\s*${n}[.?!]?$`);
+  const bare = new RegExp(`^${n}[.?!]?$`);
+  const any = new RegExp(`\\b${n}\\b`);
+  if (!any.test(text)) return "none";
+  if (bare.test(text)) return "direct";
+  if (leading.test(text)) return "direct";
+  if (trailing.test(text)) return "direct";
   return "mention";
 }
 
@@ -70,8 +79,9 @@ export function hasNegation(rawText: string): boolean {
  * flagged, matching Part 17's explicit requirement not to penalize the
  * former while catching the latter.
  */
-export function hasSuspiciousRepetition(rawText: string): boolean {
+export function hasSuspiciousRepetition(rawText: string, name = "jack"): boolean {
   const text = rawText.trim().toLowerCase();
-  const matches = text.match(ALL_JACK_OCCURRENCES);
+  const n = escapeRegExp(name.trim().toLowerCase());
+  const matches = text.match(new RegExp(`\\b${n}\\b`, "g"));
   return (matches?.length ?? 0) >= 2;
 }

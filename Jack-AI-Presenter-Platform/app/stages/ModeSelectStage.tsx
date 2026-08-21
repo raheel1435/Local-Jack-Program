@@ -29,6 +29,13 @@ const MODES: { id: PresentMode; icon: string; label: string; title: string; desc
   },
 ];
 
+// Multi-persona milestone: same pattern as PresentSetup.tsx's identical
+// helper -- these templates keep the literal word "Jack", swapped for
+// whichever assistant name is actually selected at render time.
+function withAssistantName(text: string, name: string): string {
+  return text.replace(/\bJack\b/g, name);
+}
+
 export function ModeSelectStage() {
   const { session, dispatch } = useSession();
   const jack = useJack();
@@ -47,9 +54,9 @@ export function ModeSelectStage() {
       </button>
 
       <div className="jack-stage compact">
-        <div className="orb-wrap"><JackOrb state={session.jackState} size={140} /></div>
+        <div className="orb-wrap"><JackOrb state={session.jackState} size={140} name={jack.assistantName} /></div>
         <div className="jack-status">
-          <i /> <strong>JACK IS AVAILABLE</strong>
+          <i /> <strong>{jack.assistantName.toUpperCase()} IS AVAILABLE</strong>
           <small>Analysis complete</small>
         </div>
       </div>
@@ -67,22 +74,22 @@ export function ModeSelectStage() {
           onChange={(e) => jack.setPresenterName(e.target.value)}
           placeholder="e.g. Alex"
         />
-        <small>Jack stays quiet until you call him -- he&apos;ll greet you by name the first time.</small>
+        <small>{jack.assistantName} stays quiet until you call it -- it&apos;ll greet you by name the first time.</small>
       </label>
 
       <div className="section-heading">
-        <h2>How would you like Jack to help?</h2>
+        <h2>How would you like {jack.assistantName} to help?</h2>
       </div>
 
       <div className="mode-grid">
         {MODES.map((mode) => (
           <article key={mode.id}>
             <div className="mode-icon">{mode.icon}</div>
-            <span>{mode.label}</span>
-            <h3>{mode.title}</h3>
-            <p>{mode.description}</p>
+            <span>{mode.id === "askJack" ? `ASK ${jack.assistantName.toUpperCase()}` : mode.label}</span>
+            <h3>{withAssistantName(mode.title, jack.assistantName)}</h3>
+            <p>{withAssistantName(mode.description, jack.assistantName)}</p>
             <button type="button" onClick={() => dispatch({ type: "SELECT_MODE", mode: mode.id })}>
-              {mode.id === "practice" ? "Start a practice" : mode.id === "present" ? "Present with Jack" : "Open conversation"} <b>→</b>
+              {mode.id === "practice" ? "Start a practice" : mode.id === "present" ? `Present with ${jack.assistantName}` : "Open conversation"} <b>→</b>
             </button>
           </article>
         ))}

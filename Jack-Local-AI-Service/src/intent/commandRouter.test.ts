@@ -159,3 +159,22 @@ test("adversarial corpus: no false destructive action from name-confusables or b
   assert.deepEqual(matchDeterministicCommand("next slide"), { type: "action", action: "next_slide" });
   assert.deepEqual(matchDeterministicCommand("pause"), { type: "action", action: "pause_presentation" });
 });
+
+// Multi-persona milestone: the wake word follows whichever assistant name is
+// currently selected (see voiceSettings.ts's VOICE_OPTIONS on the frontend),
+// not always literally "jack" -- passed as matchDeterministicCommand's
+// second argument, defaulting to "jack" when omitted so every test above
+// (and any caller that hasn't been updated) keeps working unchanged.
+test("a non-default assistant name is recognized as the wake word, and 'jack' alone no longer is", () => {
+  assert.deepEqual(matchDeterministicCommand("Nova, stop.", "Nova"), { type: "action", action: "stop_presentation" });
+  assert.deepEqual(matchDeterministicCommand("Hey Nova, next slide.", "Nova"), { type: "action", action: "next_slide" });
+  assert.deepEqual(matchDeterministicCommand("Take over, Nova.", "Nova"), { type: "action", action: "start_presentation" });
+  assert.deepEqual(matchDeterministicCommand("Nova take over again.", "Nova"), { type: "action", action: "start_presentation" });
+  // Addressing the OLD default name while a different one is selected is
+  // just a name-confusable, same as "Jackson"/"Jackie" above -- not a match.
+  assert.deepEqual(matchDeterministicCommand("Jack, stop.", "Nova"), null);
+});
+
+test("matchDeterministicCommand defaults to 'jack' when no assistant name is passed", () => {
+  assert.deepEqual(matchDeterministicCommand("Jack, stop."), { type: "action", action: "stop_presentation" });
+});

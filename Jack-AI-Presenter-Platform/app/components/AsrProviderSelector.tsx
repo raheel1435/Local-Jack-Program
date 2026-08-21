@@ -46,8 +46,9 @@ export function AsrProviderSelector({ titlePrefix }: { titlePrefix?: string }) {
         </button>
       </div>
       <p className="jack-settings-note">
-        Applies everywhere Jack listens (ambient, push-to-talk, Ask Jack, Practice) -- no per-screen override. Test is
-        experimental and never used automatically if unavailable; switch back to Approved if it fails.
+        Applies everywhere {jack.assistantName} listens (ambient, push-to-talk, Ask {jack.assistantName}, Practice) -- no
+        per-screen override. Test is experimental and never used automatically if unavailable; switch back to Approved if
+        it fails.
       </p>
     </div>
   );

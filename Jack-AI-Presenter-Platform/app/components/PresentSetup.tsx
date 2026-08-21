@@ -6,6 +6,11 @@ import type { AudienceQuestionPolicy, ControlMode } from "../jack/types";
 import { LANGUAGE_OPTIONS, VOICE_OPTIONS } from "../jack/voiceSettings";
 import { AsrProviderSelector } from "./AsrProviderSelector";
 
+// Multi-persona milestone: these templates keep the literal word "Jack" --
+// swapped for whichever assistant name is actually selected via
+// withAssistantName() at render time below, same pattern narration.ts and
+// JackProvider's pickGreeting already use, rather than restructuring every
+// entry into a function.
 const CONTROL_MODES: { id: ControlMode; label: string; description: string }[] = [
   { id: "presenterLeads", label: "Presenter leads", description: "You control the slides. Jack speaks only when asked or scheduled." },
   { id: "jackLeads", label: "Jack leads", description: "Jack narrates and advances slides. You can interrupt or take back control anytime." },
@@ -19,9 +24,17 @@ const QUESTION_POLICIES: { id: AudienceQuestionPolicy; label: string }[] = [
   { id: "moderatedQueue", label: "Queue for moderated Q&A" },
 ];
 
+function withAssistantName(text: string, name: string): string {
+  return text.replace(/\bJack\b/g, name);
+}
+
 export function PresentSetup({ onReady, title }: { onReady: () => void; title: string }) {
   const jack = useJack();
   const activeLanguage = LANGUAGE_OPTIONS.find((l) => l.id === jack.language);
+  // Multi-persona milestone: this used to be a hardcoded "Jack" -- now
+  // reflects whichever voice is actually selected below, since that's what
+  // decides the assistant's spoken name (see JackProvider's assistantName).
+  const activeVoiceLabel = VOICE_OPTIONS.find((v) => v.id === jack.voice)?.label ?? "Jack";
 
   // Manual presentation must always be reachable (Phase 9): the presenter
   // proceeds immediately. Jack (OpenAI voice, or the local-command panel
@@ -61,7 +74,7 @@ export function PresentSetup({ onReady, title }: { onReady: () => void; title: s
   return (
     <section className="stage-shell present-setup">
       <div className="jack-stage compact">
-        <div className="orb-wrap"><JackOrb state={jack.orb.orbState} size={140} /></div>
+        <div className="orb-wrap"><JackOrb state={jack.orb.orbState} size={140} name={jack.assistantName} /></div>
         <div className="jack-status">
           <i /> <strong>{jack.orb.label.toUpperCase()}</strong>
           <small>{jack.orb.description}</small>
@@ -81,7 +94,7 @@ export function PresentSetup({ onReady, title }: { onReady: () => void; title: s
                 checked={jack.controlMode === mode.id}
                 onChange={() => jack.setControlMode(mode.id)}
               />
-              <span><strong>{mode.label}</strong><small>{mode.description}</small></span>
+              <span><strong>{withAssistantName(mode.label, jack.assistantName)}</strong><small>{withAssistantName(mode.description, jack.assistantName)}</small></span>
             </label>
           ))}
         </fieldset>
@@ -89,7 +102,7 @@ export function PresentSetup({ onReady, title }: { onReady: () => void; title: s
         <fieldset>
           <legend>Audience questions</legend>
           <select value={jack.audienceQuestionPolicy} onChange={(e) => jack.setAudienceQuestionPolicy(e.target.value as AudienceQuestionPolicy)}>
-            {QUESTION_POLICIES.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
+            {QUESTION_POLICIES.map((p) => <option key={p.id} value={p.id}>{withAssistantName(p.label, jack.assistantName)}</option>)}
           </select>
 
           <label className="setup-checkbox">
@@ -100,7 +113,7 @@ export function PresentSetup({ onReady, title }: { onReady: () => void; title: s
 
         <fieldset>
           <legend>AI presenter</legend>
-          <p className="setup-static">Jack</p>
+          <p className="setup-static">{activeVoiceLabel}</p>
 
           <legend>Language</legend>
           <select value={jack.language} onChange={(e) => jack.setLanguage(e.target.value)}>
@@ -118,12 +131,12 @@ export function PresentSetup({ onReady, title }: { onReady: () => void; title: s
 
           <label className="setup-checkbox">
             <input type="checkbox" checked={jack.captionsEnabled} onChange={(e) => jack.setCaptionsEnabled(e.target.checked)} />
-            Show captions of what Jack says
+            Show captions of what {jack.assistantName} says
           </label>
 
           <label className="setup-checkbox">
             <input type="checkbox" checked={jack.browserFallbackEnabled} onChange={(e) => jack.setBrowserFallbackEnabled(e.target.checked)} />
-            Allow browser voice fallback if Jack&apos;s voice is unreachable
+            Allow browser voice fallback if {jack.assistantName}&apos;s voice is unreachable
           </label>
         </fieldset>
       </div>
@@ -135,7 +148,7 @@ export function PresentSetup({ onReady, title }: { onReady: () => void; title: s
           Start presentation
         </button>
         <p className="setup-note">
-          Manual navigation and typed Jack commands work immediately. Connect the mic from the presentation screen for live OpenAI voice, or type commands to use Jack Local AI instead.
+          Manual navigation and typed {jack.assistantName} commands work immediately. Connect the mic from the presentation screen for live OpenAI voice, or type commands to use Jack Local AI instead.
         </p>
       </div>
     </section>

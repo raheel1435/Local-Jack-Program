@@ -7,6 +7,10 @@ export type LocalHealthLabel = "checking" | "connected" | "offline";
 export type PresentMicLabel = "off" | "preparing" | "listening" | "processing";
 
 export interface JackStatusBarProps {
+  /** Multi-persona milestone: the assistant's current spoken/displayed name
+   * (see JackProvider's assistantName) -- every "Jack" reference in this bar
+   * follows it instead of being hardcoded. */
+  name: string;
   jackState: JackState;
   jackLabel: string;
   /** Jack Local AI gateway health -- the ONE authoritative connection truth for
@@ -66,6 +70,7 @@ function presenceLabel(jackAwake: boolean, micLabel: PresentMicLabel, isPresenti
 const TRANSIENT_JACK_STATES: ReadonlySet<JackState> = new Set(["thinking", "speaking", "acting", "alert"]);
 
 export function JackStatusBar({
+  name,
   jackState,
   jackLabel,
   localHealth,
@@ -87,11 +92,11 @@ export function JackStatusBar({
         type="button"
         className={`sync-item sync-presence ${jackAwake ? "awake" : "sleeping"}`}
         onClick={jackAwake ? onSleep : onWake}
-        aria-label={jackAwake ? "Put Jack to sleep" : "Wake Jack"}
-        title={jackAwake ? "Click to put Jack to sleep" : "Click to wake Jack -- Jack will greet you"}
+        aria-label={jackAwake ? `Put ${name} to sleep` : `Wake ${name}`}
+        title={jackAwake ? `Click to put ${name} to sleep` : `Click to wake ${name} -- ${name} will greet you`}
       >
         <i className={`sync-dot state-${jackState}`} aria-hidden="true" />
-        Jack &middot; {presenceLabel(jackAwake, micLabel, isPresentingAutonomously)}
+        {name} &middot; {presenceLabel(jackAwake, micLabel, isPresentingAutonomously)}
       </button>
       {TRANSIENT_JACK_STATES.has(jackState) && (
         <span className="sync-item" title={jackLabel || JACK_STATES[jackState].label}>
@@ -102,7 +107,7 @@ export function JackStatusBar({
         {LOCAL_HEALTH_LABEL[localHealth]}
       </span>
       <span className="sync-item">
-        Control: <strong>{presenterControl === "jack" ? "Jack" : "Presenter"}</strong>
+        Control: <strong>{presenterControl === "jack" ? name : "Presenter"}</strong>
       </span>
       <span className={`sync-item mic-${micLabel}`}>Mic: {MIC_LABEL[micLabel]}</span>
       <span className="sync-item">Slide: <strong>{slideText}</strong></span>
@@ -110,8 +115,8 @@ export function JackStatusBar({
         type="button"
         className="sync-follow-toggle"
         onClick={onToggleFollowMode}
-        title={followMode === "auto" ? "Jack follows your slide navigation automatically -- click to stop" : "Jack stays on its own slide until you sync -- click to auto-follow again"}
-        aria-label="Toggle whether Jack automatically follows the slide you're viewing"
+        title={followMode === "auto" ? `${name} follows your slide navigation automatically -- click to stop` : `${name} stays on its own slide until you sync -- click to auto-follow again`}
+        aria-label={`Toggle whether ${name} automatically follows the slide you're viewing`}
       >
         {followMode === "auto" ? "Auto-follow: on" : "Auto-follow: off"}
       </button>
@@ -120,10 +125,10 @@ export function JackStatusBar({
           type="button"
           className="sync-action"
           onClick={onSync}
-          title="Jack is following a different slide than the one you're viewing -- click to bring Jack to this slide"
-          aria-label="Sync Jack to this slide"
+          title={`${name} is following a different slide than the one you're viewing -- click to bring ${name} to this slide`}
+          aria-label={`Sync ${name} to this slide`}
         >
-          Sync Jack to this slide
+          Sync {name} to this slide
         </button>
       )}
     </div>

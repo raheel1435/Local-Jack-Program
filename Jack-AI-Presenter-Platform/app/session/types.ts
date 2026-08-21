@@ -48,6 +48,7 @@ export type AnalysisStep =
   | "detecting-structure"
   | "preparing-guidance"
   | "identifying-questions"
+  | "preparing-narration"
   | "done"
   | "failed";
 
@@ -55,6 +56,15 @@ export interface AnalysisProgress {
   fileId: string;
   step: AnalysisStep;
   error?: string;
+  /** Live "x/y slides" progress text -- currently only set during
+   * "preparing-narration", where the step itself can take much longer than
+   * the fixed-duration steps above it. */
+  detail?: string;
+  /** Same "preparing-narration" progress as `detail`, as numbers -- lets the
+   * please-wait overlay's liquid-fill bar compute a fill percentage directly
+   * instead of parsing `detail`'s display text. */
+  narrationDone?: number;
+  narrationTotal?: number;
 }
 
 export type PresentMode = "practice" | "present" | "askJack";
@@ -82,7 +92,7 @@ export type SessionAction =
   | { type: "REMOVE_FILE"; id: string }
   | { type: "START_ANALYSIS" }
   | { type: "ANALYSIS_FILE_ACTIVE"; fileId: string }
-  | { type: "ANALYSIS_STEP"; fileId: string; step: AnalysisStep }
+  | { type: "ANALYSIS_STEP"; fileId: string; step: AnalysisStep; detail?: string; narrationDone?: number; narrationTotal?: number }
   | { type: "ANALYSIS_FILE_DONE"; fileId: string; doc: ParsedDocument }
   | { type: "ANALYSIS_FILE_UNSUPPORTED"; fileId: string; doc: ParsedDocument }
   | { type: "ANALYSIS_FILE_FAILED"; fileId: string; error: string }

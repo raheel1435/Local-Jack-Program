@@ -50,3 +50,16 @@ test("hasSuspiciousRepetition flags Jack's name repeating, not the command verb 
   assert.equal(hasSuspiciousRepetition("Jack, stop, stop, stop!"), false);
   assert.equal(hasSuspiciousRepetition("Jack, next slide."), false);
 });
+
+// Multi-persona milestone: both functions take the currently selected
+// assistant name as an optional second argument (default "jack"), so the
+// same address/repetition logic works for any persona, not just "Jack".
+test("classifyAddress and hasSuspiciousRepetition follow a non-default assistant name", () => {
+  assert.equal(classifyAddress("Nova, next slide.", "Nova"), "direct");
+  assert.equal(classifyAddress("Hey Nova, pause.", "Nova"), "direct");
+  assert.equal(classifyAddress("My friend Nova works in London.", "Nova"), "mention");
+  // "Jack" is just an ordinary word once a different name is selected.
+  assert.equal(classifyAddress("Jack, stop.", "Nova"), "none");
+  assert.equal(hasSuspiciousRepetition("Nova, stop. Nova, stop. Nova, stop.", "Nova"), true);
+  assert.equal(hasSuspiciousRepetition("Nova, stop, stop, stop!", "Nova"), false);
+});

@@ -15,12 +15,15 @@ import { JackPerformancePanel } from "./JackPerformancePanel";
 export function PresentSettingsPopover({ onClose }: { onClose: () => void }) {
   const jack = useJack();
   const activeLanguage = LANGUAGE_OPTIONS.find((l) => l.id === jack.language);
+  // Multi-persona milestone: mirrors PresentSetup's activeVoiceLabel -- the
+  // assistant's name follows whichever voice is selected below.
+  const activeVoiceLabel = VOICE_OPTIONS.find((v) => v.id === jack.voice)?.label ?? "Jack";
 
   return (
     <div className="jack-settings-popover" role="dialog" aria-label="Presentation settings">
       <div className="jack-settings-row">
         <span className="jack-settings-label">AI presenter</span>
-        <span className="jack-settings-static">Jack</span>
+        <span className="jack-settings-static">{activeVoiceLabel}</span>
       </div>
 
       <div className="jack-settings-row">
@@ -59,7 +62,7 @@ export function PresentSettingsPopover({ onClose }: { onClose: () => void }) {
           onChange={(e) => jack.setBrowserFallbackEnabled(e.target.checked)}
         />
       </label>
-      <p className="jack-settings-note">Only used if Jack&apos;s own voice (Kokoro) is unreachable, and only when this is on.</p>
+      <p className="jack-settings-note">Only used if {jack.assistantName}&apos;s own voice (Kokoro) is unreachable, and only when this is on.</p>
 
       <hr className="jack-settings-divider" />
       <AsrProviderSelector titlePrefix="" />

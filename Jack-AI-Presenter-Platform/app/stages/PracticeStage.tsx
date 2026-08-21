@@ -115,7 +115,7 @@ export function PracticeStage() {
       return s.doc ? ok({ matches: searchDocuments(query, [s.doc], s.activeFile.id) }) : ok({ matches: [] });
     },
     showRelevantSource: () => fail("Not available in Practice mode."),
-    queueAudienceQuestion: () => fail("There's no audience in Practice mode — ask Jack directly instead."),
+    queueAudienceQuestion: () => fail(`There's no audience in Practice mode — ask ${jack.assistantName} directly instead.`),
     markQuestionForFollowUp: () => fail("There's no audience in Practice mode."),
     syncJackToCurrentSlide: () => {
       const s = latest.current;
@@ -180,7 +180,7 @@ export function PracticeStage() {
       <div className="practice-header">
         <button type="button" className="text-button" onClick={() => dispatch({ type: "BACK_TO_MODE_SELECT" })}>← Back</button>
         <div className="practice-timer">{formatElapsed(elapsedMs)}</div>
-        <div className="jack-mini"><JackOrb state={jack.orb.orbState} size={52} /></div>
+        <div className="jack-mini"><JackOrb state={jack.orb.orbState} size={52} name={jack.assistantName} /></div>
       </div>
 
       {sections.length === 0 ? (
@@ -214,8 +214,8 @@ export function PracticeStage() {
           onClick={() => jack.setAmbientListeningEnabled(!jack.ambientListeningEnabled)}
           disabled={jack.jackLocalHealth?.whisper === "unavailable"}
           aria-pressed={jack.ambientListeningEnabled}
-          aria-label={jack.ambientListeningEnabled ? "Turn mic off" : "Turn mic on -- ask Jack anything by name while you practice"}
-          title={jack.ambientListeningEnabled ? "Turn mic off" : "Turn mic on -- say “Jack” to ask a question or get an explanation"}
+          aria-label={jack.ambientListeningEnabled ? "Turn mic off" : `Turn mic on -- ask ${jack.assistantName} anything by name while you practice`}
+          title={jack.ambientListeningEnabled ? "Turn mic off" : `Turn mic on -- say "${jack.assistantName}" to ask a question or get an explanation`}
         >
           🎤
         </button>
@@ -225,8 +225,8 @@ export function PracticeStage() {
         {jack.localUnavailable
           ? "Jack Local AI is unavailable — practicing without live AI feedback."
           : jack.ambientListeningEnabled
-            ? "Jack is listening -- say “Jack” to ask a question or get an explanation."
-            : "Jack is ready -- turn the mic on to ask questions by voice, or use typed commands elsewhere."}
+            ? `${jack.assistantName} is listening -- say "${jack.assistantName}" to ask a question or get an explanation.`
+            : `${jack.assistantName} is ready -- turn the mic on to ask questions by voice, or use typed commands elsewhere.`}
       </p>
 
       {devDiagnosticsEnabled && <MicDiagnostics jack={jack} />}

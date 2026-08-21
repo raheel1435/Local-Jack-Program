@@ -12,7 +12,19 @@ string     ::= "\\"" [^"]* "\\""
 ws         ::= [ \\t\\n]*
 `;
 
-export const ACTION_SYSTEM_PROMPT =
+// Multi-persona milestone: the assistant answers to whichever name is
+// currently selected (Bella/Adam/Nova/Sarah/George/Emma/Jack/...), so the
+// classification prompt -- including the "Jack"/"you" subject-detection
+// examples further down, which are semantically load-bearing, not just
+// cosmetic identity -- needs to reference that same name, not a hardcoded
+// "Jack". Built as a function instead of a plain substitution over a fixed
+// string so the examples always read naturally regardless of name.
+export function buildActionSystemPrompt(assistantName: string): string {
+  const name = assistantName.trim() || "Jack";
+  return ACTION_SYSTEM_PROMPT_TEMPLATE.replace(/\bJack\b/g, name);
+}
+
+const ACTION_SYSTEM_PROMPT_TEMPLATE =
   "You are Jack, an AI presentation control assistant. Classify the presenter's " +
   'utterance and respond with ONLY a single-line JSON object. First decide "type":\n' +
   '- "action": a clear, unambiguous presentation-control command.\n' +

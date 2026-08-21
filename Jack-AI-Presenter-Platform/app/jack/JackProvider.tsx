@@ -35,8 +35,9 @@ import { unsupportedController, type PresentationController } from "./presentati
 import { resolveSlideTarget } from "./slideTargetResolver";
 import { createPresentationTools } from "./tools";
 import { createWakeWordService } from "./wakeWordService";
-import { DEFAULT_VOICE_ID } from "./voiceSettings";
+import { DEFAULT_VOICE_ID, VOICE_OPTIONS } from "./voiceSettings";
 import { useSession } from "../session/SessionContext";
+import type { ParsedDocument } from "../session/types";
 import type {
   AudienceQuestionPolicy,
   ConnectionStatus,
@@ -179,9 +180,10 @@ const PROFESSIONAL_GREETINGS = [
   "Ready to begin whenever you are.",
 ];
 
-function pickGreeting(humourEnabled: boolean): string {
+function pickGreeting(humourEnabled: boolean, assistantName = "Jack"): string {
   const bank = humourEnabled ? HUMOROUS_GREETINGS : PROFESSIONAL_GREETINGS;
-  return bank[Math.floor(Math.random() * bank.length)];
+  const greeting = bank[Math.floor(Math.random() * bank.length)];
+  return greeting.replace(/\bJack\b/g, assistantName.trim() || "Jack");
 }
 
 // The very first thing Jack ever says to the presenter, once, for the whole
@@ -273,6 +275,17 @@ export interface JackContextValue {
   language: string;
   /** Kokoro voice id (Phase 8) -- the single source of truth for every Jack-voiced utterance. */
   voice: string;
+  /**
+   * Multi-persona milestone: the assistant's spoken/displayed name, derived
+   * from `voice` (see voiceSettings.ts's VOICE_OPTIONS) -- "Nova" when the
+   * Nova voice is selected, "Jack" for the default/unrecognized case. This
+   * is the single source of truth every UI surface should read from instead
+   * of hardcoding "Jack" -- the wake-word gate, narration self-introduction,
+   * and Q&A prompts already do (see JackProvider's own `assistantName`).
+   * Deliberately does NOT rename the product/app name ("Jack AI" in the
+   * header) -- only the persona the presenter is actually talking to.
+   */
+  assistantName: string;
   /** Default OFF (Phase 3/26): narration/Q&A/acknowledgement text is heard, not shown, unless explicitly enabled. */
   captionsEnabled: boolean;
   /** Default OFF (Phase 10): browser speechSynthesis may only ever be used when explicitly enabled AND Kokoro is unreachable -- never a silent substitute for Jack's real voice. */
@@ -358,6 +371,23 @@ export interface JackContextValue {
    * both ultimately drive the same controller, never raw UI state.
    */
   runLocalCommand(text: string, kind?: "typed" | "voice" | "interruption"): Promise<LocalCommandOutcome>;
+
+  /**
+   * Generates every slide's opening (and, where there's more to say,
+   * continuation) narration text + synthesized audio up front, right after a
+   * document finishes parsing -- instead of only the next slide, generated
+   * just-in-time while the current one plays (see prefetchNextSlideOpening/
+   * runNarrationStep, which still exist as the fallback for anything this
+   * step didn't cover). Meant to be awaited by AnalysisStage before it lets
+   * a file count as fully ready, so the wait happens once during upload
+   * instead of being spread out, one slide at a time, across the live
+   * presentation. `onProgress` reports slides completed so far (1-based) out
+   * of the total, for a live progress indicator during that wait. Best-
+   * effort per slide: a slide whose generation fails is simply left out of
+   * the cache and falls back to runNarrationStep's existing live path when
+   * it's actually reached.
+   */
+  pregenerateDeckNarration(doc: ParsedDocument, onProgress?: (done: number, total: number) => void): Promise<void>;
 
   /** Shared local-recorder state -- reflects whichever of the two arm reasons
    * below is currently holding it (see the arm/disarm effect's comment). */
@@ -500,13 +530,33 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const [presenterName, setPresenterNameState] = useState("");
   const [audienceQuestionPolicy, setAudienceQuestionPolicyState] = useState<AudienceQuestionPolicy>("askPresenterFirst");
   const [humourEnabled, setHumourEnabledState] = useState(true);
-  // Each lazy initializer runs loadPresentSettings() once, only on mount --
-  // cheap (a tiny localStorage JSON.parse), and avoids the ref-during-render
-  // pattern React's rules disallow.
-  const [language, setLanguageState] = useState(() => loadPresentSettings().language);
-  const [voice, setVoiceState] = useState(() => loadPresentSettings().voice);
-  const [captionsEnabled, setCaptionsEnabledState] = useState(() => loadPresentSettings().captionsEnabled);
-  const [browserFallbackEnabled, setBrowserFallbackEnabledState] = useState(() => loadPresentSettings().browserFallbackEnabled);
+  // Bug fix (multi-persona milestone): these four used to lazy-initialize
+  // straight from loadPresentSettings(), which reads localStorage -- on the
+  // server (SSR, no `window`) that always returns DEFAULT_PRESENT_SETTINGS,
+  // but the CLIENT's very first render (the hydration render, not a later
+  // one) already has `window` and reads the REAL persisted value. Nothing
+  // rendered text derived from any of these into the server-rendered markup
+  // before, so the divergence was silent; once assistantName (below) started
+  // being rendered on the very first screen (UploadStage), this became a
+  // real, visible React hydration-mismatch error ("server rendered text
+  // didn't match the client") -- e.g. the orb saying "Bella" for one frame
+  // server-side while the client immediately re-renders "Nova". Both the
+  // server AND the client's first render must now produce the exact same
+  // (default) output; the real persisted values are synced in afterward, in
+  // the effect below, which only ever runs post-hydration.
+  const [language, setLanguageState] = useState(DEFAULT_PRESENT_SETTINGS.language);
+  const [voice, setVoiceState] = useState(DEFAULT_PRESENT_SETTINGS.voice);
+  const [captionsEnabled, setCaptionsEnabledState] = useState(DEFAULT_PRESENT_SETTINGS.captionsEnabled);
+  const [browserFallbackEnabled, setBrowserFallbackEnabledState] = useState(DEFAULT_PRESENT_SETTINGS.browserFallbackEnabled);
+  // Multi-persona milestone: the assistant answers to whichever name goes
+  // with the currently selected voice (Bella/Adam/Nova/Sarah/George/Emma/
+  // Jack/...) -- see voiceSettings.ts's VOICE_OPTIONS. This is the single
+  // source of that name for the whole provider: the wake-word gate, wake
+  // greeting, narration self-introduction, and Q&A prompts all read it from
+  // here so renaming the voice renames every part of Jack's spoken identity
+  // consistently. Falls back to "Jack" for any persisted voice id that isn't
+  // (or isn't yet) in VOICE_OPTIONS.
+  const assistantName = useMemo(() => VOICE_OPTIONS.find((v) => v.id === voice)?.label ?? "Jack", [voice]);
   const persistPresentSettings = useCallback((partial: Partial<PersistedPresentSettings>) => {
     const next = { ...loadPresentSettings(), ...partial };
     savePresentSettings(next);
@@ -539,10 +589,28 @@ export function JackProvider({ children }: { children: ReactNode }) {
     },
     [persistPresentSettings],
   );
-  const [asrProvider, setAsrProviderState] = useState<AsrProviderId>(() => loadAsrProvider());
+  // Same SSR/localStorage hydration hazard as language/voice/captions/
+  // browserFallbackEnabled above -- starts at the fixed default on every
+  // render (server and client's first render alike), synced to the real
+  // persisted value post-hydration in the effect below.
+  const [asrProvider, setAsrProviderState] = useState<AsrProviderId>("whisper");
   const setAsrProvider = useCallback((next: AsrProviderId) => {
     setAsrProviderState(next);
     saveAsrProvider(next);
+  }, []);
+  // Runs exactly once, after mount -- i.e. strictly after hydration, when
+  // `window`/localStorage are safely available and there's no server-
+  // rendered markup left to mismatch against. Pulls in whatever was
+  // actually persisted from a previous session; a fresh session (nothing
+  // persisted yet) leaves every value at the same default it already
+  // rendered, so this is a genuine no-op for first-time visitors.
+  useEffect(() => {
+    const saved = loadPresentSettings();
+    setLanguageState(saved.language);
+    setVoiceState(saved.voice);
+    setCaptionsEnabledState(saved.captionsEnabled);
+    setBrowserFallbackEnabledState(saved.browserFallbackEnabled);
+    setAsrProviderState(loadAsrProvider());
   }, []);
   const [questions, setQuestions] = useState<QueuedQuestion[]>([]);
   const queueQuestion = useCallback((text: string) => {
@@ -613,6 +681,16 @@ export function JackProvider({ children }: { children: ReactNode }) {
     slideIndex: number;
     promise: Promise<{ text: string; audio: Blob } | null>;
   } | null>(null);
+  // Whole-deck narration pre-generation (upload-time milestone): fileId ->
+  // slideIndex -> its opening/continuation, generated up front by
+  // pregenerateDeckNarration instead of one slide ahead during presenting.
+  // A ref (not state) since it's read imperatively inside runNarrationStep
+  // and never needs to trigger a re-render on its own. A slide missing from
+  // the map (generation failed, or this file was never pregenerated) simply
+  // falls through to runNarrationStep's existing live-generation path.
+  const pregeneratedNarrationRef = useRef<
+    Map<string, Map<number, { openingText: string; openingAudio: Blob; continuationText: string | null; continuationAudio: Blob | null }>>
+  >(new Map());
   // Distinct from jackAwake (Phase 8): waking Jack up is a private moment
   // with the presenter; delivering the audience-facing opening happens once
   // per presentation session, the first time Jack actually starts
@@ -1196,9 +1274,9 @@ export function JackProvider({ children }: { children: ReactNode }) {
     // presenterGreetedRef's comment.
     const isFirstEverContact = !presenterGreetedRef.current;
     presenterGreetedRef.current = true;
-    const greeting = isFirstEverContact ? pickFirstContactGreeting(presenterName) : pickGreeting(humourEnabled);
+    const greeting = isFirstEverContact ? pickFirstContactGreeting(presenterName) : pickGreeting(humourEnabled, assistantName);
     await speakAndWait(greeting, traceId);
-  }, [speechPlayer, speakAndWait, humourEnabled, presenterName]);
+  }, [speechPlayer, speakAndWait, humourEnabled, presenterName, assistantName]);
 
   const unlockSpeech = useCallback(() => {
     speechPlayer.unlock();
@@ -1245,6 +1323,62 @@ export function JackProvider({ children }: { children: ReactNode }) {
     localMicLevelRef.current = localRecorder.level;
   }, [localRecorder.level]);
 
+  // Upload-time milestone: generates every slide's opening + continuation
+  // narration (text and synthesized audio) up front, right after parsing,
+  // instead of one slide ahead while presenting. Sequential (one slide's
+  // LLM+TTS round trip after another), matching the same one-at-a-time
+  // pattern prefetchNextSlideOpening already uses -- the local LLM/TTS
+  // providers this app talks to are not built for concurrent requests.
+  // Best-effort per slide: a failure just leaves that slide out of the
+  // cache, so it falls back to runNarrationStep's live-generation path
+  // exactly as it always has.
+  const pregenerateDeckNarration = useCallback(
+    async (doc: ParsedDocument, onProgress?: (done: number, total: number) => void) => {
+      const sections = doc.sections;
+      const total = sections.length;
+      const slideMap = new Map<
+        number,
+        { openingText: string; openingAudio: Blob; continuationText: string | null; continuationAudio: Blob | null }
+      >();
+      for (let i = 0; i < total; i++) {
+        const section = sections[i];
+        const prev = i > 0 ? sections[i - 1] : null;
+        const next = i < total - 1 ? sections[i + 1] : null;
+        const context: PresentationContext = {
+          deckTitle: doc.title,
+          currentSlideNumber: i + 1,
+          totalSlides: total,
+          currentSlideTitle: section.title,
+          currentSlideText: section.text,
+          currentSlideNotes: section.speakerNotes ?? null,
+          previousSlideTitle: prev?.title,
+          previousSlideText: prev?.text,
+          nextSlideTitle: next?.title,
+        };
+        try {
+          // Slide 0 is the only slide that ever gets the self-introduction --
+          // matches runNarrationStep's own presentationOpeningDeliveredRef
+          // logic, which likewise only opens on the very first slide spoken.
+          const openingText = await generateNarrationOpening(context, i === 0, humourEnabled, assistantName);
+          const openingAudio = await jackApi.speak(openingText, voice);
+          let continuationText: string | null = null;
+          let continuationAudio: Blob | null = null;
+          const rawContinuation = await generateNarrationContinuation(context, openingText, humourEnabled, assistantName);
+          if (rawContinuation && !isRedundantContinuation(openingText, rawContinuation)) {
+            continuationText = rawContinuation;
+            continuationAudio = await jackApi.speak(rawContinuation, voice);
+          }
+          slideMap.set(i, { openingText, openingAudio, continuationText, continuationAudio });
+        } catch {
+          // Best-effort -- see this function's own comment above.
+        }
+        onProgress?.(i + 1, total);
+      }
+      pregeneratedNarrationRef.current.set(doc.fileId, slideMap);
+    },
+    [humourEnabled, assistantName, voice],
+  );
+
   // --- Autonomous narration loop (Phase 2-5) ------------------------------
   /** Stops Jack's autonomy safely: audio, pending advance, and any in-flight capture. Does NOT change presenterControl -- callers decide that separately. Safe to call even when nothing is running. */
   const cancelAutonomousPresenting = useCallback(() => {
@@ -1263,7 +1397,10 @@ export function JackProvider({ children }: { children: ReactNode }) {
       clearBargeInArmTimers();
       clearBargeInCaptureTimeout();
       console.log("[mic] stop() called from: cancelAutonomousPresenting");
-      void localRecorder.stop("cancel"); // discard whatever was captured -- cancellation, not a command
+      // .catch here: fire-and-forget by design (nothing awaits the discarded
+      // audio), but an uncaught rejection would otherwise surface as a
+      // stray unhandled-promise-rejection error with nothing to act on it.
+      void localRecorder.stop("cancel").catch(() => {}); // discard whatever was captured -- cancellation, not a command
     }
   }, [stopJackAudio, clearBargeInArmTimers, clearBargeInCaptureTimeout, localRecorder, setBargeInPhaseBoth]);
 
@@ -1283,7 +1420,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       }
       const promise = (async () => {
         try {
-          const text = await generateNarrationOpening(context, false, humourEnabled);
+          const text = await generateNarrationOpening(context, false, humourEnabled, assistantName);
           const audio = await jackApi.speak(text, voice);
           return { text, audio };
         } catch {
@@ -1292,7 +1429,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       })();
       narrationPrefetchRef.current = { generation, slideIndex, promise };
     },
-    [humourEnabled, voice],
+    [humourEnabled, voice, assistantName],
   );
 
   const runNarrationStep = useCallback(
@@ -1346,9 +1483,22 @@ export function JackProvider({ children }: { children: ReactNode }) {
       const prefetchHit = isPrefetchValid(prefetch, { isOpening, generation, slideIndex: resolvedSlideIndex });
       narrationPrefetchRef.current = null;
 
+      // Upload-time milestone: a whole-deck pregeneration (see
+      // pregenerateDeckNarration) beats even a prefetch hit -- it costs
+      // exactly 0ms of THIS narration step's latency, same reasoning as the
+      // prefetch case below, just covering every slide instead of one.
+      const pregenDeck = pregeneratedNarrationRef.current.get(appSessionRef.current.activeFileId ?? "");
+      const pregenSlide = pregenDeck?.get(resolvedSlideIndex);
+
       let opening: { text: string; audio: Blob } | null = null;
       mark(traceId, "llmRequestStart"); // T12
-      if (prefetchHit && prefetch) {
+      if (pregenSlide) {
+        mark(traceId, "llmFirstToken"); // T13 -- opening text was ready via upload-time pregeneration
+        mark(traceId, "ttsRequestStart"); // T15
+        mark(traceId, "ttsResponseReady");
+        opening = { text: pregenSlide.openingText, audio: pregenSlide.openingAudio };
+        setTraceLabel(traceId, `[pregenerated] ${pregenSlide.openingText}`);
+      } else if (prefetchHit && prefetch) {
         const result = await prefetch.promise;
         if (!stillCurrent()) {
           finishTrace(traceId, false);
@@ -1369,7 +1519,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       }
       if (!opening) {
         try {
-          const text = await generateNarrationOpening(context, isOpening, humourEnabled);
+          const text = await generateNarrationOpening(context, isOpening, humourEnabled, assistantName);
           mark(traceId, "llmFirstToken"); // T13 -- opening sentence text ready (genuinely measurable now, unlike the old single-shot call)
           if (!stillCurrent()) {
             finishTrace(traceId, false);
@@ -1402,22 +1552,34 @@ export function JackProvider({ children }: { children: ReactNode }) {
       // this slide's narration (if any) and the NEXT slide's opening
       // prefetch both happen concurrently with what the audience is
       // currently hearing, never blocking it.
-      const continuationPromise = (async () => {
-        try {
-          const text = await generateNarrationContinuation(context, opening!.text, humourEnabled);
-          // Empty (model judged the opening already complete) or a
-          // near-duplicate of the opening (the model didn't reliably follow
-          // that instruction -- see isRedundantContinuation's comment) are
-          // both treated the same way: no continuation, opening alone is a
-          // complete, honest utterance.
-          if (!text || isRedundantContinuation(opening!.text, text)) return null;
-          const audio = await jackApi.speak(text, voice);
-          return { text, audio };
-        } catch {
-          return null; // best-effort -- losing the continuation still leaves a real (if shorter) narration
-        }
-      })();
-      prefetchNextSlideOpening(generation, resolvedSlideIndex + 1);
+      const continuationPromise: Promise<{ text: string; audio: Blob } | null> = pregenSlide
+        ? Promise.resolve(
+            pregenSlide.continuationText && pregenSlide.continuationAudio
+              ? { text: pregenSlide.continuationText, audio: pregenSlide.continuationAudio }
+              : null,
+          )
+        : (async () => {
+            try {
+              const text = await generateNarrationContinuation(context, opening!.text, humourEnabled, assistantName);
+              // Empty (model judged the opening already complete) or a
+              // near-duplicate of the opening (the model didn't reliably follow
+              // that instruction -- see isRedundantContinuation's comment) are
+              // both treated the same way: no continuation, opening alone is a
+              // complete, honest utterance.
+              if (!text || isRedundantContinuation(opening!.text, text)) return null;
+              const audio = await jackApi.speak(text, voice);
+              return { text, audio };
+            } catch {
+              return null; // best-effort -- losing the continuation still leaves a real (if shorter) narration
+            }
+          })();
+      // No need to speculatively prefetch the next slide when it's already
+      // sitting in the whole-deck pregeneration cache -- would just be a
+      // wasted LLM+TTS round trip nothing will ever consume, since the
+      // pregen check above always takes priority over a prefetch hit anyway.
+      if (!pregenDeck?.has(resolvedSlideIndex + 1)) {
+        prefetchNextSlideOpening(generation, resolvedSlideIndex + 1);
+      }
 
       const advanceToNextSlide = () => {
         if (!stillCurrent()) return;
@@ -1468,7 +1630,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
         })();
       });
     },
-    [cancelAutonomousPresenting, dispatchEvent, speechPlayer, voice, humourEnabled, prefetchNextSlideOpening],
+    [cancelAutonomousPresenting, dispatchEvent, speechPlayer, voice, humourEnabled, prefetchNextSlideOpening, assistantName],
   );
 
   // `slideIndex`, when given, is the AUTHORITATIVE slide to resume/start
@@ -1505,7 +1667,12 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // real command; see addressing.ts's module comment for the live false-stop
   // it reproduced. classifyJackAddress distinguishes "Jack, stop." (direct)
   // from "the slide explains why Jack stopped" (mention) structurally.
-  const isAddressedToJack = useCallback((transcript: string) => isDirectlyAddressedToJack(transcript), []);
+  // Multi-persona milestone: the wake word is whichever assistant name is
+  // currently selected (see assistantName above), not always "Jack".
+  const isAddressedToJack = useCallback(
+    (transcript: string) => isDirectlyAddressedToJack(transcript, assistantName),
+    [assistantName],
+  );
 
   // --- Barge-in: capture finished (silence/timeout) -> transcribe -> route ---
   //
@@ -1528,7 +1695,25 @@ export function JackProvider({ children }: { children: ReactNode }) {
     setBargeInPhaseBoth("processing");
     clearBargeInCaptureTimeout();
     console.log("[mic] stop() called from: finishBargeInCapture", { closeReason });
-    const audio = await localRecorder.stop(closeReason);
+    // Bug fix: localRecorder.stop() used to be awaited outside any try/catch
+    // here. useLocalRecorder's teardown() is now hardened not to throw (see
+    // its own comment), but this is defense in depth for the same failure
+    // mode either way -- a rejection here used to propagate as an unhandled
+    // promise rejection AND permanently strand bargeInPhase at "processing"
+    // (every reset lives below this line), since nothing ever called it
+    // fresh again. The mic UI would show "Processing" forever with no
+    // recovery short of a page reload.
+    let audio: Blob | null;
+    try {
+      audio = await localRecorder.stop(closeReason);
+    } catch (err) {
+      abortTrace(traceId);
+      bargeInTraceIdRef.current = undefined;
+      setBargeInPhaseBoth("idle");
+      dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
+      setLastError(err instanceof Error ? err.message : "Microphone capture failed.");
+      return;
+    }
     mark(traceId, "captureFinalized"); // T3
     if (!audio) {
       abortTrace(traceId);
@@ -1552,7 +1737,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       // TTS is genuinely high-confidence/well-formed, so it would otherwise
       // sail through both the address gate AND commandRouter.ts's
       // deterministic patterns exactly like a real command).
-      const selfEcho = transcript ? isSelfEcho(transcript, getRecentJackSpeech()) : false;
+      const selfEcho = transcript ? isSelfEcho(transcript, getRecentJackSpeech(), assistantName) : false;
       if (!transcript || !isAddressedToJack(transcript) || selfEcho) {
         // Ambient noise / background speech that never named Jack, or
         // Jack's own voice leaking back into the mic -- ignore it entirely
@@ -1589,7 +1774,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       setLastError(err instanceof Error ? err.message : "Transcription failed.");
       recordAsrDiagnostic({ provider: asrProvider, transcript: "", latencyMs: 0, success: false });
     }
-  }, [clearBargeInCaptureTimeout, localRecorder, dispatchEvent, setBargeInPhaseBoth, isAddressedToJack, getRecentJackSpeech, asrProvider, recordAsrDiagnostic]);
+  }, [clearBargeInCaptureTimeout, localRecorder, dispatchEvent, setBargeInPhaseBoth, isAddressedToJack, getRecentJackSpeech, asrProvider, recordAsrDiagnostic, assistantName]);
 
   // Safe-interruption fix (latency-fix milestone): detecting sound crossing
   // the barge-in threshold must NOT touch Jack's in-progress narration --
@@ -1728,7 +1913,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       setBargeInPhaseBoth("idle");
       clearBargeInArmTimers();
       console.log("[mic] stop() called from: disarm effect", { attentionState, presenterControl });
-      void localRecorder.stop("route_change");
+      void localRecorder.stop("route_change").catch(() => {}); // fire-and-forget -- see cancelAutonomousPresenting's matching comment
     }
     // "capturing" and "processing" are left alone here; handleBargeInDetected/finishBargeInCapture own those transitions.
   }, [attentionState, presenterControl, ambientListeningEnabled, localRecorder, clearBargeInArmTimers, setBargeInPhaseBoth, capturePolicy]);
@@ -1796,7 +1981,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
           await wakeJackLocal();
         }
         mark(traceId, "intentRequestStart"); // T6
-        const intent = await jackApi.detectIntent(text);
+        const intent = await jackApi.detectIntent(text, assistantName);
         mark(traceId, "intentResultReady"); // T7
         dispatchEvent({ type: "LOCAL_COMMAND_ACTING" });
 
@@ -1895,6 +2080,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
             Object.values(parsedDocs),
             activeFileId,
             inAskJackMode,
+            assistantName,
           );
           mark(traceId, "llmResponseReady"); // T14
           dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
@@ -2093,6 +2279,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       audienceQuestionPolicy,
       queueQuestion,
       controlMode,
+      assistantName,
     ],
   );
 
@@ -2151,7 +2338,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
 
   const value: JackContextValue = {
     attentionState,
-    orb: toOrbPresentation(attentionState),
+    orb: toOrbPresentation(attentionState, assistantName),
     connectionStatus,
     micStatus,
     micLevel,
@@ -2205,6 +2392,8 @@ export function JackProvider({ children }: { children: ReactNode }) {
     unregisterController,
     endSession,
     runLocalCommand,
+    pregenerateDeckNarration,
+    assistantName,
     localMicState: localRecorder.state,
     localMicLevel: localRecorder.level,
     localMicError: localRecorder.error,

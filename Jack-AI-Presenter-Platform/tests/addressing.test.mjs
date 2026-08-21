@@ -111,3 +111,21 @@ test("self-echo: the exclusion list does not defeat detection of the original mo
   const recent = [{ text: "Got it. I'll take it from here.", at: Date.now() }];
   assert.equal(isSelfEcho("Jack, I'll take it from here.", recent), true);
 });
+
+// Multi-persona milestone: the wake word follows whichever assistant name is
+// currently selected, passed as the optional second argument (default
+// "jack"), so classifyJackAddress/isDirectlyAddressedToJack/isSelfEcho work
+// identically for any persona.
+test("classifyJackAddress and isDirectlyAddressedToJack follow a non-default assistant name", () => {
+  assert.equal(classifyJackAddress("Nova, next slide.", "Nova"), "direct");
+  assert.equal(classifyJackAddress("Hey Nova, pause.", "Nova"), "direct");
+  assert.equal(classifyJackAddress("My friend Nova works in London.", "Nova"), "mention");
+  assert.equal(classifyJackAddress("Jack, stop.", "Nova"), "none");
+  assert.equal(isDirectlyAddressedToJack("Nova, stop.", "Nova"), true);
+  assert.equal(isDirectlyAddressedToJack("Jack, stop.", "Nova"), false);
+});
+
+test("isSelfEcho excludes the currently selected assistant name from content-word overlap, same as the default 'jack'", () => {
+  const recent = [{ text: "Nova, I'll take it from here.", at: Date.now() }];
+  assert.equal(isSelfEcho("Nova, I'll take it from here.", recent, "Nova"), true);
+});

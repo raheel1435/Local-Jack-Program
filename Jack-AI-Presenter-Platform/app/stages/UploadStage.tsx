@@ -2,11 +2,13 @@
 
 import { useRef, useState, type ChangeEvent, type DragEvent } from "react";
 import { JackOrb } from "../JackOrb";
+import { useJack } from "../jack/JackProvider";
 import { ACCEPTED_EXTENSIONS, formatFileSize, validateAndDedupeFiles, type ValidationRejection } from "../lib/validation";
 import { useSession } from "../session/SessionContext";
 
 export function UploadStage() {
   const { session, dispatch } = useSession();
+  const jack = useJack();
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
   const [rejections, setRejections] = useState<ValidationRejection[]>([]);
@@ -38,17 +40,17 @@ export function UploadStage() {
       <div className="stage-hero">
         <div className="jack-stage">
           <div className="orb-wrap">
-            <JackOrb state="available" size={160} />
+            <JackOrb state="available" size={160} name={jack.assistantName} />
           </div>
           <div className="jack-status">
-            <i /> <strong>JACK IS AVAILABLE</strong>
+            <i /> <strong>{jack.assistantName.toUpperCase()} IS AVAILABLE</strong>
             <small>Ready to look at what you bring</small>
           </div>
         </div>
         <div className="stage-copy">
           <div className="eyebrow"><i /> YOUR AI PRESENTATION PARTNER</div>
-          <h1>Bring what you already have.<br /><span>Jack gets you ready.</span></h1>
-          <p>Upload existing PowerPoint, PDF, or Word files. Jack reads them, prepares speaker guidance, and stays with you through practice and the real thing.</p>
+          <h1>Bring what you already have.<br /><span>{jack.assistantName} gets you ready.</span></h1>
+          <p>Upload existing PowerPoint, PDF, or Word files. {jack.assistantName} reads them, prepares speaker guidance, and stays with you through practice and the real thing.</p>
         </div>
       </div>
 
@@ -124,7 +126,7 @@ export function UploadStage() {
       )}
 
       <p className="privacy-note">
-        Your files stay in this browser session — Jack analyzes them locally and nothing is uploaded to an external service.
+        Your files stay in this browser session — {jack.assistantName} analyzes them locally and nothing is uploaded to an external service.
       </p>
     </section>
   );

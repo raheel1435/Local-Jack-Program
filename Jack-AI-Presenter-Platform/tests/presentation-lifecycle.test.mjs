@@ -124,6 +124,20 @@ test("narration prompt for a continuation explicitly forbids re-introducing Jack
   assert.doesNotMatch(prompt, /very first thing you will say/i);
 });
 
+// Multi-persona milestone: passing a non-default assistant name renames
+// every reference to "Jack" in the prompt, including the self-introduction
+// example and the "do NOT reintroduce yourself as ___" instruction.
+test("narration prompt follows a non-default assistant name throughout, opening and continuation alike", () => {
+  const opening = narrationSystemPrompt(true, false, "Nova");
+  assert.match(opening, /You are Nova, an AI co-presenter/);
+  assert.match(opening, /I'm Nova, and I'll be/);
+  assert.doesNotMatch(opening, /\bJack\b/);
+
+  const continuation = narrationSystemPrompt(false, false, "Nova");
+  assert.match(continuation, /do NOT reintroduce yourself as Nova/);
+  assert.doesNotMatch(continuation, /\bJack\b/);
+});
+
 test("narration prompt discourages stating the slide number regardless of opening/continuation", () => {
   assert.match(narrationSystemPrompt(true, false), /Do not state the slide/i);
   assert.match(narrationSystemPrompt(false, false), /Do not state the slide/i);

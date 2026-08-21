@@ -35,46 +35,65 @@ interface ConversationRule {
 // recognized, as a plain string substitution into each pattern source
 // (regex literals can't interpolate a shared fragment directly).
 const HEY = "(?:(?:hey|ok(?:ay)?|yo)[,]?\\s+)?";
-function withHey(source: string): RegExp {
-  return new RegExp(source.replace(/JACK/g, `${HEY}jack`));
+
+// Multi-persona milestone: every pattern that used to hardcode the literal
+// word "jack" now takes the currently selected assistant name instead
+// (Bella/Adam/Nova/Sarah/George/Emma/Jack/...), via the same JACK placeholder
+// substitution these pattern sources already used. Regex-escaped since a
+// name is presenter-facing text, not a hand-written pattern.
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-const ACTION_RULES: ActionRule[] = [
+function withHey(source: string, name: string): RegExp {
+  return new RegExp(source.replace(/JACK/g, `${HEY}${name}`));
+}
+
+// For the couple of patterns where the name TRAILS the command instead of
+// leading it ("take over, Jack.") -- the HEY greeting filler is meaningless
+// there (a greeting always leads), so this is the same JACK-placeholder
+// substitution without it.
+function withName(source: string, name: string): RegExp {
+  return new RegExp(source.replace(/JACK/g, name));
+}
+
+function buildActionRules(name: string): ActionRule[] {
+  return [
   {
     type: "action",
     action: "start_presentation",
     patterns: [
-      withHey("^(JACK,?\\s+)?(start|begin)( the)? presentation\\.?$"),
+      withHey("^(JACK,?\\s+)?(start|begin)( the)? presentation\\.?$", name),
       // "Jack, take over" hands presenting duties TO Jack -- distinct from
       // "I'll take over"/"give me control" below, which hand them back.
       // "take ?over" (space optional): whisper.cpp reproducibly transcribes
       // this exact phrase as the compound word "takeover" -- observed live
       // during real-hardware voice testing, not a hypothetical.
-      withHey("^JACK,?\\s+(take ?over|you (take it|present this|take ?over|handle it)|please present)( now| again)?\\.?$"),
+      withHey("^JACK,?\\s+(take ?over|you (take it|present this|take ?over|handle it)|please present)( now| again)?\\.?$", name),
       // "again" specifically -- confirmed live the LLM fallback inverted
       // "Jack take over again." to handoff_to_presenter (the OPPOSITE
       // meaning) when it fell through un-anchored by an explicit pattern;
       // this is the same repeat-takeover-in-one-session case as Phase 14/17.
       // Name trails here ("...again, Jack") so the HEY filler (a greeting,
       // always leads) doesn't apply to this one.
-      /^take ?over again,?\s*jack\.?$/,
+      withName("^take ?over again,?\\s*JACK\\.?$", name),
       // Realistic phrasing variants, all still addressed TO Jack (subject is
       // "you"/"Jack", never "I"/"I'll") -- confirmed live that without these,
       // "Jack take over from here." fell through to the LLM, which
       // misclassified it as handoff_to_presenter (the OPPOSITE of what it
       // means) by pattern-matching on "take it/take over from here" too
       // loosely against "I'll take it from here" below.
-      withHey("^(JACK,?\\s+)?take ?over from (here|there)\\.?$"),
+      withHey("^(JACK,?\\s+)?take ?over from (here|there)\\.?$", name),
       /^you (can )?take it from (here|there)\.?$/,
-      withHey("^JACK,?\\s+you present( this)?( now)?\\.?$"),
-      withHey("^JACK,?\\s+continue( the presentation)?\\.?$"),
+      withHey("^JACK,?\\s+you present( this)?( now)?\\.?$", name),
+      withHey("^JACK,?\\s+continue( the presentation)?\\.?$", name),
       // "Jack, present this." (no "you"), "Take over, Jack." (name trails,
       // not leads), "You can present from here." -- confirmed live via
       // direct /jack/intent calls that the LLM fallback either inverted
       // these (returned handoff_to_presenter, the opposite meaning) or
       // classified them as non-actionable "conversation".
-      withHey("^JACK,?\\s+present( this)?( now)?\\.?$"),
-      /^take ?over,?\s*jack\.?$/,
+      withHey("^JACK,?\\s+present( this)?( now)?\\.?$", name),
+      withName("^take ?over,?\\s*JACK\\.?$", name),
       /^you (can )?present( this)? from (here|there)\.?$/,
     ],
   },
@@ -82,26 +101,26 @@ const ACTION_RULES: ActionRule[] = [
     type: "action",
     action: "next_slide",
     patterns: [
-      withHey("^(JACK,?\\s+)?next( slide)?\\.?$"),
-      withHey("^(JACK,?\\s+)?(go|move) (to the )?next( slide)?\\.?$"),
+      withHey("^(JACK,?\\s+)?next( slide)?\\.?$", name),
+      withHey("^(JACK,?\\s+)?(go|move) (to the )?next( slide)?\\.?$", name),
     ],
   },
   {
     type: "action",
     action: "previous_slide",
     patterns: [
-      withHey("^(JACK,?\\s+)?(go )?back\\.?$"),
-      withHey("^(JACK,?\\s+)?previous( slide)?\\.?$"),
-      withHey("^(JACK,?\\s+)?(go|move) (to the )?previous( slide)?\\.?$"),
+      withHey("^(JACK,?\\s+)?(go )?back\\.?$", name),
+      withHey("^(JACK,?\\s+)?previous( slide)?\\.?$", name),
+      withHey("^(JACK,?\\s+)?(go|move) (to the )?previous( slide)?\\.?$", name),
     ],
   },
   {
     type: "action",
     action: "pause_presentation",
     patterns: [
-      withHey("^(JACK,?\\s+)?pause\\.?$"),
-      withHey("^(JACK,?\\s+)?pause( the)? presentation\\.?$"),
-      withHey("^JACK,?\\s+wait\\.?$"),
+      withHey("^(JACK,?\\s+)?pause\\.?$", name),
+      withHey("^(JACK,?\\s+)?pause( the)? presentation\\.?$", name),
+      withHey("^JACK,?\\s+wait\\.?$", name),
       /^wait\.?$/,
       /^hold on\.?$/,
     ],
@@ -117,9 +136,9 @@ const ACTION_RULES: ActionRule[] = [
       // code, not a behavior change. "Resume"/"keep going"/"carry on" have
       // no such conflict.
       /^(continue|resume)\.?$/,
-      withHey("^(JACK,?\\s+)?resume\\.?$"),
-      withHey("^(JACK,?\\s+)?(keep going|carry on)\\.?$"),
-      withHey("^(JACK,?\\s+)?resume( the)? presentation\\.?$"),
+      withHey("^(JACK,?\\s+)?resume\\.?$", name),
+      withHey("^(JACK,?\\s+)?(keep going|carry on)\\.?$", name),
+      withHey("^(JACK,?\\s+)?resume( the)? presentation\\.?$", name),
     ],
   },
   {
@@ -131,9 +150,9 @@ const ACTION_RULES: ActionRule[] = [
       // perfectly but was falling through to the LLM fallback un-anchored
       // by "jack,", which classified it as plain "conversation" (no action
       // at all), same failure class as "Jack, I'll continue." below.
-      withHey("^(JACK,?\\s+)?i('| wi)ll take ?over( now)?\\.?$"),
-      withHey("^(JACK,?\\s+)?i('| wi)ll take it from (here|there)\\.?$"),
-      withHey("^(JACK,?\\s+)?i('| wi)ll continue\\.?$"),
+      withHey("^(JACK,?\\s+)?i('| wi)ll take ?over( now)?\\.?$", name),
+      withHey("^(JACK,?\\s+)?i('| wi)ll take it from (here|there)\\.?$", name),
+      withHey("^(JACK,?\\s+)?i('| wi)ll continue\\.?$", name),
       /^(give|hand)( me| back)? (the )?control( back)?\.?$/,
       // "Give it back to me." -- confirmed live the LLM fallback returned a
       // bare "conversation" with no action at all for this phrasing.
@@ -146,7 +165,7 @@ const ACTION_RULES: ActionRule[] = [
     type: "action",
     action: "stop_presentation",
     patterns: [
-      withHey("^(JACK,?\\s+)?stop( presenting)?\\.?$"),
+      withHey("^(JACK,?\\s+)?stop( presenting)?\\.?$", name),
       /^end( the)? presentation\.?$/,
     ],
   },
@@ -161,20 +180,22 @@ const ACTION_RULES: ActionRule[] = [
     // gate in routes/intent.ts applies to.
     type: "action",
     action: "explain_slide",
-    patterns: [withHey("^JACK,?\\s+explain( this| the)? slide\\.?$")],
+    patterns: [withHey("^JACK,?\\s+explain( this| the)? slide\\.?$", name)],
   },
   {
     type: "action",
     action: "summarize_slide",
-    patterns: [withHey("^JACK,?\\s+summar(ize|ise)( this| the)? slide\\.?$")],
+    patterns: [withHey("^JACK,?\\s+summar(ize|ise)( this| the)? slide\\.?$", name)],
   },
-];
+  ];
+}
 
 // Common conversational filler that must never be allowed to reach the
 // LLM's action grammar -- guaranteed-correct fast path for the cases the
 // safety regression suite explicitly requires, rather than trusting model
 // variance for the most common ones.
-const CONVERSATION_RULES: ConversationRule[] = [
+function buildConversationRules(name: string): ConversationRule[] {
+  return [
   {
     type: "conversation",
     patterns: [
@@ -186,10 +207,29 @@ const CONVERSATION_RULES: ConversationRule[] = [
       /^what do you think\??$/,
       /^can you tell me more\??$/,
       /^why is (that|this) important\??$/,
-      /^(hi|hello|hey)( jack)?\.?$/,
+      withName("^(hi|hello|hey)( JACK)?\\.?$", name),
     ],
   },
-];
+  ];
+}
+
+const actionRuleCache = new Map<string, ActionRule[]>();
+const conversationRuleCache = new Map<string, ConversationRule[]>();
+
+function rulesFor(rawName: string): { action: ActionRule[]; conversation: ConversationRule[] } {
+  const key = escapeRegExp(rawName.trim().toLowerCase()) || "jack";
+  let action = actionRuleCache.get(key);
+  if (!action) {
+    action = buildActionRules(key);
+    actionRuleCache.set(key, action);
+  }
+  let conversation = conversationRuleCache.get(key);
+  if (!conversation) {
+    conversation = buildConversationRules(key);
+    conversationRuleCache.set(key, conversation);
+  }
+  return { action, conversation };
+}
 
 /**
  * A single bare word that didn't match any action or conversation pattern
@@ -240,7 +280,7 @@ function isNonSpeechArtifact(normalized: string): boolean {
  * word (see isBareWordFragment), which fails safe to "unknown" without
  * ever reaching the LLM's more permissive "conversation" guess.
  */
-export function matchDeterministicCommand(text: string): DeterministicMatch | null {
+export function matchDeterministicCommand(text: string, assistantName = "jack"): DeterministicMatch | null {
   const normalized = text.trim().toLowerCase();
   if (!normalized) return { type: "unknown" };
 
@@ -254,6 +294,8 @@ export function matchDeterministicCommand(text: string): DeterministicMatch | nu
   if (hasNegation(normalized)) {
     return { type: "conversation" };
   }
+
+  const { action: ACTION_RULES, conversation: CONVERSATION_RULES } = rulesFor(assistantName);
 
   for (const rule of ACTION_RULES) {
     if (rule.patterns.some((p) => p.test(normalized))) {

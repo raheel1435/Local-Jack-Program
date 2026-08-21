@@ -6,9 +6,12 @@ export interface SubtitleBarProps {
   speech: UseSpeechResult;
   onPlay: () => void;
   playLabel?: string;
+  /** Multi-persona milestone: the assistant's current spoken/displayed name (see JackProvider's assistantName). */
+  name?: string;
 }
 
-export function SubtitleBar({ speech, onPlay, playLabel = "Play with Jack's voice" }: SubtitleBarProps) {
+export function SubtitleBar({ speech, onPlay, playLabel, name = "Jack" }: SubtitleBarProps) {
+  const resolvedPlayLabel = playLabel ?? `Play with ${name}'s voice`;
   if (!speech.supported) {
     return (
       <div className="subtitle-bar unsupported" role="status">
@@ -21,17 +24,17 @@ export function SubtitleBar({ speech, onPlay, playLabel = "Play with Jack's voic
     <div className="subtitle-bar">
       <div className="subtitle-controls">
         {!speech.isSpeaking && (
-          <button type="button" className="speech-btn primary" onClick={onPlay} aria-label={playLabel}>
+          <button type="button" className="speech-btn primary" onClick={onPlay} aria-label={resolvedPlayLabel}>
             ▶ Play
           </button>
         )}
         {speech.isSpeaking && !speech.isPaused && (
-          <button type="button" className="speech-btn" onClick={speech.pause} aria-label="Pause Jack's voice">
+          <button type="button" className="speech-btn" onClick={speech.pause} aria-label={`Pause ${name}'s voice`}>
             ❚❚ Pause
           </button>
         )}
         {speech.isSpeaking && speech.isPaused && (
-          <button type="button" className="speech-btn" onClick={speech.resume} aria-label="Resume Jack's voice">
+          <button type="button" className="speech-btn" onClick={speech.resume} aria-label={`Resume ${name}'s voice`}>
             ▶ Resume
           </button>
         )}
@@ -39,7 +42,7 @@ export function SubtitleBar({ speech, onPlay, playLabel = "Play with Jack's voic
           type="button"
           className="speech-btn"
           onClick={speech.stop}
-          aria-label="Stop Jack's voice"
+          aria-label={`Stop ${name}'s voice`}
           disabled={!speech.isSpeaking}
         >
           ■ Stop

@@ -42,41 +42,48 @@ export function AskJackStage() {
     latest.current = { docs, activeFileId };
   });
 
+  // Multi-persona milestone: "Ask Jack" is both this mode's display name and
+  // literally embeds the assistant's own name -- interpolated once here at
+  // mount, same as every other value this ref captures (this controller was
+  // already never live-rebuilt on later prop changes, unlike PresentStage's
+  // fresher latest.current-backed methods, so this matches existing
+  // behavior rather than introducing a new staleness case).
+  const askModeName = `Ask ${jack.assistantName}`;
   const controllerRef = useRef<PresentationController>({
-    modeName: "Ask Jack",
+    modeName: askModeName,
     getPresentationContext: () => {
       const s = latest.current;
-      return ok({ title: "Ask Jack", totalSlides: s.docs.length, currentSlideIndex: 0, mode: "askJack" });
+      return ok({ title: askModeName, totalSlides: s.docs.length, currentSlideIndex: 0, mode: "askJack" });
     },
-    startPresentation: () => fail("There's no presentation to start in Ask Jack mode."),
-    pausePresentation: () => fail("Not applicable in Ask Jack mode."),
-    resumePresentation: () => fail("Not applicable in Ask Jack mode."),
+    startPresentation: () => fail(`There's no presentation to start in ${askModeName} mode.`),
+    pausePresentation: () => fail(`Not applicable in ${askModeName} mode.`),
+    resumePresentation: () => fail(`Not applicable in ${askModeName} mode.`),
     endPresentation: () => ok({ ended: true as const }),
-    goToNextSlide: () => fail("There are no slides in Ask Jack mode."),
-    goToPreviousSlide: () => fail("There are no slides in Ask Jack mode."),
-    goToSlide: () => fail("There are no slides in Ask Jack mode."),
-    getCurrentSlide: () => fail("There are no slides in Ask Jack mode."),
-    getSlideContent: () => fail("There are no slides in Ask Jack mode."),
-    getSpeakerNotes: () => fail("There are no speaker notes in Ask Jack mode."),
-    showSpeakerNotes: () => fail("Not applicable in Ask Jack mode."),
-    hideSpeakerNotes: () => fail("Not applicable in Ask Jack mode."),
-    takePresentationControl: () => fail("Not applicable in Ask Jack mode."),
-    handControlToPresenter: () => fail("Not applicable in Ask Jack mode."),
-    setPresentationPace: () => fail("Not applicable in Ask Jack mode."),
+    goToNextSlide: () => fail(`There are no slides in ${askModeName} mode.`),
+    goToPreviousSlide: () => fail(`There are no slides in ${askModeName} mode.`),
+    goToSlide: () => fail(`There are no slides in ${askModeName} mode.`),
+    getCurrentSlide: () => fail(`There are no slides in ${askModeName} mode.`),
+    getSlideContent: () => fail(`There are no slides in ${askModeName} mode.`),
+    getSpeakerNotes: () => fail(`There are no speaker notes in ${askModeName} mode.`),
+    showSpeakerNotes: () => fail(`Not applicable in ${askModeName} mode.`),
+    hideSpeakerNotes: () => fail(`Not applicable in ${askModeName} mode.`),
+    takePresentationControl: () => fail(`Not applicable in ${askModeName} mode.`),
+    handControlToPresenter: () => fail(`Not applicable in ${askModeName} mode.`),
+    setPresentationPace: () => fail(`Not applicable in ${askModeName} mode.`),
     getRemainingTime: () => ok({ remainingMs: null, message: "No time limit is set." }),
     searchUploadedDocuments: (query) => {
       const s = latest.current;
       return ok({ matches: searchDocuments(query, s.docs, s.activeFileId) });
     },
     showRelevantSource: () => ok({ shown: true as const }),
-    queueAudienceQuestion: () => fail("Not applicable in Ask Jack mode."),
-    markQuestionForFollowUp: () => fail("Not applicable in Ask Jack mode."),
-    syncJackToCurrentSlide: () => fail("Not applicable in Ask Jack mode."),
-    setAudienceQuestionPolicy: () => fail("Not applicable in Ask Jack mode."),
+    queueAudienceQuestion: () => fail(`Not applicable in ${askModeName} mode.`),
+    markQuestionForFollowUp: () => fail(`Not applicable in ${askModeName} mode.`),
+    syncJackToCurrentSlide: () => fail(`Not applicable in ${askModeName} mode.`),
+    setAudienceQuestionPolicy: () => fail(`Not applicable in ${askModeName} mode.`),
   });
 
   useEffect(() => {
-    jack.registerController("Ask Jack", controllerRef.current);
+    jack.registerController(askModeName, controllerRef.current);
     return () => {
       jack.unregisterController();
       jack.sleepJackLocal();
@@ -123,7 +130,7 @@ export function AskJackStage() {
       <button type="button" className="text-button back-link" onClick={() => dispatch({ type: "BACK_TO_MODE_SELECT" })}>← Back</button>
 
       <div className="jack-stage compact">
-        <div className="orb-wrap"><JackOrb state={jack.orb.orbState} size={140} /></div>
+        <div className="orb-wrap"><JackOrb state={jack.orb.orbState} size={140} name={jack.assistantName} /></div>
         <div className="jack-status">
           <i /> <strong>{jack.orb.label.toUpperCase()}</strong>
           <small>{jack.localUnavailable ? "Jack Local AI is unavailable — offline keyword search only" : "Ask about anything you uploaded"}</small>
@@ -144,15 +151,15 @@ export function AskJackStage() {
 
       <div className="ask-jack-conversation" aria-live="polite">
         {history.length === 0 && (
-          <p className="ask-jack-empty">Ask Jack a question about your uploaded material below.</p>
+          <p className="ask-jack-empty">Ask {jack.assistantName} a question about your uploaded material below.</p>
         )}
         {history.map((entry) => (
           <div key={entry.id} className={`ask-jack-bubble role-${entry.role}`}>
-            <strong>{entry.role === "user" ? "You" : "Jack"}</strong>
+            <strong>{entry.role === "user" ? "You" : jack.assistantName}</strong>
             <p>{entry.text}</p>
           </div>
         ))}
-        {thinking && <div className="ask-jack-bubble role-jack thinking">Jack is thinking…</div>}
+        {thinking && <div className="ask-jack-bubble role-jack thinking">{jack.assistantName} is thinking…</div>}
       </div>
 
       {suggestions.length > 0 && history.length === 0 && (
@@ -173,8 +180,8 @@ export function AskJackStage() {
           onClick={() => jack.setAmbientListeningEnabled(!jack.ambientListeningEnabled)}
           disabled={jack.jackLocalHealth?.whisper === "unavailable"}
           aria-pressed={jack.ambientListeningEnabled}
-          aria-label={jack.ambientListeningEnabled ? "Turn mic off" : "Turn mic on -- say “Jack” followed by your question"}
-          title={jack.ambientListeningEnabled ? "Turn mic off" : "Turn mic on -- say “Jack” followed by your question"}
+          aria-label={jack.ambientListeningEnabled ? "Turn mic off" : `Turn mic on -- say "${jack.assistantName}" followed by your question`}
+          title={jack.ambientListeningEnabled ? "Turn mic off" : `Turn mic on -- say "${jack.assistantName}" followed by your question`}
         >
           🎤
         </button>
@@ -183,7 +190,7 @@ export function AskJackStage() {
           value={question}
           onChange={(e) => setQuestion(e.target.value)}
           placeholder="Ask a question about your material…"
-          aria-label="Ask Jack a question"
+          aria-label={`Ask ${jack.assistantName} a question`}
         />
         <button type="submit" className="primary" disabled={!question.trim() || thinking}>Ask</button>
       </form>
