@@ -184,6 +184,21 @@ function pickGreeting(humourEnabled: boolean): string {
   return bank[Math.floor(Math.random() * bank.length)];
 }
 
+// The very first thing Jack ever says to the presenter, once, for the whole
+// session -- always warm and professional (not gated by humourEnabled; a
+// first impression isn't the place for a joke). Falls back to an
+// unaddressed greeting if no name was given on the mode-select screen.
+function pickFirstContactGreeting(presenterName: string): string {
+  const name = presenterName.trim();
+  const hi = name ? `Hi ${name}` : "Hi there";
+  const bank = [
+    `${hi}, it's a pleasure to meet you. How can I help?`,
+    `${hi}, welcome -- what would you like me to do?`,
+    `${hi}, glad to be here. What do you need from me?`,
+  ];
+  return bank[Math.floor(Math.random() * bank.length)];
+}
+
 // Brief takeover acknowledgements (Phase 10) -- confirms the command landed
 // before narration starts, so the user isn't left wondering whether it worked.
 const TAKEOVER_ACKS = ["Got it. I'll take it from here.", "Absolutely. I'll take over.", "Sure -- I've got the next part."];
@@ -250,6 +265,9 @@ export interface JackContextValue {
   currentCaption: string;
   lastError: string | null;
   controlMode: ControlMode;
+  /** The presenter's own name, set once on the mode-select screen -- used only for Jack's one-time first-contact greeting (see wakeJackLocal). Empty until set; never required. */
+  presenterName: string;
+  setPresenterName(name: string): void;
   audienceQuestionPolicy: AudienceQuestionPolicy;
   humourEnabled: boolean;
   language: string;
@@ -476,6 +494,10 @@ export function JackProvider({ children }: { children: ReactNode }) {
   }, []);
   const [lastError, setLastError] = useState<string | null>(null);
   const [controlMode, setControlModeState] = useState<ControlMode>("presenterLeads");
+  // Set once, up front (ModeSelectStage), reused for the first-contact
+  // greeting below -- not persisted, this is a per-session identity, not a
+  // saved preference like language/voice/captions.
+  const [presenterName, setPresenterNameState] = useState("");
   const [audienceQuestionPolicy, setAudienceQuestionPolicyState] = useState<AudienceQuestionPolicy>("askPresenterFirst");
   const [humourEnabled, setHumourEnabledState] = useState(true);
   // Each lazy initializer runs loadPresentSettings() once, only on mount --
@@ -550,6 +572,14 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // its reactive mirror for the UI.
   const jackAwakeRef = useRef(false);
   const [jackAwake, setJackAwake] = useState(false);
+  // Separate from jackAwakeRef on purpose: jackAwake/asleep resets on every
+  // mode transition (Present/Practice/Ask Jack each sleep Jack on unmount),
+  // so a wake genuinely does re-greet each time -- but the personalized
+  // first-contact greeting (name + "what do you need") must happen exactly
+  // once for the whole session, the very first time the presenter calls
+  // Jack anywhere, never again afterward regardless of how many times he
+  // sleeps/wakes or which mode that first call happens in.
+  const presenterGreetedRef = useRef(false);
   // Structurally isolated per provider (Part 9/24 of the WHISPER SAFETY
   // CORRECTION milestone) -- see capturePolicy.ts. Recomputed whenever
   // asrProvider changes; useLocalRecorder reads the latest value on every
@@ -1161,8 +1191,14 @@ export function JackProvider({ children }: { children: ReactNode }) {
     jackAwakeRef.current = true;
     setJackAwake(true);
     const traceId = startTrace("wake_greeting");
-    await speakAndWait(pickGreeting(humourEnabled), traceId);
-  }, [speechPlayer, speakAndWait, humourEnabled]);
+    // The very first wake of the whole session gets the personalized
+    // greeting-by-name instead of the generic rotation -- see
+    // presenterGreetedRef's comment.
+    const isFirstEverContact = !presenterGreetedRef.current;
+    presenterGreetedRef.current = true;
+    const greeting = isFirstEverContact ? pickFirstContactGreeting(presenterName) : pickGreeting(humourEnabled);
+    await speakAndWait(greeting, traceId);
+  }, [speechPlayer, speakAndWait, humourEnabled, presenterName]);
 
   const unlockSpeech = useCallback(() => {
     speechPlayer.unlock();
@@ -1749,6 +1785,16 @@ export function JackProvider({ children }: { children: ReactNode }) {
       dispatchEvent({ type: "LOCAL_COMMAND_START" });
       const controller = controllerRef.current.controller;
       try {
+        // Jack stays silent until the presenter actually calls him -- this
+        // is that first call, in any mode/stage (presentation, Q&A,
+        // wherever), and covers every subsequent one too since
+        // wakeJackLocal() is a no-op once already awake. "Jack leads" is
+        // deliberately excluded: it auto-narrates the instant the session
+        // starts, unprompted, by design -- that flow wakes Jack itself, from
+        // inside the start_presentation case below.
+        if (controlMode !== "jackLeads") {
+          await wakeJackLocal();
+        }
         mark(traceId, "intentRequestStart"); // T6
         const intent = await jackApi.detectIntent(text);
         mark(traceId, "intentResultReady"); // T7
@@ -2046,6 +2092,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       humourEnabled,
       audienceQuestionPolicy,
       queueQuestion,
+      controlMode,
     ],
   );
 
@@ -2113,6 +2160,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     currentCaption,
     lastError,
     controlMode,
+    presenterName,
     audienceQuestionPolicy,
     humourEnabled,
     language,
@@ -2149,6 +2197,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     retryConnection,
     sendText,
     setControlMode: setControlModeState,
+    setPresenterName: setPresenterNameState,
     setAudienceQuestionPolicy: setAudienceQuestionPolicyState,
     setHumourEnabled: setHumourEnabledState,
     setLanguage,

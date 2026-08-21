@@ -53,6 +53,11 @@
 .mode-select-summary{text-align:center;display:grid;gap:4px}
 .mode-select-summary strong{font-size:16px}
 .mode-select-summary span{font-size:11px;color:#65839a}
+.mode-select-name{display:grid;gap:6px;justify-items:center;max-width:340px;margin:0 auto;text-align:center}
+.mode-select-name>span{font-size:10px;letter-spacing:.12em;color:#7897b3;text-transform:uppercase}
+.mode-select-name input{width:100%;background:rgba(6,12,26,.8);border:1px solid var(--line);border-radius:8px;color:var(--text);padding:9px 12px;font-size:13px;text-align:center}
+.mode-select-name input:focus-visible{outline:2px solid var(--cyan);outline-offset:1px}
+.mode-select-name small{font-size:10px;color:#5f7e95}
 
 /* Practice */
 .practice-stage{max-width:760px}

@@ -1,6 +1,7 @@
 "use client";
 
 import { JackOrb } from "../JackOrb";
+import { useJack } from "../jack/JackProvider";
 import { useSession } from "../session/SessionContext";
 import type { PresentMode } from "../session/types";
 
@@ -30,6 +31,7 @@ const MODES: { id: PresentMode; icon: string; label: string; title: string; desc
 
 export function ModeSelectStage() {
   const { session, dispatch } = useSession();
+  const jack = useJack();
 
   const readyFiles = session.files.filter((f) => f.status === "ready" || f.status === "unsupported");
   const totalSections = readyFiles.reduce(
@@ -56,6 +58,17 @@ export function ModeSelectStage() {
         <strong>{title}</strong>
         <span>{totalSections} section{totalSections === 1 ? "" : "s"} detected · Analysis complete</span>
       </div>
+
+      <label className="mode-select-name">
+        <span>Your name</span>
+        <input
+          type="text"
+          value={jack.presenterName}
+          onChange={(e) => jack.setPresenterName(e.target.value)}
+          placeholder="e.g. Alex"
+        />
+        <small>Jack stays quiet until you call him -- he&apos;ll greet you by name the first time.</small>
+      </label>
 
       <div className="section-heading">
         <h2>How would you like Jack to help?</h2>
