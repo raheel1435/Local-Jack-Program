@@ -276,6 +276,18 @@ export function useLocalRecorder(capturePolicy: CaptureBoundaryPolicy): UseLocal
     rafRef.current = requestAnimationFrame(tick);
   }, []);
 
+  // Bug fix: every disconnect()/stop() call here used to run unguarded --
+  // an AudioNode already torn down by a stale/overlapping teardown, or a
+  // MediaStreamTrack already stopped elsewhere, can throw synchronously
+  // (browsers vary on this). Since this function's caller, stop() below, is
+  // never itself wrapped in try/catch, and ITS caller (JackProvider's
+  // finishBargeInCapture) awaits stop() outside a try/catch too, a single
+  // throw here used to reject the whole chain as an unhandled promise
+  // rejection and leave bargeInPhase stuck at "processing" forever -- the
+  // mic UI reporting "Processing" indefinitely with no way to recover short
+  // of a page reload. Cleanup must never fail the caller: each step is now
+  // independently best-effort, same treatment the postMessage/AudioContext
+  // steps already had.
   const teardown = useCallback(() => {
     stopLevelLoop();
     setLevel(0);
@@ -286,24 +298,44 @@ export function useLocalRecorder(capturePolicy: CaptureBoundaryPolicy): UseLocal
         // context/port may already be gone
       }
       workletNodeRef.current.port.onmessage = null;
-      workletNodeRef.current.disconnect();
+      try {
+        workletNodeRef.current.disconnect();
+      } catch {
+        // already disconnected/context closed -- nothing left to tear down
+      }
       workletNodeRef.current = null;
     }
     if (silentGainNodeRef.current) {
-      silentGainNodeRef.current.disconnect();
+      try {
+        silentGainNodeRef.current.disconnect();
+      } catch {
+        // already disconnected/context closed
+      }
       silentGainNodeRef.current = null;
     }
     if (sourceRef.current) {
-      sourceRef.current.disconnect();
+      try {
+        sourceRef.current.disconnect();
+      } catch {
+        // already disconnected/context closed
+      }
       sourceRef.current = null;
     }
     analyserRef.current = null;
     if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
+      try {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+      } catch {
+        // track(s) already stopped/ended
+      }
       streamRef.current = null;
     }
     if (audioContextRef.current) {
-      void audioContextRef.current.close().catch(() => {});
+      try {
+        void audioContextRef.current.close().catch(() => {});
+      } catch {
+        // already closed/closing
+      }
       audioContextRef.current = null;
     }
   }, [stopLevelLoop]);
