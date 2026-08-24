@@ -22,7 +22,11 @@ export type JackIntentAction =
   | "stop_presentation";
 
 export interface JackHealth {
-  gateway: "ok";
+  /** "unreachable" means the gateway process itself could not be reached at
+   * all (connection refused, timeout, non-2xx, malformed response) -- see
+   * jackApi.health()'s catch block. Distinct from any individual provider
+   * being "unavailable" while the gateway process is genuinely up. */
+  gateway: "ok" | "unreachable";
   colibri: "available" | "unavailable";
   llamacpp: "available" | "unavailable";
   whisper: "available" | "unavailable";
@@ -113,7 +117,7 @@ function enqueueSpeak<T>(run: () => Promise<T>): Promise<T> {
 export const jackApi = {
   baseUrl: BASE_URL,
 
-  /** Never throws -- returns a synthetic "unavailable" report on any failure, so callers can always render an honest status. */
+  /** Never throws -- returns a synthetic report on any failure, so callers can always render an honest status. `gateway: "unreachable"` (CLAUDE-04 fix) distinguishes "the gateway process itself didn't respond" from a genuinely-up gateway whose providers happen to all be down. */
   async health(): Promise<JackHealth> {
     try {
       const res = await fetch(`${BASE_URL}/health`, { signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS) });
@@ -121,7 +125,7 @@ export const jackApi = {
       return (await res.json()) as JackHealth;
     } catch {
       return {
-        gateway: "ok",
+        gateway: "unreachable",
         colibri: "unavailable",
         llamacpp: "unavailable",
         whisper: "unavailable",
@@ -146,11 +150,6 @@ export const jackApi = {
       { messages, max_tokens: opts?.maxTokens ?? 200, temperature: opts?.temperature ?? 0.4 },
       30_000,
     );
-  },
-
-  /** Transcribes a local audio file already on disk (the gateway shells out to the selected ASR engine by path, not upload). `provider` defaults to "whisper" (Approved) when omitted -- never silently falls back if Test fails. */
-  transcribe(audioFilePath: string, language?: string, provider?: AsrProviderId): Promise<JackTranscribeResult> {
-    return postJson("/jack/transcribe", { audioFilePath, language, provider }, 30_000);
   },
 
   /** Transcribes browser-captured audio (a WAV blob) via the selected ASR engine -- no filesystem path ever crosses the browser boundary. `provider` defaults to "whisper" (Approved) when omitted. */

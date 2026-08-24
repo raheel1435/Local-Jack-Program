@@ -116,7 +116,6 @@ export function UploadStage() {
             <button
               type="button"
               className="primary"
-              disabled={session.files.length === 0}
               onClick={() => dispatch({ type: "START_ANALYSIS" })}
             >
               Next →

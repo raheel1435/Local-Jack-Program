@@ -2,6 +2,10 @@ import { config } from "../../config/services.js";
 import type { ProviderStatus } from "../../types/jack.js";
 
 const HEALTH_TIMEOUT_MS = 2000;
+// CLAUDE-15 fix: checkHealth() already had a bound; speak() (the actual TTS
+// request) had none. 30s matches the client's own jackApi.ts /jack/speak
+// timeout budget.
+const SPEAK_TIMEOUT_MS = 30_000;
 
 export interface KokoroSpeakResult {
   audio: Buffer;
@@ -38,6 +42,7 @@ export class KokoroProvider {
         voice,
         response_format: "wav",
       }),
+      signal: AbortSignal.timeout(SPEAK_TIMEOUT_MS),
     });
 
     if (!res.ok) {

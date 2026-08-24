@@ -74,7 +74,8 @@ export interface UseLocalRecorderResult {
   error: string | null;
   /** Diagnostics for the most recently completed (stop()-resolved) recording. */
   metrics: RecorderMetrics | null;
-  start(): Promise<void>;
+  /** Resolves true only after the first PCM frame proves capture is usable. */
+  start(): Promise<boolean>;
   /** Call the instant a real VAD trigger fires (not at arm/listen time).
    * Freezes the bounded pre-roll ring buffer accumulated so far and switches
    * the recorder into capped active-capture accounting for everything after.
@@ -230,7 +231,13 @@ export function useLocalRecorder(capturePolicy: CaptureBoundaryPolicy): UseLocal
   const triggeredRef = useRef(false);
   const preRollSamplesAtTriggerRef = useRef(0);
   const capturePolicyRef = useRef(capturePolicy);
-  capturePolicyRef.current = capturePolicy;
+  // Written in an effect, not during render (react-hooks/refs lint fix):
+  // nothing in this render pass reads capturePolicyRef -- only the
+  // onmessage closure does, asynchronously, later -- so committing the
+  // update after render (rather than during it) changes nothing observable.
+  useEffect(() => {
+    capturePolicyRef.current = capturePolicy;
+  }, [capturePolicy]);
   // Analyser-stage peak/RMS across the whole session, for direct comparison
   // against the worklet/PCM-stage peak/RMS at stop() -- Phase 16 of the
   // activation milestone: isolate whether a zero-signal capture is lost
@@ -340,7 +347,7 @@ export function useLocalRecorder(capturePolicy: CaptureBoundaryPolicy): UseLocal
     }
   }, [stopLevelLoop]);
 
-  const start = useCallback(async () => {
+  const start = useCallback(async (): Promise<boolean> => {
     // Defensive: if something (barge-in's ambient arm, or a previous
     // push-to-talk session) left the recorder active, tear it down first
     // instead of silently leaking the old MediaStream/AudioContext and
@@ -513,19 +520,20 @@ export function useLocalRecorder(capturePolicy: CaptureBoundaryPolicy): UseLocal
       // once this resolves) that we're "Listening" until audio is actually
       // flowing -- otherwise a user who starts speaking the instant they see
       // "Listening" can lose their first word to setup latency that already
-      // happened invisibly. Falls back to proceeding anyway after a timeout
-      // so a genuinely stalled first callback can't hang the mic button.
+      // happened invisibly. A timeout is a startup failure: without a PCM
+      // frame there is no truthful basis for claiming capture is active.
       await Promise.race([
         firstFramePromise,
         new Promise<void>((resolve) => setTimeout(resolve, FIRST_FRAME_TIMEOUT_MS)),
       ]);
       if (!firstFrameSeen) {
-        mark("WARNING: first PCM frame did not arrive within timeout -- proceeding anyway");
+        throw new Error("Microphone started, but no audio frames were received.");
       }
 
       listeningAtRef.current = performance.now();
       setState("listening");
       mark("Listening shown to user");
+      return true;
     } catch (err) {
       teardown();
       if (err instanceof DOMException && err.name === "NotAllowedError") {
@@ -536,6 +544,7 @@ export function useLocalRecorder(capturePolicy: CaptureBoundaryPolicy): UseLocal
         setError(err instanceof Error ? err.message : "Couldn't access the microphone.");
       }
       setState("error");
+      return false;
     }
   }, [runLevelLoop, teardown]);
 

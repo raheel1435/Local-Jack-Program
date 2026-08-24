@@ -36,7 +36,7 @@ export function toOrbPresentation(state: JackAttentionState, name = "Jack"): Orb
     case "alert":
       return { orbState: "alert", label: `${name} needs attention`, description: "Check microphone permissions" };
     case "disconnected":
-      return { orbState: "idle", label: "Not connected", description: `${name} isn't connected to OpenAI` };
+      return { orbState: "idle", label: "Not connected", description: `${name}'s local service isn't connected` };
     case "error":
       return { orbState: "alert", label: "Connection error", description: "Something went wrong" };
   }

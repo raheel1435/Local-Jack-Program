@@ -59,14 +59,22 @@ async function withServer(
   }
 }
 
-test("defaults to whisper when no provider is specified (JSON path)", async () => {
+// Security-boundary hardening: the JSON `{ audioFilePath }` mode (an
+// already-on-disk path chosen entirely by the caller, with no root
+// restriction) was removed -- it had zero real callers (the browser
+// frontend always uploads raw audio/wav bytes) and let any gateway-reachable
+// client make the configured ASR engine open an arbitrary local file. Every
+// test below now exercises provider-selection/health logic through the same
+// audio/wav upload body real callers actually use.
+
+test("defaults to whisper when no provider is specified (upload path)", async () => {
   const whisper = new FakeAsrProvider("whisper", "Approved · Whisper", "available");
   const vibevoice = new FakeAsrProvider("vibevoice", "Test · VibeVoice", "available");
   await withServer(whisper, vibevoice, async (base) => {
     const res = await fetch(`${base}/jack/transcribe`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ audioFilePath: "C:/fake.wav" }),
+      headers: { "Content-Type": "audio/wav" },
+      body: Buffer.from([0, 1, 2, 3]),
     });
     assert.equal(res.status, 200);
     const body = await res.json();
@@ -76,14 +84,14 @@ test("defaults to whisper when no provider is specified (JSON path)", async () =
   });
 });
 
-test("routes to vibevoice when explicitly selected (JSON path)", async () => {
+test("routes to vibevoice when explicitly selected (upload path)", async () => {
   const whisper = new FakeAsrProvider("whisper", "Approved · Whisper", "available");
   const vibevoice = new FakeAsrProvider("vibevoice", "Test · VibeVoice", "available");
   await withServer(whisper, vibevoice, async (base) => {
-    const res = await fetch(`${base}/jack/transcribe`, {
+    const res = await fetch(`${base}/jack/transcribe?provider=vibevoice`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ audioFilePath: "C:/fake.wav", provider: "vibevoice" }),
+      headers: { "Content-Type": "audio/wav" },
+      body: Buffer.from([0, 1, 2, 3]),
     });
     assert.equal(res.status, 200);
     const body = await res.json();
@@ -97,10 +105,10 @@ test("unknown provider value is rejected with 400, neither engine is invoked", a
   const whisper = new FakeAsrProvider("whisper", "Approved · Whisper", "available");
   const vibevoice = new FakeAsrProvider("vibevoice", "Test · VibeVoice", "available");
   await withServer(whisper, vibevoice, async (base) => {
-    const res = await fetch(`${base}/jack/transcribe`, {
+    const res = await fetch(`${base}/jack/transcribe?provider=gpt4o-transcribe`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ audioFilePath: "C:/fake.wav", provider: "gpt4o-transcribe" }),
+      headers: { "Content-Type": "audio/wav" },
+      body: Buffer.from([0, 1, 2, 3]),
     });
     assert.equal(res.status, 400);
     const body = await res.json();
@@ -114,10 +122,10 @@ test("vibevoice unavailable returns a structured 503 and never falls back to whi
   const whisper = new FakeAsrProvider("whisper", "Approved · Whisper", "available");
   const vibevoice = new FakeAsrProvider("vibevoice", "Test · VibeVoice", "unavailable");
   await withServer(whisper, vibevoice, async (base) => {
-    const res = await fetch(`${base}/jack/transcribe`, {
+    const res = await fetch(`${base}/jack/transcribe?provider=vibevoice`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ audioFilePath: "C:/fake.wav", provider: "vibevoice" }),
+      headers: { "Content-Type": "audio/wav" },
+      body: Buffer.from([0, 1, 2, 3]),
     });
     assert.equal(res.status, 503);
     const body = await res.json();
@@ -135,12 +143,44 @@ test("whisper unavailable returns a structured 503 and never falls back to vibev
   await withServer(whisper, vibevoice, async (base) => {
     const res = await fetch(`${base}/jack/transcribe`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ audioFilePath: "C:/fake.wav" }),
+      headers: { "Content-Type": "audio/wav" },
+      body: Buffer.from([0, 1, 2, 3]),
     });
     assert.equal(res.status, 503);
     const body = await res.json();
     assert.equal(body.error, "whisper_unavailable");
+    assert.equal(vibevoice.calls.length, 0);
+  });
+});
+
+test("a JSON body (the removed arbitrary-file-path mode) is rejected with 400, no provider is ever invoked", async () => {
+  const whisper = new FakeAsrProvider("whisper", "Approved · Whisper", "available");
+  const vibevoice = new FakeAsrProvider("vibevoice", "Test · VibeVoice", "available");
+  await withServer(whisper, vibevoice, async (base) => {
+    const res = await fetch(`${base}/jack/transcribe`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ audioFilePath: "C:/Windows/System32/drivers/etc/hosts" }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(body.error, "invalid_request");
+    assert.equal(whisper.calls.length, 0);
+    assert.equal(vibevoice.calls.length, 0);
+  });
+});
+
+test("a JSON body attempting path traversal is rejected the same way -- no path-mode exists to traverse with", async () => {
+  const whisper = new FakeAsrProvider("whisper", "Approved · Whisper", "available");
+  const vibevoice = new FakeAsrProvider("vibevoice", "Test · VibeVoice", "available");
+  await withServer(whisper, vibevoice, async (base) => {
+    const res = await fetch(`${base}/jack/transcribe`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ audioFilePath: "../../../../etc/passwd" }),
+    });
+    assert.equal(res.status, 400);
+    assert.equal(whisper.calls.length, 0);
     assert.equal(vibevoice.calls.length, 0);
   });
 });

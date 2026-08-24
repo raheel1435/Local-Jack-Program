@@ -21,7 +21,13 @@ const offlineProvider = getAskJackProvider();
 export function AskJackStage() {
   const { session, dispatch } = useSession();
   const readyFiles = session.files.filter((f) => f.status === "ready" || f.status === "unsupported");
-  const [activeFileId, setActiveFileId] = useState<string | null>(session.activeFileId);
+  // CLAUDE-10 fix: session.activeFileId is the single source of truth --
+  // this used to be a separate local `useState`, seeded once from the
+  // global value and never written back, so the "Ask about:" dropdown
+  // visibly changed but the REAL answer path (runLocalCommand ->
+  // answerDeckQuestion, in JackProvider.tsx) reads the global
+  // appSessionRef.current.activeFileId and never saw the local selection.
+  const activeFileId = session.activeFileId;
   const [question, setQuestion] = useState("");
   const [history, setHistory] = useState<ConversationEntry[]>([]);
   const [thinking, setThinking] = useState(false);
@@ -37,55 +43,55 @@ export function AskJackStage() {
   // back to a dumb offline keyword search (no AI at all), same graceful-
   // degradation pattern as Present/Practice's own localUnavailable warning.
 
-  const latest = useRef({ docs, activeFileId });
+  const askModeName = `Ask ${jack.assistantName}`;
+  const latest = useRef({ docs, activeFileId, askModeName });
   useEffect(() => {
-    latest.current = { docs, activeFileId };
+    latest.current = { docs, activeFileId, askModeName };
   });
 
-  // Multi-persona milestone: "Ask Jack" is both this mode's display name and
-  // literally embeds the assistant's own name -- interpolated once here at
-  // mount, same as every other value this ref captures (this controller was
-  // already never live-rebuilt on later prop changes, unlike PresentStage's
-  // fresher latest.current-backed methods, so this matches existing
-  // behavior rather than introducing a new staleness case).
-  const askModeName = `Ask ${jack.assistantName}`;
+  // Controller callbacks read the latest persona name so changing personas
+  // cannot leave command results branded with the name from first mount.
   const controllerRef = useRef<PresentationController>({
     modeName: askModeName,
     getPresentationContext: () => {
       const s = latest.current;
-      return ok({ title: askModeName, totalSlides: s.docs.length, currentSlideIndex: 0, mode: "askJack" });
+      return ok({ title: s.askModeName, totalSlides: s.docs.length, currentSlideIndex: 0, mode: "askJack" });
     },
-    startPresentation: () => fail(`There's no presentation to start in ${askModeName} mode.`),
-    pausePresentation: () => fail(`Not applicable in ${askModeName} mode.`),
-    resumePresentation: () => fail(`Not applicable in ${askModeName} mode.`),
+    startPresentation: () => fail(`There's no presentation to start in ${latest.current.askModeName} mode.`),
+    pausePresentation: () => fail(`Not applicable in ${latest.current.askModeName} mode.`),
+    resumePresentation: () => fail(`Not applicable in ${latest.current.askModeName} mode.`),
     endPresentation: () => ok({ ended: true as const }),
-    goToNextSlide: () => fail(`There are no slides in ${askModeName} mode.`),
-    goToPreviousSlide: () => fail(`There are no slides in ${askModeName} mode.`),
-    goToSlide: () => fail(`There are no slides in ${askModeName} mode.`),
-    getCurrentSlide: () => fail(`There are no slides in ${askModeName} mode.`),
-    getSlideContent: () => fail(`There are no slides in ${askModeName} mode.`),
-    getSpeakerNotes: () => fail(`There are no speaker notes in ${askModeName} mode.`),
-    showSpeakerNotes: () => fail(`Not applicable in ${askModeName} mode.`),
-    hideSpeakerNotes: () => fail(`Not applicable in ${askModeName} mode.`),
-    takePresentationControl: () => fail(`Not applicable in ${askModeName} mode.`),
-    handControlToPresenter: () => fail(`Not applicable in ${askModeName} mode.`),
-    setPresentationPace: () => fail(`Not applicable in ${askModeName} mode.`),
+    goToNextSlide: () => fail(`There are no slides in ${latest.current.askModeName} mode.`),
+    goToPreviousSlide: () => fail(`There are no slides in ${latest.current.askModeName} mode.`),
+    goToSlide: () => fail(`There are no slides in ${latest.current.askModeName} mode.`),
+    getCurrentSlide: () => fail(`There are no slides in ${latest.current.askModeName} mode.`),
+    getSlideContent: () => fail(`There are no slides in ${latest.current.askModeName} mode.`),
+    getSpeakerNotes: () => fail(`There are no speaker notes in ${latest.current.askModeName} mode.`),
+    showSpeakerNotes: () => fail(`Not applicable in ${latest.current.askModeName} mode.`),
+    hideSpeakerNotes: () => fail(`Not applicable in ${latest.current.askModeName} mode.`),
+    takePresentationControl: () => fail(`Not applicable in ${latest.current.askModeName} mode.`),
+    handControlToPresenter: () => fail(`Not applicable in ${latest.current.askModeName} mode.`),
+    setPresentationPace: () => fail(`Not applicable in ${latest.current.askModeName} mode.`),
     getRemainingTime: () => ok({ remainingMs: null, message: "No time limit is set." }),
     searchUploadedDocuments: (query) => {
       const s = latest.current;
       return ok({ matches: searchDocuments(query, s.docs, s.activeFileId) });
     },
     showRelevantSource: () => ok({ shown: true as const }),
-    queueAudienceQuestion: () => fail(`Not applicable in ${askModeName} mode.`),
-    markQuestionForFollowUp: () => fail(`Not applicable in ${askModeName} mode.`),
-    syncJackToCurrentSlide: () => fail(`Not applicable in ${askModeName} mode.`),
-    setAudienceQuestionPolicy: () => fail(`Not applicable in ${askModeName} mode.`),
+    queueAudienceQuestion: () => fail(`Not applicable in ${latest.current.askModeName} mode.`),
+    markQuestionForFollowUp: () => fail(`Not applicable in ${latest.current.askModeName} mode.`),
+    syncJackToCurrentSlide: () => fail(`Not applicable in ${latest.current.askModeName} mode.`),
+    setAudienceQuestionPolicy: () => fail(`Not applicable in ${latest.current.askModeName} mode.`),
   });
 
   useEffect(() => {
+    controllerRef.current.modeName = askModeName;
     jack.registerController(askModeName, controllerRef.current);
+    return () => jack.unregisterController();
+  }, [askModeName, jack]);
+
+  useEffect(() => {
     return () => {
-      jack.unregisterController();
       jack.sleepJackLocal();
       jack.setAmbientListeningEnabled(false);
     };
@@ -140,7 +146,10 @@ export function AskJackStage() {
       {readyFiles.length > 1 && (
         <label className="ask-jack-file-select">
           Ask about:
-          <select value={activeFileId ?? ""} onChange={(e) => setActiveFileId(e.target.value || null)}>
+          <select
+            value={activeFileId ?? ""}
+            onChange={(e) => dispatch({ type: "SET_ACTIVE_FILE", fileId: e.target.value || null })}
+          >
             <option value="">All uploaded files</option>
             {readyFiles.map((f) => (
               <option key={f.id} value={f.id}>{f.name}</option>
@@ -172,6 +181,7 @@ export function AskJackStage() {
 
       {devDiagnosticsEnabled && <MicDiagnostics jack={jack} />}
       {jack.lastError && <p className="speech-error" role="alert">{jack.lastError}</p>}
+      {jack.localMicError && <p className="speech-error" role="alert">{jack.localMicError}</p>}
 
       <form className="ask-jack-input-row" onSubmit={onSubmit}>
         <button

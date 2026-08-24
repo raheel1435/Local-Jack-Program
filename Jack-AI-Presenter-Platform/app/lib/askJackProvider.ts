@@ -75,9 +75,16 @@ export function findRelevantSections(
 
 /**
  * Local, in-browser keyword search over already-extracted document text.
- * This is explicitly NOT an AI model — it's a transparent fallback used
- * because no real Jack API backend is connected yet. `getAskJackProvider()`
- * is the single seam to swap in a real backend later without touching the UI.
+ * This is explicitly NOT an AI model — it's the deliberate OFFLINE/DEGRADED
+ * fallback for when the local gateway is unreachable (see AskJackStage.tsx's
+ * `jack.localUnavailable` branch, the only caller of `getAskJackProvider()`).
+ * The normal path uses a real backend: `jack.runLocalCommand` ->
+ * `answerDeckQuestion` -> `jackApi.chat` -> the local gateway's LLM, entirely
+ * bypassing this class. (Corrected: an earlier version of this comment said
+ * no real backend was connected — that stopped being true once the local
+ * gateway integration shipped, and this class's own "single seam to swap in
+ * a real backend" framing was never how that integration was actually
+ * wired.)
  */
 export class LocalSearchAskJackProvider implements AskJackProvider {
   async ask(question: string, ctx: AskJackContext): Promise<AskJackAnswer> {

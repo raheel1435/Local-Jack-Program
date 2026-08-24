@@ -99,7 +99,7 @@ export type SessionAction =
   | { type: "ANALYSIS_RETRY_FILE"; fileId: string }
   | { type: "ANALYSIS_COMPLETE" }
   | { type: "SELECT_MODE"; mode: PresentMode }
-  | { type: "SET_ACTIVE_FILE"; fileId: string }
+  | { type: "SET_ACTIVE_FILE"; fileId: string | null }
   | { type: "BACK_TO_UPLOAD" }
   | { type: "BACK_TO_MODE_SELECT" }
   | { type: "SET_JACK_STATE"; jackState: JackState };

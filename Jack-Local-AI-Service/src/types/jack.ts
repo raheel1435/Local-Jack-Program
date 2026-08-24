@@ -46,14 +46,6 @@ export interface LlmProvider {
   chat(req: JackChatRequest): Promise<JackChatResponse>;
 }
 
-export interface JackTranscribeRequest {
-  /** Absolute path to a local audio file (wav) already on disk. */
-  audioFilePath: string;
-  language?: string;
-  /** Which ASR engine to use. Defaults to "whisper" (Approved) when omitted. */
-  provider?: AsrProviderId;
-}
-
 /** Normalized result shape shared by every ASR provider, so callers never
  * need engine-specific handling. `metadata` carries provider-specific
  * extras (e.g. VibeVoice's raw language/code-switching info) without

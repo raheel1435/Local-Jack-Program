@@ -2,6 +2,12 @@ import { Router } from "express";
 import { matchDeterministicCommand, type IntentType } from "../intent/commandRouter.js";
 import { classifyAddress, hasSuspiciousRepetition } from "../intent/addressing.js";
 import { ACTION_GRAMMAR, buildActionSystemPrompt } from "../intent/actionGrammar.js";
+import {
+  isNonEmptyStringWithinLimit,
+  isOptionalStringWithinLimit,
+  MAX_ASSISTANT_NAME_LENGTH,
+  MAX_INTENT_TEXT_LENGTH,
+} from "../lib/requestValidation.js";
 import type { JackErrorResponse, LlmProvider } from "../types/jack.js";
 
 interface JackIntentRequest {
@@ -54,10 +60,18 @@ export function intentRouter(llm: LlmProvider): Router {
 
   router.post("/jack/intent", async (req, res) => {
     const body = req.body as Partial<JackIntentRequest>;
-    if (!body.text || typeof body.text !== "string") {
+    if (!isNonEmptyStringWithinLimit(body.text, MAX_INTENT_TEXT_LENGTH)) {
       const err: JackErrorResponse = {
         error: "invalid_request",
-        detail: "Request body must include a non-empty `text` string.",
+        detail: `Request body must include a non-empty \`text\` string of at most ${MAX_INTENT_TEXT_LENGTH} characters.`,
+      };
+      res.status(400).json(err);
+      return;
+    }
+    if (!isOptionalStringWithinLimit(body.assistantName, MAX_ASSISTANT_NAME_LENGTH)) {
+      const err: JackErrorResponse = {
+        error: "invalid_request",
+        detail: `\`assistantName\`, when provided, must be a string of at most ${MAX_ASSISTANT_NAME_LENGTH} characters.`,
       };
       res.status(400).json(err);
       return;

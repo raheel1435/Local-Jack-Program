@@ -4,8 +4,50 @@ function readLlmProvider(): LlmProviderName {
   return process.env.JACK_LLM_PROVIDER === "colibri" ? "colibri" : "llamacpp";
 }
 
+function readPort(): number {
+  const raw = process.env.JACK_LOCAL_PORT;
+  if (raw === undefined || raw.trim() === "") return 43110;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+    throw new Error(
+      `Invalid JACK_LOCAL_PORT "${raw}" -- must be an integer between 1 and 65535.`,
+    );
+  }
+  return parsed;
+}
+
+// This gateway is a machine-local dev service: bound to loopback only by
+// default (security-boundary hardening -- a prior audit confirmed the
+// previous unbound app.listen() accepted connections on every network
+// interface, not just this machine). Override only if you understand the
+// exposure this creates.
+function readHost(): string {
+  const raw = process.env.JACK_LOCAL_HOST;
+  return raw && raw.trim() ? raw.trim() : "127.0.0.1";
+}
+
+// CORS allowlist (security-boundary hardening): the gateway used to reflect
+// ANY request Origin back in Access-Control-Allow-Origin, which let any web
+// page open in the browser -- not just this app's own dev server -- drive
+// local LLM/STT/TTS compute. Only origins in this list (or none, e.g. a
+// same-machine CLI/test client with no Origin header) are allowed. Vite's
+// default dev port (5173) on both localhost and 127.0.0.1 is included so a
+// fresh checkout works with no .env changes.
+function readAllowedOrigins(): string[] {
+  const raw = process.env.JACK_ALLOWED_ORIGINS;
+  if (raw && raw.trim()) {
+    return raw
+      .split(",")
+      .map((o) => o.trim())
+      .filter(Boolean);
+  }
+  return ["http://localhost:5173", "http://127.0.0.1:5173"];
+}
+
 export const config = {
-  port: Number(process.env.JACK_LOCAL_PORT ?? 43110),
+  port: readPort(),
+  host: readHost(),
+  allowedOrigins: readAllowedOrigins(),
 
   // Which local LLM provider backs /jack/chat and the intent router's LLM
   // fallback. Both providers are always constructed (health-checked, and

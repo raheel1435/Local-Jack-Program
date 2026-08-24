@@ -1,7 +1,6 @@
 ﻿"use client";
 
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { OpenAIRealtimeWebRTC, RealtimeAgent, RealtimeSession, type RealtimeItem } from "@openai/agents-realtime";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useLocalRecorder, type CaptureCloseReason, type LocalRecorderState } from "../hooks/useLocalRecorder";
 import { capturePolicyFor } from "./capturePolicy";
 import { isDirectlyAddressedToJack, isSelfEcho, type RecentSpeech } from "./addressing";
@@ -18,8 +17,6 @@ import {
   subscribeTraces,
   type TraceRecord,
 } from "./perfTrace";
-import { summarizeDocuments } from "./documentContext";
-import { buildInstructions } from "./instructions";
 import { createJackSpeechPlayer } from "./jackSpeechPlayer";
 import { nextAttentionState } from "./jackStateMachine";
 import {
@@ -33,21 +30,17 @@ import { toOrbPresentation, type OrbPresentation } from "./orbStateMap";
 import { buildPresentationContext, formatContextForPrompt, type PresentationContext } from "./presentationContext";
 import { unsupportedController, type PresentationController } from "./presentationController";
 import { resolveSlideTarget } from "./slideTargetResolver";
-import { createPresentationTools } from "./tools";
 import { createWakeWordService } from "./wakeWordService";
 import { DEFAULT_VOICE_ID, VOICE_OPTIONS } from "./voiceSettings";
 import { useSession } from "../session/SessionContext";
 import type { ParsedDocument } from "../session/types";
 import type {
   AudienceQuestionPolicy,
-  ConnectionStatus,
   ControlMode,
   ControlOwner,
   JackAttentionState,
   JackEvent,
-  MicPipelineStatus,
   QueuedQuestion,
-  TranscriptEntry,
 } from "./types";
 
 const JACK_LOCAL_HEALTH_POLL_MS = 8000;
@@ -82,12 +75,6 @@ export interface AsrDiagnosticEntry {
   success: boolean;
   downstreamOk?: boolean;
   timestamp: number;
-}
-
-const REALTIME_MODEL = "gpt-realtime-2";
-
-interface WebkitAudioContextWindow {
-  webkitAudioContext?: typeof AudioContext;
 }
 
 /**
@@ -229,41 +216,9 @@ function pickTakeoverAgainAck(): string {
   return TAKEOVER_AGAIN_ACKS[Math.floor(Math.random() * TAKEOVER_AGAIN_ACKS.length)];
 }
 
-function transportEventType(event: unknown): string | undefined {
-  if (event && typeof event === "object" && "type" in event) {
-    const value = (event as { type: unknown }).type;
-    if (typeof value === "string") return value;
-  }
-  return undefined;
-}
-
-function textFromHistory(history: RealtimeItem[]): TranscriptEntry[] {
-  const entries: TranscriptEntry[] = [];
-  for (const item of history) {
-    if (item.type !== "message" || item.role === "system") continue;
-    const role = item.role === "user" ? "presenter" : "jack";
-    const text = item.content
-      .map((part) => {
-        if (part.type === "input_text" || part.type === "output_text") return part.text;
-        if (part.type === "input_audio" || part.type === "output_audio") return part.transcript ?? "";
-        return "";
-      })
-      .join(" ")
-      .trim();
-    if (!text) continue;
-    entries.push({ id: item.itemId, role, text, final: item.status === "completed", timestamp: Date.now() });
-  }
-  return entries;
-}
-
 export interface JackContextValue {
   attentionState: JackAttentionState;
   orb: OrbPresentation;
-  connectionStatus: ConnectionStatus;
-  micStatus: MicPipelineStatus;
-  micLevel: number;
-  sendingAudioToOpenAI: boolean;
-  transcript: TranscriptEntry[];
   currentCaption: string;
   lastError: string | null;
   controlMode: ControlMode;
@@ -326,7 +281,7 @@ export interface JackContextValue {
    * acknowledgment for the SAME speechPlayer slot.
    */
   unlockSpeech(): void;
-  /** True once Jack has been explicitly activated for this local-pipeline session (Phase 1/2) -- independent of attentionState's sleeping/standby, which belongs to the unused OpenAI Realtime path in Present mode. */
+  /** True once Jack has been explicitly activated for this local-pipeline session (Phase 1/2). */
   jackAwake: boolean;
   /** The ONE authoritative activation function (Phase 2) -- idempotent, greets once per sleeping->awake transition (Phase 5). */
   wakeJackLocal(): Promise<void>;
@@ -341,20 +296,22 @@ export interface JackContextValue {
   /** Who currently owns slide navigation. Set by start_presentation (-> jack) and handoff_to_presenter (-> human) via runLocalCommand, or explicitly. */
   presenterControl: ControlOwner;
   setPresenterControl(owner: ControlOwner): void;
-  /** Jack-Local-AI-Service reachability -- polled independently of the OpenAI Realtime connection, so manual mode can always report an honest status even when Jack is fully offline. */
+  /** Jack-Local-AI-Service reachability -- polled independently, so every mode can always report an honest status even when Jack is fully offline. */
   jackLocalHealth: JackHealth | null;
   /** True once BOTH local LLM providers (llama.cpp and Colibri) are confirmed unavailable -- the one computation every mode's "Jack Local AI is unavailable" warning needs, centralized here instead of copied per-stage. */
   localUnavailable: boolean;
 
-  wake(): Promise<void>;
-  sleep(): void;
-  mute(): void;
-  unmute(): void;
   pause(): void;
   resume(): void;
   interrupt(): void;
-  retryConnection(): Promise<void>;
-  sendText(text: string): void;
+  /**
+   * Restarts Jack's autonomous narration at the given slide index (used by
+   * the "Sync Jack to this slide" control when the presenter has manually
+   * navigated away from wherever Jack is currently narrating). A no-op if
+   * Jack doesn't currently hold presentation control -- there's nothing to
+   * resync when the presenter is the one driving.
+   */
+  syncNarrationToSlide(slideIndex: number): void;
   setControlMode(mode: ControlMode): void;
   setAudienceQuestionPolicy(policy: AudienceQuestionPolicy): void;
   setHumourEnabled(enabled: boolean): void;
@@ -442,20 +399,14 @@ export function useJack(): JackContextValue {
 export function JackProvider({ children }: { children: ReactNode }) {
   const { session: appSession } = useSession();
 
-  // "standby", not "disconnected": attentionState represents Jack's own
-  // activity (idle/listening/thinking/speaking), not the OpenAI Realtime
-  // link -- that's the separate `connectionStatus` state below. Starting at
-  // "disconnected" blocked every local-only transition (LOCAL_COMMAND_*,
-  // AUDIO_START, USER_SPEECH_DETECTED all guard against it), which silently
-  // froze the orb and made barge-in impossible to arm for any session that
-  // never calls wake(). The OpenAI flow already converges on "standby" once
-  // connected+awake (CONNECTED -> "sleeping", then wake()'s own WAKE ->
-  // "standby"), so this doesn't change that path's eventual behavior.
+  // "standby": attentionState represents Jack's own activity
+  // (idle/listening/thinking/speaking) for the local pipeline -- the
+  // dormant OpenAI Realtime path that used to also drive this state (via a
+  // separate connectionStatus) was removed; every local-only transition
+  // (LOCAL_COMMAND_*, AUDIO_START, USER_SPEECH_DETECTED) needs a starting
+  // value other than "disconnected", which used to block them until the
+  // never-called wake() ran.
   const [attentionState, setAttentionState] = useState<JackAttentionState>("standby");
-  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("disconnected");
-  const [micStatus, setMicStatus] = useState<MicPipelineStatus>("off");
-  const [micLevel, setMicLevel] = useState(0);
-  const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [currentCaption, setCurrentCaption] = useState("");
   // Self-echo guard history (WHISPER FALSE-DESTRUCTIVE-COMMAND ROOT-CAUSE
   // milestone): every real thing Jack has spoken recently, so an incoming
@@ -517,11 +468,18 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // subscription so the Diagnostics panel re-renders when a trace finishes.
   // Same local-only/session-scoped/no-raw-audio guarantees as asrDiagnostics
   // above -- see perfTrace.ts's module doc comment.
-  const [perfTraces, setPerfTraces] = useState<TraceRecord[]>([]);
-  useEffect(() => {
-    setPerfTraces(getTraceHistory());
-    return subscribeTraces(() => setPerfTraces(getTraceHistory()));
-  }, []);
+  // useSyncExternalStore, not useState+useEffect (react-hooks/set-state-in-effect
+  // lint fix): perfTrace.ts's `history` is a genuine external store (a
+  // module-level array reassigned, never mutated in place, on every
+  // change -- see getTraceHistory/subscribeTraces), which is exactly what
+  // this hook exists for; no behavior change versus the previous
+  // subscribe-in-an-effect pattern.
+  // Third argument (getServerSnapshot) is required for a component that can
+  // be server-rendered (this app uses vinext/RSC SSR) -- getTraceHistory()
+  // itself is a safe, valid server snapshot too: real traces are only ever
+  // recorded client-side (voice/narration/wake events), so it's always []
+  // during SSR either way.
+  const perfTraces = useSyncExternalStore(subscribeTraces, getTraceHistory, getTraceHistory);
   const [lastError, setLastError] = useState<string | null>(null);
   const [controlMode, setControlModeState] = useState<ControlMode>("presenterLeads");
   // Set once, up front (ModeSelectStage), reused for the first-contact
@@ -604,6 +562,13 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // actually persisted from a previous session; a fresh session (nothing
   // persisted yet) leaves every value at the same default it already
   // rendered, so this is a genuine no-op for first-time visitors.
+  // Deliberate exception to react-hooks/set-state-in-effect: this isn't
+  // deriving state that could be computed during render -- it's a one-time
+  // post-hydration sync from localStorage, which genuinely differs between
+  // the server render (no `window`) and the client's own first render, and
+  // MUST happen in an effect (after commit) rather than during render to
+  // avoid exactly the hydration-mismatch bug documented above this block.
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     const saved = loadPresentSettings();
     setLanguageState(saved.language);
@@ -612,6 +577,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     setBrowserFallbackEnabledState(saved.browserFallbackEnabled);
     setAsrProviderState(loadAsrProvider());
   }, []);
+  /* eslint-enable react-hooks/set-state-in-effect */
   const [questions, setQuestions] = useState<QueuedQuestion[]>([]);
   const queueQuestion = useCallback((text: string) => {
     setQuestions((qs) => [...qs, { id: crypto.randomUUID(), text, status: "pending", timestamp: Date.now() }]);
@@ -633,11 +599,10 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const [isPresentingAutonomously, setIsPresentingAutonomously] = useState(false);
   // Local-pipeline activation lifecycle (Phase 1/2 of the activation
   // milestone) -- deliberately separate from attentionState's
-  // sleeping/standby, which is wired to the OpenAI Realtime connection this
-  // mode never uses (Present mode's typed/voice commands go through the
-  // local gateway, not wake()/RealtimeSession). jackAwakeRef is the
-  // authoritative synchronous guard against a double greeting; jackAwake is
-  // its reactive mirror for the UI.
+  // sleeping/standby (the dormant OpenAI Realtime path's states, unused
+  // since the Realtime implementation was removed -- see PROGRESS.md).
+  // jackAwakeRef is the authoritative synchronous guard against a double
+  // greeting; jackAwake is its reactive mirror for the UI.
   const jackAwakeRef = useRef(false);
   const [jackAwake, setJackAwake] = useState(false);
   // Separate from jackAwakeRef on purpose: jackAwake/asleep resets on every
@@ -762,6 +727,11 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // (defined later, since they depend on the speech player/narration deps).
   const cancelAutonomousPresentingRef = useRef<() => void>(() => {});
   const startAutonomousPresentingRef = useRef<(slideIndex?: number) => void>(() => {});
+  // Same forward-reference pattern (react-hooks/immutability lint fix): the
+  // auto-advance-to-next-slide closure inside runNarrationStep itself needs
+  // to call the LATEST runNarrationStep recursively, which can't reference
+  // the `const` it's declared inside of before that declaration finishes.
+  const runNarrationStepRef = useRef<(generation: number, slideIndex?: number) => Promise<void>>(async () => {});
   // Same forward-reference pattern, for pause()/interrupt()'s short spoken
   // acknowledgement (Phase 14) -- speakThroughPlayer is defined later since
   // it depends on speechPlayer/voice. Optional traceId (perf tracing,
@@ -772,13 +742,6 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // speakAndWait is defined later since it depends on speechPlayer/voice.
   const speakAndWaitRef = useRef<(text: string, traceId?: string) => Promise<void>>(async () => {});
 
-  const realtimeSessionRef = useRef<RealtimeSession | null>(null);
-  const micStreamRef = useRef<MediaStream | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const rafRef = useRef<number | null>(null);
-  const humourUsedRef = useRef(false);
-  const openingPendingRef = useRef(false);
   const controllerRef = useRef<{ name: string; controller: PresentationController }>({
     name: "idle",
     controller: unsupportedController("no active mode"),
@@ -814,225 +777,8 @@ export function JackProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const buildCurrentInstructions = useCallback(() => {
-    return buildInstructions({
-      documentSummary: summarizeDocuments(Object.values(appSessionRef.current.parsedDocs)),
-      controlMode,
-      audienceQuestionPolicy,
-      language,
-      humourEnabled,
-      humourUsed: humourUsedRef.current,
-      modeName: controllerRef.current.name,
-    });
-  }, [controlMode, audienceQuestionPolicy, language, humourEnabled]);
-
-  const stopLevelLoop = useCallback(() => {
-    if (rafRef.current !== null) {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = null;
-    }
-  }, []);
-
-  const runLevelLoop = useCallback(() => {
-    const analyser = analyserRef.current;
-    if (!analyser) return;
-    const data = new Uint8Array(analyser.frequencyBinCount);
-    const tick = () => {
-      if (!analyserRef.current) return;
-      analyserRef.current.getByteTimeDomainData(data);
-      let sumSquares = 0;
-      for (let i = 0; i < data.length; i++) {
-        const normalized = (data[i] - 128) / 128;
-        sumSquares += normalized * normalized;
-      }
-      setMicLevel(Math.min(1, Math.sqrt(sumSquares / data.length) * 4));
-      rafRef.current = requestAnimationFrame(tick);
-    };
-    rafRef.current = requestAnimationFrame(tick);
-  }, []);
-
-  const teardownMic = useCallback(() => {
-    stopLevelLoop();
-    setMicLevel(0);
-    if (micStreamRef.current) {
-      micStreamRef.current.getTracks().forEach((track) => track.stop());
-      micStreamRef.current = null;
-    }
-    if (audioContextRef.current) {
-      void audioContextRef.current.close().catch(() => {});
-      audioContextRef.current = null;
-    }
-    analyserRef.current = null;
-  }, [stopLevelLoop]);
-
-  const fetchEphemeralKey = useCallback(async (): Promise<string> => {
-    const response = await fetch("/api/realtime/session", { method: "POST" });
-    const body = (await response.json().catch(() => null)) as
-      | { ok: true; clientSecret: string }
-      | { ok: false; message: string }
-      | null;
-    if (!response.ok || !body || !body.ok) {
-      throw new Error(body && "message" in body ? body.message : "Couldn't connect to OpenAI.");
-    }
-    return body.clientSecret;
-  }, []);
-
-  const updateTranscriptFromHistory = useCallback((history: RealtimeItem[]) => {
-    const entries = textFromHistory(history);
-    setTranscript(entries);
-    const lastJack = [...entries].reverse().find((e) => e.role === "jack");
-    setCurrentCaptionTracked(lastJack?.text ?? "");
-  }, []);
-
-  const wireSessionEvents = useCallback(
-    (session: RealtimeSession) => {
-      session.on("audio_start", () => dispatchEvent({ type: "AUDIO_START" }));
-      session.on("audio_stopped", () => {
-        dispatchEvent({ type: "AUDIO_STOPPED" });
-        if (openingPendingRef.current) {
-          openingPendingRef.current = false;
-          humourUsedRef.current = true;
-          realtimeSessionRef.current?.transport.updateSessionConfig({ instructions: buildCurrentInstructions() });
-        }
-      });
-      session.on("audio_interrupted", () => dispatchEvent({ type: "AUDIO_INTERRUPTED" }));
-      session.on("agent_tool_start", () => dispatchEvent({ type: "TOOL_START" }));
-      session.on("agent_tool_end", () => dispatchEvent({ type: "TOOL_END" }));
-      session.on("error", () => {
-        dispatchEvent({ type: "ERROR", message: "Jack ran into a connection problem." });
-      });
-      session.on("history_updated", (history) => updateTranscriptFromHistory(history));
-      session.on("transport_event", (event) => {
-        const type = transportEventType(event);
-        if (type === "input_audio_buffer.speech_started") dispatchEvent({ type: "USER_SPEECH_DETECTED" });
-        if (type === "response.created") dispatchEvent({ type: "RESPONSE_REQUESTED" });
-      });
-    },
-    [dispatchEvent, updateTranscriptFromHistory, buildCurrentInstructions],
-  );
-
-  const wake = useCallback(async () => {
-    if (realtimeSessionRef.current) {
-      dispatchEvent({ type: "WAKE" });
-      return;
-    }
-
-    dispatchEvent({ type: "WAKE" });
-    dispatchEvent({ type: "CONNECT_REQUESTED" });
-    setConnectionStatus("connecting");
-    setLastError(null);
-
-    // Confirm OpenAI is actually reachable before asking the user for microphone access —
-    // no point prompting for a permission we can't use.
-    let ephemeralKey: string;
-    try {
-      ephemeralKey = await fetchEphemeralKey();
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Couldn't connect to OpenAI.";
-      setConnectionStatus("error");
-      dispatchEvent({ type: "CONNECT_FAILED", message });
-      return;
-    }
-
-    setMicStatus("requesting");
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      micStreamRef.current = stream;
-
-      const AudioContextCtor = window.AudioContext ?? (window as unknown as WebkitAudioContextWindow).webkitAudioContext;
-      if (AudioContextCtor) {
-        const audioContext = new AudioContextCtor();
-        audioContextRef.current = audioContext;
-        const source = audioContext.createMediaStreamSource(stream);
-        const analyser = audioContext.createAnalyser();
-        analyser.fftSize = 512;
-        source.connect(analyser);
-        analyserRef.current = analyser;
-        runLevelLoop();
-      }
-      setMicStatus("listening");
-
-      openingPendingRef.current = humourEnabled;
-      const tools = createPresentationTools(() => controllerRef.current.controller);
-      const agent = new RealtimeAgent({
-        name: "jack",
-        instructions: buildCurrentInstructions(),
-        tools,
-        voice: "marin",
-      });
-      const transport = new OpenAIRealtimeWebRTC({ mediaStream: stream });
-      const session = new RealtimeSession(agent, {
-        apiKey: ephemeralKey,
-        transport,
-        model: REALTIME_MODEL,
-      });
-      wireSessionEvents(session);
-      realtimeSessionRef.current = session;
-
-      await session.connect({ apiKey: ephemeralKey });
-      setConnectionStatus("connected");
-      dispatchEvent({ type: "CONNECTED" });
-      dispatchEvent({ type: "WAKE" });
-    } catch (err) {
-      realtimeSessionRef.current = null;
-      teardownMic();
-      const message = err instanceof Error ? err.message : "Couldn't connect to OpenAI.";
-      const isPermissionDenied = err instanceof DOMException && err.name === "NotAllowedError";
-      const isNoDevice = err instanceof DOMException && err.name === "NotFoundError";
-      setConnectionStatus("error");
-      if (isPermissionDenied) {
-        setMicStatus("denied");
-        setLastError("Microphone permission was denied. Allow access in your browser's site settings to use Jack.");
-        dispatchEvent({ type: "MIC_DENIED" });
-      } else if (isNoDevice) {
-        setMicStatus("unavailable");
-        setLastError("No microphone was found on this device.");
-        dispatchEvent({ type: "MIC_UNAVAILABLE" });
-      } else {
-        setMicStatus("error");
-        dispatchEvent({ type: "CONNECT_FAILED", message });
-      }
-    }
-  }, [dispatchEvent, teardownMic, runLevelLoop, humourEnabled, buildCurrentInstructions, fetchEphemeralKey, wireSessionEvents]);
-
-  const sleep = useCallback(() => {
-    // Only dispatch SLEEP (which sets the SHARED attentionState to
-    // "sleeping") if there was an actual OpenAI Realtime session to tear
-    // down. Present mode's unmount cleanup calls sleep() unconditionally as
-    // defensive teardown regardless of whether OpenAI was ever connected --
-    // and since nothing in the current UI ever calls wake() to establish
-    // that connection in the first place, every real call here used to be a
-    // no-op session teardown that nonetheless permanently poisoned
-    // attentionState to "sleeping" for the rest of the browser session (no
-    // local-only code path ever dispatches WAKE to undo it). Confirmed live
-    // as captions silently never rendering again after a single visit to
-    // Present mode, and (before a separate fix) the local ambient mic
-    // refusing to arm anywhere afterward.
-    const hadSession = realtimeSessionRef.current !== null;
-    realtimeSessionRef.current?.close();
-    realtimeSessionRef.current = null;
-    teardownMic();
-    setMicStatus("off");
-    setConnectionStatus("disconnected");
-    if (hadSession) dispatchEvent({ type: "SLEEP" });
-  }, [teardownMic, dispatchEvent]);
-
-  const mute = useCallback(() => {
-    realtimeSessionRef.current?.mute(true);
-    setMicStatus("muted");
-    dispatchEvent({ type: "MUTE" });
-  }, [dispatchEvent]);
-
-  const unmute = useCallback(() => {
-    realtimeSessionRef.current?.mute(false);
-    setMicStatus("listening");
-    dispatchEvent({ type: "UNMUTE" });
-  }, [dispatchEvent]);
-
   const pause = useCallback(() => {
     speechPlayer.unlock(); // must run synchronously inside this click -- see jackSpeechPlayer.ts
-    realtimeSessionRef.current?.interrupt();
     controllerRef.current.controller.pausePresentation();
     cancelAutonomousPresentingRef.current(); // manual Pause button must also stop Jack's own narration loop -- audio is already cancelled before the line below fires
     dispatchEvent({ type: "PAUSE" });
@@ -1065,54 +811,29 @@ export function JackProvider({ children }: { children: ReactNode }) {
 
   const interrupt = useCallback(() => {
     speechPlayer.unlock();
-    realtimeSessionRef.current?.interrupt();
     cancelAutonomousPresentingRef.current(); // manual Stop must also cancel local narration + pending advance -- audio is already cancelled before the acknowledgement below fires
     void speakThroughPlayerRef.current("Sure. I'll stop here.");
   }, [speechPlayer]);
 
-  const sendText = useCallback((text: string) => {
-    realtimeSessionRef.current?.sendMessage(text);
+  /** See JackContextValue's doc comment -- backs the "Sync Jack to this
+   * slide" control. A no-op when Jack isn't presenting (nothing to resync). */
+  const syncNarrationToSlide = useCallback((slideIndex: number) => {
+    if (presenterControlRef.current !== "jack") return;
+    startAutonomousPresentingRef.current(slideIndex);
   }, []);
 
-  const retryConnection = useCallback(async () => {
-    setLastError(null);
-    await wake();
-  }, [wake]);
-
-  const registerController = useCallback(
-    (modeName: string, controller: PresentationController) => {
-      controllerRef.current = { name: modeName, controller };
-      realtimeSessionRef.current?.transport.updateSessionConfig({ instructions: buildCurrentInstructions() });
-    },
-    [buildCurrentInstructions],
-  );
+  const registerController = useCallback((modeName: string, controller: PresentationController) => {
+    controllerRef.current = { name: modeName, controller };
+  }, []);
 
   const unregisterController = useCallback(() => {
     controllerRef.current = { name: "idle", controller: unsupportedController("no active mode") };
   }, []);
 
   const endSession = useCallback(() => {
-    // Same fix as sleep() above and for the same reason: only dispatch
-    // DISCONNECTED (-> attentionState "disconnected", permanently, since
-    // nothing local-only ever dispatches WAKE/CONNECTED to undo it) if there
-    // was a real OpenAI Realtime session to disconnect from. endSession()
-    // runs on every single "Exit presentation" click -- far more often than
-    // sleep()'s unmount-only path -- so this was the MORE common real-world
-    // trigger for attentionState getting stuck, confirmed live as captions
-    // silently never rendering again after simply exiting a presentation
-    // once via the Exit button.
-    const hadSession = realtimeSessionRef.current !== null;
-    realtimeSessionRef.current?.close();
-    realtimeSessionRef.current = null;
-    teardownMic();
     wakeWordService.stop();
     cancelAutonomousPresentingRef.current();
-    setMicStatus("off");
-    setConnectionStatus("disconnected");
-    setTranscript([]);
     setCurrentCaptionTracked("");
-    humourUsedRef.current = false;
-    openingPendingRef.current = false;
     presentationOpeningDeliveredRef.current = false; // Phase 18: ending the presentation is a genuinely new session next time
     // Confirmed live via MCP testing: without this, exiting and starting a
     // brand-new presentation still showed "Control: Jack" left over from the
@@ -1125,8 +846,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     // starting a different, unrelated one still showed the previous
     // session's queued questions in the notes panel.
     setQuestions([]);
-    if (hadSession) dispatchEvent({ type: "DISCONNECTED" });
-  }, [teardownMic, dispatchEvent, wakeWordService]);
+  }, [wakeWordService, setCurrentCaptionTracked]);
 
   // --- Controlled Jack speech (Phase 6) ---------------------------------
   const stopJackAudio = useCallback(() => {
@@ -1176,7 +896,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
         finishTrace(traceId, false);
       }
     },
-    [dispatchEvent, speechPlayer, voice],
+    [dispatchEvent, speechPlayer, voice, setCurrentCaptionTracked],
   );
 
   useEffect(() => {
@@ -1216,7 +936,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
             resolve(); // Kokoro unavailable -- don't block the caller's continuation
           });
       }),
-    [dispatchEvent, speechPlayer, voice],
+    [dispatchEvent, speechPlayer, voice, setCurrentCaptionTracked],
   );
 
   useEffect(() => {
@@ -1251,7 +971,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
         }
       }
     },
-    [dispatchEvent, speechPlayer, voice, browserFallbackEnabled, offlineSpeechSupported, speakOffline],
+    [dispatchEvent, speechPlayer, voice, browserFallbackEnabled, offlineSpeechSupported, speakOffline, setCurrentCaptionTracked],
   );
 
   /**
@@ -1392,7 +1112,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     // acknowledgement, readCurrentSlide, etc.) set their own caption right
     // after this runs, so this only ever clears a caption nothing replaces.
     setCurrentCaptionTracked("");
-    if (bargeInPhaseRef.current !== "idle") {
+    if (bargeInPhaseRef.current !== "idle" && bargeInPhaseRef.current !== "processing") {
       setBargeInPhaseBoth("idle");
       clearBargeInArmTimers();
       clearBargeInCaptureTimeout();
@@ -1402,7 +1122,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       // stray unhandled-promise-rejection error with nothing to act on it.
       void localRecorder.stop("cancel").catch(() => {}); // discard whatever was captured -- cancellation, not a command
     }
-  }, [stopJackAudio, clearBargeInArmTimers, clearBargeInCaptureTimeout, localRecorder, setBargeInPhaseBoth]);
+  }, [stopJackAudio, clearBargeInArmTimers, clearBargeInCaptureTimeout, localRecorder, setBargeInPhaseBoth, setCurrentCaptionTracked]);
 
   // Speculatively generates + synthesizes the NEXT slide's opening sentence
   // now, so it's (often) already sitting ready by the time that slide
@@ -1592,7 +1312,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
         }
         // Pass the index goToNextSlide() just returned, not "whatever
         // current looks like now" -- see runNarrationStep's param comment.
-        void runNarrationStep(generation, advance.data.index);
+        void runNarrationStepRef.current(generation, advance.data.index);
       };
 
       speechPlayer.play(opening.audio, () => {
@@ -1630,8 +1350,12 @@ export function JackProvider({ children }: { children: ReactNode }) {
         })();
       });
     },
-    [cancelAutonomousPresenting, dispatchEvent, speechPlayer, voice, humourEnabled, prefetchNextSlideOpening, assistantName],
+    [cancelAutonomousPresenting, dispatchEvent, speechPlayer, voice, humourEnabled, prefetchNextSlideOpening, assistantName, setCurrentCaptionTracked],
   );
+
+  useEffect(() => {
+    runNarrationStepRef.current = runNarrationStep;
+  }, [runNarrationStep]);
 
   // `slideIndex`, when given, is the AUTHORITATIVE slide to resume/start
   // narrating on -- required by any caller whose own action already knows
@@ -1830,7 +1554,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
         void finishBargeInCapture(sustainedSilence ? "silence" : "hard_cap");
       }
     }, 150);
-  }, [dispatchEvent, clearBargeInArmTimers, clearBargeInCaptureTimeout, finishBargeInCapture, localRecorder, capturePolicy]);
+  }, [dispatchEvent, clearBargeInArmTimers, clearBargeInCaptureTimeout, finishBargeInCapture, localRecorder, capturePolicy, setBargeInPhaseBoth]);
 
   // Arm/disarm ambient listening. Two independent reasons to be armed:
   // (1) automatic -- Jack holds the floor (presenterControl === "jack") and
@@ -1872,14 +1596,22 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // level-keyed effect) for the same reason the capture-silence poll is --
   // see its comment.
   useEffect(() => {
+    let cancelled = false;
     const autoArmWhileJackPresents = presenterControl === "jack" && (attentionState === "speaking" || attentionState === "standby");
     const shouldArm = ambientListeningEnabled || autoArmWhileJackPresents;
     if (shouldArm && bargeInPhaseRef.current === "idle") {
       setBargeInPhaseBoth("guarding");
       bargeInLoudTicksRef.current = 0;
       console.log("[mic] start() called from: arm effect (armed)", { attentionState, presenterControl });
-      void localRecorder.start();
-      bargeInArmGuardTimeoutRef.current = setTimeout(() => {
+      void localRecorder.start().then((started) => {
+        if (cancelled || !started || bargeInPhaseRef.current !== "guarding") {
+          clearBargeInArmTimers();
+          if (bargeInPhaseRef.current === "guarding") setBargeInPhaseBoth("idle");
+          if (!started) setAmbientListeningEnabledState(false);
+          if (cancelled && started) void localRecorder.stop("route_change").catch(() => {});
+          return;
+        }
+        bargeInArmGuardTimeoutRef.current = setTimeout(() => {
         if (bargeInPhaseRef.current !== "guarding") return; // disarmed/interrupted during the guard window
         setBargeInPhaseBoth("calibrating");
         bargeInCalibrationSamplesRef.current = [];
@@ -1898,7 +1630,8 @@ export function JackProvider({ children }: { children: ReactNode }) {
           bargeInLoudTicksRef.current = 0;
           setBargeInPhaseBoth("armed");
         }, capturePolicy.calibrationMs);
-      }, capturePolicy.armGuardMs);
+        }, capturePolicy.armGuardMs);
+      });
     } else if (
       !shouldArm &&
       bargeInPhaseRef.current !== "idle" &&
@@ -1915,8 +1648,26 @@ export function JackProvider({ children }: { children: ReactNode }) {
       console.log("[mic] stop() called from: disarm effect", { attentionState, presenterControl });
       void localRecorder.stop("route_change").catch(() => {}); // fire-and-forget -- see cancelAutonomousPresenting's matching comment
     }
+    return () => {
+      cancelled = true;
+    };
     // "capturing" and "processing" are left alone here; handleBargeInDetected/finishBargeInCapture own those transitions.
-  }, [attentionState, presenterControl, ambientListeningEnabled, localRecorder, clearBargeInArmTimers, setBargeInPhaseBoth, capturePolicy]);
+    // Deliberately localRecorder.start/localRecorder.stop, not the whole
+    // localRecorder object: useLocalRecorder() returns a brand-new object
+    // literal every render (its `level` field updates ~60x/sec via rAF while
+    // listening), but start/stop are individually useCallback-stable. Depending
+    // on the whole object made this effect's cleanup fire on every level-driven
+    // re-render -- cancelling an in-flight start() before its first-PCM-frame
+    // promise resolved, which then called stop("route_change") on a genuinely
+    // successful mic activation and immediately re-armed, producing a runaway
+    // start()/stop("route_change") loop (confirmed live via Chrome DevTools:
+    // dozens of start()/stop("route_change") calls per second while sitting in
+    // Present mode with no actual route/mode change). exhaustive-deps can't
+    // see that localRecorder.stop (used only inside the nested start().then()
+    // closure above) is covered by the same narrowing as localRecorder.start,
+    // and asks for the whole object back -- doing that reintroduces the bug.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [attentionState, presenterControl, ambientListeningEnabled, localRecorder.start, localRecorder.stop, clearBargeInArmTimers, setBargeInPhaseBoth, capturePolicy]);
 
   // Watches mic level while armed for a sustained loud burst -> real
   // interruption, against this utterance's calibrated effective threshold
@@ -2311,27 +2062,21 @@ export function JackProvider({ children }: { children: ReactNode }) {
     [speechPlayer],
   );
 
-  // Push updated instructions to a live session whenever behavior-affecting settings change.
-  useEffect(() => {
-    if (realtimeSessionRef.current && connectionStatus === "connected") {
-      realtimeSessionRef.current.transport.updateSessionConfig({ instructions: buildCurrentInstructions() });
-    }
-  }, [buildCurrentInstructions, connectionStatus]);
-
+  // Unmount cleanup: the barge-in arm/disarm effect's own timer chain
+  // (arm-guard -> calibration -> the capture-silence poll) is normally
+  // cleared from within that effect's disarm branch or from
+  // finishBargeInCapture/handleBargeInDetected -- but if the whole provider
+  // unmounts while barge-in is mid-flight (a route change unmounting the
+  // app tree, or React Strict Mode's dev double-invoke), none of those ever
+  // run, and the pending timers keep firing against a torn-down closure.
   useEffect(() => {
     return () => {
-      realtimeSessionRef.current?.close();
-      teardownMic();
+      clearBargeInArmTimers();
+      clearBargeInCaptureTimeout();
+      void localRecorder.stop("session_end").catch(() => {});
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  const sendingAudioToOpenAI =
-    connectionStatus === "connected" &&
-    micStatus === "listening" &&
-    attentionState !== "sleeping" &&
-    attentionState !== "muted" &&
-    attentionState !== "disconnected";
 
   const localUnavailable =
     jackLocalHealth !== null && jackLocalHealth.llamacpp === "unavailable" && jackLocalHealth.colibri === "unavailable";
@@ -2339,11 +2084,6 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const value: JackContextValue = {
     attentionState,
     orb: toOrbPresentation(attentionState, assistantName),
-    connectionStatus,
-    micStatus,
-    micLevel,
-    sendingAudioToOpenAI,
-    transcript,
     currentCaption,
     lastError,
     controlMode,
@@ -2374,15 +2114,10 @@ export function JackProvider({ children }: { children: ReactNode }) {
     setPresenterControl,
     jackLocalHealth,
     localUnavailable,
-    wake,
-    sleep,
-    mute,
-    unmute,
     pause,
     resume,
     interrupt,
-    retryConnection,
-    sendText,
+    syncNarrationToSlide,
     setControlMode: setControlModeState,
     setPresenterName: setPresenterNameState,
     setAudienceQuestionPolicy: setAudienceQuestionPolicyState,

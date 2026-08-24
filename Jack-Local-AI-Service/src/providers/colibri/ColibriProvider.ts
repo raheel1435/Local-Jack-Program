@@ -7,6 +7,8 @@ import type {
 } from "../../types/jack.js";
 
 const HEALTH_TIMEOUT_MS = 2000;
+// CLAUDE-15 fix: see LlamaCppProvider.ts's matching comment.
+const CHAT_TIMEOUT_MS = 60_000;
 
 export class ColibriProvider implements LlmProvider {
   private readonly baseUrl: string;
@@ -37,6 +39,7 @@ export class ColibriProvider implements LlmProvider {
         temperature: req.temperature,
         max_tokens: req.max_tokens,
       }),
+      signal: AbortSignal.timeout(CHAT_TIMEOUT_MS),
     });
 
     if (!res.ok) {

@@ -109,6 +109,12 @@ export class VibeAsrProvider implements AsrProvider {
     };
   }
 
+  /** CLAUDE-35 fix: passthrough so the gateway's shutdown hook can terminate
+   * the warm child (if any) without reaching into a private field. */
+  stop(): void {
+    this.warmServer?.stop();
+  }
+
   /** Reference one-shot path (VibeVoiceTestConfig.warmRuntime === false only).
    * The warm server's --context is fixed at process start (no per-request
    * override in its stdin protocol -- see VibeWarmServer's class comment),

@@ -7,6 +7,10 @@ import type {
 } from "../../types/jack.js";
 
 const HEALTH_TIMEOUT_MS = 2000;
+// CLAUDE-15 fix: checkHealth() already had a bound; the actual work-performing
+// call (chat()) had none at all, so a hung llama-server process could hang
+// this request (and the caller waiting on it) indefinitely.
+const CHAT_TIMEOUT_MS = 60_000;
 
 /**
  * llama.cpp's built-in server (`llama-server`), OpenAI-compatible.
@@ -44,6 +48,7 @@ export class LlamaCppProvider implements LlmProvider {
         max_tokens: req.max_tokens,
         ...(req.grammar ? { grammar: req.grammar } : {}),
       }),
+      signal: AbortSignal.timeout(CHAT_TIMEOUT_MS),
     });
 
     if (!res.ok) {

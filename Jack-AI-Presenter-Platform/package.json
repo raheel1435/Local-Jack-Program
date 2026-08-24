@@ -10,18 +10,14 @@
     "dev": "vite",
     "build": "vinext build",
     "start": "vinext start",
-    "test": "npm run build && node --test tests/rendered-html.test.mjs && node --experimental-strip-types --import ./tests/register-ts-loader.mjs --test tests/deck-retrieval.test.mjs tests/presentation-lifecycle.test.mjs tests/perf-trace.test.mjs tests/narration-prefetch.test.mjs tests/addressing.test.mjs tests/capturePolicy.test.mjs",
+    "test": "npm run build && node --test tests/rendered-html.test.mjs && node --experimental-strip-types --import ./tests/register-ts-loader.mjs --test tests/deck-retrieval.test.mjs tests/presentation-lifecycle.test.mjs tests/perf-trace.test.mjs tests/narration-prefetch.test.mjs tests/addressing.test.mjs tests/capturePolicy.test.mjs tests/session-reducer.test.mjs tests/ask-jack-scope.test.mjs tests/jack-api-health.test.mjs",
     "validate:artifact": "bash scripts/validate-artifact.sh",
-    "lint": "bash scripts/sites-env.sh -- eslint . --ignore-pattern dist --ignore-pattern .next",
-    "db:generate": "bash scripts/sites-env.sh -- drizzle-kit generate"
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"
   },
   "dependencies": {
-    "@openai/agents-realtime": "^0.15.0",
-    "drizzle-orm": "0.45.2",
     "jszip": "^3.10.1",
     "mammoth": "^1.12.1",
     "next": "16.2.6",
-    "openai": "^7.4.0",
     "pdfjs-dist": "^6.2.108",
     "react": "19.2.6",
     "react-dom": "19.2.6",
@@ -35,7 +31,6 @@
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.2",
     "@vitejs/plugin-rsc": "0.5.26",
-    "drizzle-kit": "0.31.10",
     "eslint": "9.39.4",
     "eslint-config-next": "16.2.6",
     "react-server-dom-webpack": "19.2.6",

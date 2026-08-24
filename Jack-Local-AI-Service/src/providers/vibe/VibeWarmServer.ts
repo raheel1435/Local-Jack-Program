@@ -31,6 +31,10 @@ export class VibeWarmServer {
   private child: ChildProcessWithoutNullStreams | null = null;
   private ready: Promise<void> | null = null;
   private queue: Promise<void> = Promise.resolve();
+  private lifecycle: "running" | "closing" | "closed" = "running";
+  private pendingRequests = 0;
+  private readonly maxPendingRequests = 3;
+  private rejectReady: ((err: Error) => void) | null = null;
 
   private collectedLines: string[] = [];
   private currentResolve: ((transcript: string) => void) | null = null;
@@ -49,20 +53,32 @@ export class VibeWarmServer {
 
   /** Serializes requests: the child's stdin/stdout is a single shared stream. */
   async transcribe(audioFilePath: string): Promise<string> {
-    await this.ensureStarted();
-    const run = this.queue.then(() => this.sendOne(audioFilePath));
-    // Keep the chain alive regardless of this request's outcome so a single
-    // failure doesn't wedge every request queued behind it.
-    this.queue = run.then(
-      () => undefined,
-      () => undefined
-    );
-    return run;
+    if (this.lifecycle !== "running") throw this.shutdownError();
+    if (this.pendingRequests >= this.maxPendingRequests) {
+      throw new Error("VibeVoice warm server queue is full");
+    }
+    this.pendingRequests += 1;
+    try {
+      await this.ensureStarted();
+      if (this.lifecycle !== "running") throw this.shutdownError();
+      const run = this.queue.then(() => this.sendOne(audioFilePath));
+      // Keep the chain alive regardless of this request's outcome so a single
+      // failure doesn't wedge every request queued behind it.
+      this.queue = run.then(
+        () => undefined,
+        () => undefined
+      );
+      return await run;
+    } finally {
+      this.pendingRequests -= 1;
+    }
   }
 
   private ensureStarted(): Promise<void> {
+    if (this.lifecycle !== "running") return Promise.reject(this.shutdownError());
     if (this.ready) return this.ready;
     this.ready = new Promise<void>((resolveReady, rejectReady) => {
+      this.rejectReady = rejectReady;
       const args = [
         "--vae-model",
         this.vaeModelPath,
@@ -97,6 +113,7 @@ export class VibeWarmServer {
           if (line.trim() === "---READY---") {
             becameReady = true;
             clearTimeout(startTimeout);
+            this.rejectReady = null;
             resolveReady();
           }
           return;
@@ -121,11 +138,24 @@ export class VibeWarmServer {
       child.stdin.on("error", (err) => {
         this.failCurrent(err instanceof Error ? err : new Error(String(err)));
       });
+      // CLAUDE-18 fix: stdout/stderr are exposed to the exact same
+      // pipe-breakage class already proven live and fixed for stdin above
+      // (a broken pipe firing 'error' with zero listeners crashes the whole
+      // Node process) -- child.stderr.resume() only drains data, it doesn't
+      // add an error listener, and the readline interface on stdout
+      // (below) doesn't either.
+      child.stdout.on("error", (err) => {
+        this.failCurrent(err instanceof Error ? err : new Error(String(err)));
+      });
+      child.stderr.on("error", (err) => {
+        this.failCurrent(err instanceof Error ? err : new Error(String(err)));
+      });
 
       child.on("exit", (code) => {
         clearTimeout(startTimeout);
         this.child = null;
         this.ready = null;
+        this.rejectReady = null;
         const err = new Error(`VibeVoice warm server exited unexpectedly (code ${code})`);
         this.failCurrent(err);
         if (!becameReady) rejectReady(err);
@@ -135,6 +165,7 @@ export class VibeWarmServer {
         clearTimeout(startTimeout);
         this.child = null;
         this.ready = null;
+        this.rejectReady = null;
         this.failCurrent(err);
         if (!becameReady) rejectReady(err);
       });
@@ -142,10 +173,38 @@ export class VibeWarmServer {
     return this.ready;
   }
 
-  private sendOne(audioFilePath: string): Promise<string> {
+  private sendOne(audioFilePath: string, isRetry = false): Promise<string> {
     return new Promise<string>((resolve, reject) => {
+      if (this.lifecycle !== "running") {
+        reject(this.shutdownError());
+        return;
+      }
       if (!this.child) {
-        reject(new Error("VibeVoice warm server is not running"));
+        // CLAUDE-34 fix: if the child crashed while THIS request was
+        // already queued behind an earlier one (which already passed its
+        // own ensureStarted() check before the crash), failing immediately
+        // meant a whole burst of concurrent requests all failed, not just
+        // the one that was actually in flight when the server died --
+        // contrary to this class's own stated goal ("a single failure
+        // doesn't wedge every request queued behind it"). One retry against
+        // a freshly-respawned server before giving up.
+        if (isRetry) {
+          reject(new Error("VibeVoice warm server is not running"));
+          return;
+        }
+        // Don't reset this.ready here -- the child's own 'exit'/'error'
+        // handler already nulled it when it died. If it's non-null again
+        // already, another concurrent retry's respawn is already in
+        // flight; ensureStarted()'s own `if (this.ready) return this.ready`
+        // guard means we correctly await THAT one instead of racing a
+        // second spawn of the same server.
+        this.ensureStarted().then(
+          () => {
+            if (this.lifecycle !== "running") reject(this.shutdownError());
+            else this.sendOne(audioFilePath, true).then(resolve, reject);
+          },
+          (err) => reject(err instanceof Error ? err : new Error(String(err))),
+        );
         return;
       }
       this.collectedLines = [];
@@ -203,5 +262,29 @@ export class VibeWarmServer {
 
   private failCurrent(err: Error): void {
     if (this.currentReject) this.rejectCurrent(err);
+  }
+
+  /** CLAUDE-35 fix: terminates the warm child (if any) so it doesn't
+   * outlive the gateway process. Nothing previously called this -- the
+   * gateway had no shutdown hook at all, so a killed/restarted gateway
+   * (Ctrl+C, IDE restart) could leave asr_stream_server.exe (holding the
+   * ~1.58GB VAE+LM weights in memory) running as an orphan. Safe to call
+   * even if no child is running. */
+  stop(): void {
+    if (this.lifecycle !== "running") return;
+    this.lifecycle = "closing";
+    const err = this.shutdownError();
+    this.rejectReady?.(err);
+    this.rejectReady = null;
+    this.failCurrent(err);
+    const child = this.child;
+    this.child = null;
+    this.ready = null;
+    child?.kill();
+    this.lifecycle = "closed";
+  }
+
+  private shutdownError(): Error {
+    return new Error("VibeVoice warm server is shutting down");
   }
 }

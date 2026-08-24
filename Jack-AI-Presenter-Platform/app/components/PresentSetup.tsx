@@ -37,11 +37,11 @@ export function PresentSetup({ onReady, title }: { onReady: () => void; title: s
   const activeVoiceLabel = VOICE_OPTIONS.find((v) => v.id === jack.voice)?.label ?? "Jack";
 
   // Manual presentation must always be reachable (Phase 9): the presenter
-  // proceeds immediately. Jack (OpenAI voice, or the local-command panel
-  // inside PresentSession) connects on demand from there, same as
+  // proceeds immediately. Jack's local voice and command pipeline connects
+  // on demand from there, same as
   // Practice/Ask Jack -- neither of those gates entry on a live connection
   // either, and Present shouldn't be the one mode that becomes unusable
-  // when OpenAI (or Jack Local AI) is unreachable.
+  // when Jack Local AI is unreachable.
   const handleStart = () => {
     // "Jack leads" auto-starts narration once the session mounts (see
     // PresentStage's own effect) -- but that mount happens asynchronously,
@@ -148,7 +148,7 @@ export function PresentSetup({ onReady, title }: { onReady: () => void; title: s
           Start presentation
         </button>
         <p className="setup-note">
-          Manual navigation and typed {jack.assistantName} commands work immediately. Connect the mic from the presentation screen for live OpenAI voice, or type commands to use Jack Local AI instead.
+          Manual navigation and typed {jack.assistantName} commands work immediately. The presentation microphone and voice commands use the local Jack AI service.
         </p>
       </div>
     </section>

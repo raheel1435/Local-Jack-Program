@@ -30,6 +30,25 @@ export function AnalysisStage() {
   const processingRef = useRef(false);
   const completedRef = useRef(false);
 
+  // CLAUDE-12 fix: guards every dispatch in the processing effect below
+  // against firing after THIS component instance has genuinely unmounted --
+  // scoped to its own empty-deps effect (not the processing effect, whose
+  // deps change on every analysis step and would re-run a same-effect
+  // cleanup long before real unmount, cancelling in-flight work
+  // immediately). Without this, leaving Analysis mid-parse (e.g. via
+  // BACK_TO_UPLOAD, now that CLAUDE-11 makes re-entering Analysis genuinely
+  // possible) left the in-flight parseFile/pregenerateDeckNarration promise
+  // chain running in the background, still mutating session state for a
+  // stage the user had already left. A fresh AnalysisStage mount later gets
+  // its own fresh ref, so only the OLD instance's stale work is stopped.
+  // Mirrors the `cancelled`-flag pattern SlideVisual.tsx already uses.
+  const cancelledRef = useRef(false);
+  useEffect(() => {
+    return () => {
+      cancelledRef.current = true;
+    };
+  }, []);
+
   useEffect(() => {
     if (processingRef.current) return;
     const next = session.files.find((f) => f.status === "queued");
@@ -40,10 +59,13 @@ export function AnalysisStage() {
       dispatch({ type: "ANALYSIS_FILE_ACTIVE", fileId: next.id });
       try {
         for (const step of STEP_ORDER) {
+          if (cancelledRef.current) return;
           dispatch({ type: "ANALYSIS_STEP", fileId: next.id, step });
           await sleep(280);
         }
+        if (cancelledRef.current) return;
         const doc = await parseFile(next.file, next.kind);
+        if (cancelledRef.current) return;
         doc.fileId = next.id;
         if (isUnsupportedFormat(doc)) {
           dispatch({ type: "ANALYSIS_FILE_UNSUPPORTED", fileId: next.id, doc });
@@ -64,6 +86,7 @@ export function AnalysisStage() {
               narrationTotal: doc.sections.length,
             });
             await jack.pregenerateDeckNarration(doc, (done, total) => {
+              if (cancelledRef.current) return;
               dispatch({
                 type: "ANALYSIS_STEP",
                 fileId: next.id,
@@ -74,9 +97,11 @@ export function AnalysisStage() {
               });
             });
           }
+          if (cancelledRef.current) return;
           dispatch({ type: "ANALYSIS_FILE_DONE", fileId: next.id, doc });
         }
       } catch (err) {
+        if (cancelledRef.current) return;
         dispatch({
           type: "ANALYSIS_FILE_FAILED",
           fileId: next.id,

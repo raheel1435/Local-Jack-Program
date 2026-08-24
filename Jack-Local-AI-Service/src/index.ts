@@ -20,23 +20,24 @@ app.use(express.json());
 // capture). Only activates for audio/* content types; JSON requests to the
 // same route (the pre-existing audioFilePath contract) are unaffected.
 app.use(express.raw({ type: ["audio/wav", "audio/wave", "audio/x-wav"], limit: "25mb" }));
-// Raw binary .pptx uploads for POST /jack/convert-pptx (PowerPoint COM
-// visual-fidelity conversion).
-app.use(
-  express.raw({
-    type: ["application/vnd.openxmlformats-officedocument.presentationml.presentation"],
-    limit: "100mb",
-  }),
-);
+// PPTX parsing is route-local and occurs only after that route's admission
+// middleware accepts the request. Keeping a 100 MB raw parser here would
+// buffer rejected concurrent uploads before the route could return 429.
 
 // Minimal CORS: this gateway is a machine-local dev service consumed
 // directly by the browser-based Jack-AI-Presenter-Platform frontend, which
-// runs on a different origin (Vite dev server). Reflect the request origin
-// rather than "*" so credentials/cookies remain usable if ever needed, and
-// short-circuit the preflight -- no external CORS package required for this.
+// runs on a different origin (Vite dev server). Security-boundary hardening:
+// only reflect an Origin that's actually on the configured allowlist
+// (config.allowedOrigins, default the Vite dev server's own origin) --
+// reflecting ANY origin previously let any web page open in the same
+// browser drive local LLM/STT/TTS compute with no restriction. A request
+// with no Origin header (same-machine CLI/test client) is left unrestricted,
+// same as before -- CORS only governs browser-issued cross-origin requests.
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (origin) res.setHeader("Access-Control-Allow-Origin", origin);
+  if (origin && config.allowedOrigins.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") {
@@ -69,8 +70,19 @@ app.use(speechRouter(kokoro));
 app.use(transcriptionRouter(whisper, vibevoice));
 app.use(pptxConvertRouter());
 
-app.listen(config.port, () => {
+const server = app.listen(config.port, config.host, () => {
   console.log(
-    `Jack-Local-AI-Service listening on http://127.0.0.1:${config.port} (llm provider: ${config.llmProvider})`
+    `Jack-Local-AI-Service listening on http://${config.host}:${config.port} (llm provider: ${config.llmProvider})`
   );
 });
+
+// CLAUDE-35 fix: the gateway previously had no shutdown hook at all -- if it
+// was stopped (Ctrl+C, taskkill, IDE restart) while VibeWarmServer's child
+// (asr_stream_server.exe, holding ~1.58GB of loaded GGUF weights) was alive,
+// nothing explicitly terminated it first.
+function shutdown() {
+  vibevoice.stop();
+  server.close(() => process.exit(0));
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);

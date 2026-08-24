@@ -231,6 +231,7 @@ export function PracticeStage() {
 
       {devDiagnosticsEnabled && <MicDiagnostics jack={jack} />}
       {jack.lastError && <p className="speech-error" role="alert">{jack.lastError}</p>}
+      {jack.localMicError && <p className="speech-error" role="alert">{jack.localMicError}</p>}
       {feedback && (
         <p className={`jack-mic-feedback ${feedback.outcome.ok ? "" : "speech-error"}`} aria-live="polite">
           {feedback.prefix && `${feedback.prefix}: `}

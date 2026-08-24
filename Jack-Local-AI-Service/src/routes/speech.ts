@@ -1,5 +1,11 @@
 import { Router } from "express";
 import { KokoroProvider } from "../providers/kokoro/KokoroProvider.js";
+import {
+  isNonEmptyStringWithinLimit,
+  isOptionalStringWithinLimit,
+  MAX_ASSISTANT_NAME_LENGTH,
+  MAX_SPEAK_TEXT_LENGTH,
+} from "../lib/requestValidation.js";
 import type { JackErrorResponse, JackSpeakRequest } from "../types/jack.js";
 
 export function speechRouter(kokoro: KokoroProvider): Router {
@@ -7,10 +13,18 @@ export function speechRouter(kokoro: KokoroProvider): Router {
 
   router.post("/jack/speak", async (req, res) => {
     const body = req.body as Partial<JackSpeakRequest>;
-    if (!body.text || typeof body.text !== "string") {
+    if (!isNonEmptyStringWithinLimit(body.text, MAX_SPEAK_TEXT_LENGTH)) {
       const err: JackErrorResponse = {
         error: "invalid_request",
-        detail: "Request body must include a non-empty `text` string.",
+        detail: `Request body must include a non-empty \`text\` string of at most ${MAX_SPEAK_TEXT_LENGTH} characters.`,
+      };
+      res.status(400).json(err);
+      return;
+    }
+    if (!isOptionalStringWithinLimit(body.voice, MAX_ASSISTANT_NAME_LENGTH)) {
+      const err: JackErrorResponse = {
+        error: "invalid_request",
+        detail: `\`voice\`, when provided, must be a string of at most ${MAX_ASSISTANT_NAME_LENGTH} characters.`,
       };
       res.status(400).json(err);
       return;

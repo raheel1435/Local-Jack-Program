@@ -5,6 +5,13 @@ export type IntentType = "action" | "conversation" | "unknown";
 export interface DeterministicMatch {
   type: IntentType;
   action?: string;
+  /** Never populated by matchDeterministicCommand -- no ActionRule pattern
+   * below extracts a slide target (jump_to_slide has no deterministic
+   * pattern at all, so it always falls through to the LLM path, which DOES
+   * populate this on its own JackIntentResult; see routes/intent.ts). Kept
+   * on this shared shape only because intent.ts's deterministic response
+   * reuses the same JSON field name as the LLM path's -- always undefined
+   * here in practice. */
   target?: string;
 }
 
@@ -213,8 +220,53 @@ function buildConversationRules(name: string): ConversationRule[] {
   ];
 }
 
-const actionRuleCache = new Map<string, ActionRule[]>();
-const conversationRuleCache = new Map<string, ConversationRule[]>();
+// Security-boundary hardening: these caches are keyed by whatever
+// `assistantName` the caller of /jack/intent sends (there is no persona
+// allowlist server-side -- the frontend's own VOICE_OPTIONS is a UI-layer
+// concern the gateway deliberately doesn't import, same as the two apps'
+// separately-maintained addressing.ts copies). A prior audit confirmed an
+// unbounded Map here means any reachable caller could grow it forever, one
+// entry (a freshly-compiled RegExp array) per distinct name ever sent. A
+// small fixed-capacity LRU keeps the fast path for real, repeated persona
+// names (the realistic set is tiny -- see VOICE_OPTIONS) while capping
+// worst-case memory regardless of how many distinct names a caller sends.
+const RULE_CACHE_MAX_ENTRIES = 64;
+
+class BoundedLruMap<V> {
+  private readonly max: number;
+  private readonly map = new Map<string, V>();
+  constructor(max: number) {
+    this.max = max;
+  }
+  get(key: string): V | undefined {
+    const value = this.map.get(key);
+    if (value !== undefined) {
+      // Re-insert to mark as most-recently-used (Map preserves insertion order).
+      this.map.delete(key);
+      this.map.set(key, value);
+    }
+    return value;
+  }
+  set(key: string, value: V): void {
+    if (this.map.size >= this.max && !this.map.has(key)) {
+      const oldestKey = this.map.keys().next().value;
+      if (oldestKey !== undefined) this.map.delete(oldestKey);
+    }
+    this.map.set(key, value);
+  }
+  get size(): number {
+    return this.map.size;
+  }
+}
+
+const actionRuleCache = new BoundedLruMap<ActionRule[]>(RULE_CACHE_MAX_ENTRIES);
+const conversationRuleCache = new BoundedLruMap<ConversationRule[]>(RULE_CACHE_MAX_ENTRIES);
+
+/** Test-only accessor -- lets a regression test observe that the cache is
+ * genuinely bounded without exposing the caches themselves as public API. */
+export function __ruleCacheSizeForTests(): { action: number; conversation: number } {
+  return { action: actionRuleCache.size, conversation: conversationRuleCache.size };
+}
 
 function rulesFor(rawName: string): { action: ActionRule[]; conversation: ConversationRule[] } {
   const key = escapeRegExp(rawName.trim().toLowerCase()) || "jack";

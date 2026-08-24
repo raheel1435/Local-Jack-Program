@@ -19,11 +19,3 @@ export function searchDocuments(
     };
   });
 }
-
-/** A compact, honest summary of what's actually available — used in Jack's system instructions. Never invents section counts. */
-export function summarizeDocuments(docs: ParsedDocument[]): string {
-  if (docs.length === 0) return "No documents have been uploaded yet.";
-  return docs
-    .map((doc) => `- "${doc.title}" (${doc.format}, ${doc.sectionCount} section${doc.sectionCount === 1 ? "" : "s"})`)
-    .join("\n");
-}

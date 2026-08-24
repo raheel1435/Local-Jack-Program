@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { matchDeterministicCommand } from "./commandRouter.ts";
+import { matchDeterministicCommand, __ruleCacheSizeForTests } from "./commandRouter.ts";
 
 // Regression coverage for the slide-sync/lifecycle milestone's deterministic
 // router fixes -- all confirmed live via Chrome DevTools MCP against the
@@ -177,4 +177,16 @@ test("a non-default assistant name is recognized as the wake word, and 'jack' al
 
 test("matchDeterministicCommand defaults to 'jack' when no assistant name is passed", () => {
   assert.deepEqual(matchDeterministicCommand("Jack, stop."), { type: "action", action: "stop_presentation" });
+});
+
+// Security-boundary hardening: the per-assistantName rule cache used to be
+// an unbounded Map -- any caller of /jack/intent could grow it forever by
+// sending distinct names. Confirms the fixed-capacity LRU actually caps it.
+test("the per-assistant-name rule cache is bounded and does not grow without limit", () => {
+  for (let i = 0; i < 500; i++) {
+    matchDeterministicCommand("stop", `persona-${i}`);
+  }
+  const { action, conversation } = __ruleCacheSizeForTests();
+  assert.ok(action <= 64, `expected action cache to stay <= 64 entries, got ${action}`);
+  assert.ok(conversation <= 64, `expected conversation cache to stay <= 64 entries, got ${conversation}`);
 });

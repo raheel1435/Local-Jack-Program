@@ -135,7 +135,7 @@ function PresentSession({
 
   function syncJackToThisSlide() {
     setJackSectionIndex(sectionIndex);
-    jack.sendText(`(Presenter synced you to slide ${sectionIndex + 1}: "${currentSection?.title ?? ""}". Please continue from here.)`);
+    jack.syncNarrationToSlide(sectionIndex);
   }
 
   // --- Real PresentationController wired to Jack's tools, kept fresh via a ref so it's registered once. ---
@@ -286,7 +286,6 @@ function PresentSession({
 
   useEffect(() => {
     return () => {
-      jack.sleep();
       jack.sleepJackLocal(); // leaving Present mode resets local activation -- re-entering starts asleep again
       jack.resetPresentationOpening(); // leaving Present mode is a genuinely new session next time (Phase 18)
       // Practice/AskJack's own unmount cleanup already does this -- Present

@@ -52,8 +52,23 @@ export const VibeVoiceTestConfig = {
   // for the server's lifetime -- acceptable today because no caller
   // currently passes per-call hotwords (confirmed via the Whisper baseline
   // audit's equivalent check).
+  //
+  // SAFETY FIX (mirrors WhisperProvider.ts's COMMAND_VOCABULARY_PROMPT):
+  // this used to be complete example command SENTENCES ("Jack, stop.",
+  // "Jack, take over again.", ...) -- structurally the exact same shape of
+  // prompt that whisper.cpp's own decoder was CONFIRMED (WHISPER
+  // FALSE-DESTRUCTIVE-COMMAND ROOT-CAUSE milestone) to regurgitate
+  // verbatim from pure noise, 6/6 times across seeds, producing a clean,
+  // deterministically-matching "Jack, stop." with no speech present at all.
+  // VibeASR.cpp/BitNet is a different LM-side-primed decoder, but the same
+  // failure class -- an initial-context string shaped as a complete,
+  // ready-to-execute command -- was never re-tested against it before this
+  // fix. This word-list-only replacement keeps the vocabulary-priming
+  // benefit (the individual words a real command needs) while removing the
+  // complete-sentence regurgitation target, exactly as WhisperProvider.ts's
+  // own fix did. A live noise-reproduction re-test against
+  // asr_stream_server.exe specifically (mirroring WHISPER_APPROVED_BASELINE.md's
+  // methodology) is still open -- see VIBEVOICE_BASELINE.md.
   contextVocabulary:
-    "Jack, next slide. Jack, previous slide. Jack, go back. Jack, pause. Jack, continue. Jack, stop. " +
-    "Jack, take over. Jack, take over again. I'll take it from here. Jack, explain this slide. " +
-    "Jack, summarize this slide. Jack, go to slide three. pricing, roadmap, presentation.",
+    "Jack next previous back pause continue stop take over here explain summarize slide three pricing roadmap presentation",
 } as const;

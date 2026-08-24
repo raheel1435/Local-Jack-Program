@@ -45,3 +45,28 @@ test("WhisperApprovedConfig's command-vocabulary prompt is imported from Whisper
   // source of truth (see this file's own module comment).
   assert.equal(WhisperApprovedConfig.commandVocabularyPrompt, COMMAND_VOCABULARY_PROMPT);
 });
+
+// CLAUDE-09 safety regression guard: VibeVoiceTestConfig.contextVocabulary
+// used to be complete example command SENTENCES ("Jack, stop.", "Jack, take
+// over again.", ...) -- the exact prompt shape the WHISPER
+// FALSE-DESTRUCTIVE-COMMAND ROOT-CAUSE milestone confirmed whisper.cpp's
+// decoder regurgitated verbatim from pure noise (6/6 reproductions),
+// producing a clean, deterministically-matching destructive command with no
+// speech present. Fixed to a bare word list, mirroring
+// COMMAND_VOCABULARY_PROMPT's own fix -- this test fails immediately if a
+// future edit reintroduces punctuated, sentence-shaped command text.
+test("Vibe context vocabulary is a bare word list, not complete command sentences (regression guard for the Whisper noise-hallucination class)", () => {
+  assert.equal(
+    /[.,]/.test(VibeVoiceTestConfig.contextVocabulary),
+    false,
+    "contextVocabulary must not contain periods or commas -- those are exactly what shaped the confirmed Whisper noise-hallucination into a complete, executable command",
+  );
+  // Every individual command word real commands need should still be
+  // present -- this fix removes the SENTENCE shape, not the vocabulary.
+  for (const word of ["jack", "stop", "pause", "continue", "next", "previous", "take", "over", "explain", "summarize"]) {
+    assert.ok(
+      VibeVoiceTestConfig.contextVocabulary.toLowerCase().includes(word),
+      `expected contextVocabulary to still include the word "${word}"`,
+    );
+  }
+});

@@ -99,16 +99,7 @@
 .ask-jack-input-row input{flex:1;background:rgba(13,24,41,.7);border:1px solid var(--line);border-radius:10px;color:var(--text);padding:12px 14px;font-size:13px}
 .ask-jack-input-row input:focus-visible{outline:2px solid var(--cyan);outline-offset:1px}
 
-/* Speech / subtitle bar (Present + Ask Jack) */
-.subtitle-bar{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:rgba(13,24,41,.5);display:grid;gap:10px}
-.subtitle-bar.unsupported{color:#ffb08a;font-size:12px;text-align:center}
-.subtitle-controls{display:flex;flex-wrap:wrap;align-items:center;gap:10px}
-.speech-btn{background:rgba(0,217,245,.06);border:1px solid rgba(0,217,245,.28);border-radius:8px;color:var(--cyan);padding:8px 14px;font-size:12px;cursor:pointer}
-.speech-btn.primary{background:var(--cyan);color:#04101a;font-weight:700;border-color:transparent}
-.speech-btn:disabled{opacity:.35;cursor:not-allowed}
-.speech-slider{display:flex;align-items:center;gap:6px;font-size:10px;color:#7897b3}
 .speech-error{color:#ff8660;font-size:12px}
-.subtitle-text{margin:0;font-size:14px;color:#dff8ff;line-height:1.6;min-height:1.6em}
 
 /* Mic button */
 
