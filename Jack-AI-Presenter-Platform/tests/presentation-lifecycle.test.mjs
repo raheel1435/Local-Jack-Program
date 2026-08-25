@@ -1,8 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildPresentationContext } from "../app/jack/presentationContext.ts";
-import { narrationSystemPrompt, isRedundantContinuation } from "../app/jack/narration.ts";
+import {
+  narrationSystemPrompt,
+  isRedundantContinuation,
+  repeatTakeoverAcknowledgement,
+  shouldSpeakTakeoverAcknowledgement,
+} from "../app/jack/narration.ts";
 import { ok, fail } from "../app/jack/presentationController.ts";
+import { requestsNarrationFromSlide } from "../app/jack/slideTargetResolver.ts";
+import { DEFAULT_VOICE_ID, normalizeVoiceId, VOICE_OPTIONS } from "../app/jack/voiceSettings.ts";
 
 // Slide-sync regression tests (Phase 28 of the slide-sync milestone) --
 // covers the pure, non-React pieces of the fix: buildPresentationContext's
@@ -12,6 +19,57 @@ import { ok, fail } from "../app/jack/presentationController.ts";
 // audience introduction).
 
 const TITLES = ["Welcome", "Growth", "Pricing", "Roadmap", "Thank You"];
+
+test("only Jack and Nova are selectable assistant personas", () => {
+  assert.deepEqual(VOICE_OPTIONS.map(({ id, label }) => ({ id, label })), [
+    { id: "am_adam", label: "Jack" },
+    { id: "af_nova", label: "Nova" },
+  ]);
+});
+
+test("removed or invalid persisted persona selections fall back to Jack", () => {
+  assert.equal(normalizeVoiceId("am_adam"), "am_adam");
+  assert.equal(normalizeVoiceId("af_nova"), "af_nova");
+  assert.equal(normalizeVoiceId("af_sarah"), DEFAULT_VOICE_ID);
+  assert.equal(normalizeVoiceId("af_bella"), DEFAULT_VOICE_ID);
+  assert.equal(normalizeVoiceId(undefined), DEFAULT_VOICE_ID);
+});
+
+test("Jack is configured with a male voice", () => {
+  assert.equal(VOICE_OPTIONS[0].gender, "Male");
+});
+
+test("the first takeover reserves the first speech for Jack's introduction", () => {
+  assert.equal(shouldSpeakTakeoverAcknowledgement(false), false);
+  assert.equal(shouldSpeakTakeoverAcknowledgement(true), true);
+});
+
+test("later takeovers use the selected character's fixed return greeting", () => {
+  assert.equal(repeatTakeoverAcknowledgement("Jack"), "OK! Jack is here again.");
+  assert.equal(repeatTakeoverAcknowledgement("Nova"), "OK! Nova is here again.");
+});
+
+test("explicit start-from-slide wording requests narration at the jump destination", () => {
+  for (const phrase of [
+    "Nova, start from slide number 7.",
+    "Jack, begin the presentation at slide 3.",
+    "Present from slide five.",
+    "Start on page 9.",
+  ]) {
+    assert.equal(requestsNarrationFromSlide(phrase), true, phrase);
+  }
+});
+
+test("ordinary slide navigation remains navigation-only", () => {
+  for (const phrase of [
+    "Nova, go to slide 7.",
+    "Jump to slide 3.",
+    "Show slide five.",
+    "Move to the pricing slide.",
+  ]) {
+    assert.equal(requestsNarrationFromSlide(phrase), false, phrase);
+  }
+});
 
 /** Minimal PresentationController double -- "current" always reports index 2
  * (slide 3), so any test that instead sees slide-1/slide-4 content proves

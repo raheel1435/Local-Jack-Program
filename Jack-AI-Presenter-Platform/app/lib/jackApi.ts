@@ -137,8 +137,8 @@ export const jackApi = {
   },
 
   /** Runs the deterministic-command-router-then-LLM-fallback intent classifier.
-   * `assistantName` is the currently selected persona (Bella/Adam/Nova/Sarah/
-   * George/Emma/Jack/...) that the gateway treats as the wake word -- defaults
+   * `assistantName` is the currently selected persona (Jack or Nova) that
+   * the gateway treats as the wake word -- defaults
    * server-side to "Jack" when omitted. */
   detectIntent(text: string, assistantName?: string): Promise<JackIntentResult> {
     return postJson<JackIntentResult>("/jack/intent", { text, assistantName }, 15_000);
@@ -152,11 +152,12 @@ export const jackApi = {
     );
   },
 
-  /** Transcribes browser-captured audio (a WAV blob) via the selected ASR engine -- no filesystem path ever crosses the browser boundary. `provider` defaults to "whisper" (Approved) when omitted. */
-  async transcribeAudio(audio: Blob, language?: string, provider?: AsrProviderId): Promise<JackTranscribeResult> {
+  /** Transcribes browser-captured audio (a WAV blob) via the selected ASR engine -- no filesystem path ever crosses the browser boundary. `provider` defaults to "whisper" (Approved) when omitted. `assistantName` primes ASR with the active persona's wake word without changing the downstream address gate. */
+  async transcribeAudio(audio: Blob, language?: string, provider?: AsrProviderId, assistantName?: string): Promise<JackTranscribeResult> {
     const params = new URLSearchParams();
     if (language) params.set("language", language);
     if (provider) params.set("provider", provider);
+    if (assistantName) params.set("assistantName", assistantName);
     const qs = params.toString() ? `?${params.toString()}` : "";
     const res = await fetch(`${BASE_URL}/jack/transcribe${qs}`, {
       method: "POST",

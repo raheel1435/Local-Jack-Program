@@ -48,15 +48,8 @@ export function PresentSetup({ onReady, title }: { onReady: () => void; title: s
     // well after this click's own synchronous execution ends, so it can't
     // be the thing that satisfies the browser's autoplay-gesture
     // requirement for Jack's first audio. unlockSpeech() runs synchronously
-    // here, inside this real click, and does nothing else -- deliberately
-    // NOT wakeJackLocal(), which would ALSO start playing the greeting
-    // immediately and race it against the takeover acknowledgment the
-    // auto-start effect's own start_presentation flow plays right after
-    // (confirmed live: the greeting was getting cut off mid-sentence by the
-    // ack, since both ultimately share the one-clip-at-a-time speechPlayer).
-    // Leaving the actual wake+greeting to that flow keeps the same
-    // wake-then-wait-then-ack sequencing a real spoken "Jack, start
-    // presentation." already gets.
+    // here, inside this real click, and does nothing else. Ready/wake stays
+    // silent; the first autonomous narration supplies the introduction.
     if (jack.controlMode === "jackLeads") jack.unlockSpeech();
     // Mic on by default the moment a presentation session starts (latency-
     // fix milestone follow-up), in EVERY control mode -- not just once the

@@ -2,7 +2,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useLocalRecorder, type CaptureCloseReason, type LocalRecorderState } from "../hooks/useLocalRecorder";
-import { capturePolicyFor } from "./capturePolicy";
+import { capturePolicyFor, effectiveSpeechThreshold } from "./capturePolicy";
 import { isDirectlyAddressedToJack, isSelfEcho, type RecentSpeech } from "./addressing";
 import { useSpeech, type UseSpeechResult } from "../hooks/useSpeech";
 import { jackApi, type AsrProviderId, type JackHealth, type JackIntentAction } from "../lib/jackApi";
@@ -21,17 +21,20 @@ import { createJackSpeechPlayer } from "./jackSpeechPlayer";
 import { nextAttentionState } from "./jackStateMachine";
 import {
   answerDeckQuestion,
+  canUsePregeneratedNarration,
   generateNarrationContinuation,
   generateNarrationOpening,
   isPrefetchValid,
   isRedundantContinuation,
+  repeatTakeoverAcknowledgement,
+  shouldSpeakTakeoverAcknowledgement,
 } from "./narration";
 import { toOrbPresentation, type OrbPresentation } from "./orbStateMap";
 import { buildPresentationContext, formatContextForPrompt, type PresentationContext } from "./presentationContext";
 import { unsupportedController, type PresentationController } from "./presentationController";
-import { resolveSlideTarget } from "./slideTargetResolver";
+import { requestsNarrationFromSlide, resolveSlideTarget } from "./slideTargetResolver";
 import { createWakeWordService } from "./wakeWordService";
-import { DEFAULT_VOICE_ID, VOICE_OPTIONS } from "./voiceSettings";
+import { DEFAULT_VOICE_ID, normalizeVoiceId, VOICE_OPTIONS } from "./voiceSettings";
 import { useSession } from "../session/SessionContext";
 import type { ParsedDocument } from "../session/types";
 import type {
@@ -107,7 +110,7 @@ function loadPresentSettings(): PersistedPresentSettings {
     const parsed = JSON.parse(raw) as Partial<PersistedPresentSettings>;
     return {
       language: typeof parsed.language === "string" ? parsed.language : DEFAULT_PRESENT_SETTINGS.language,
-      voice: typeof parsed.voice === "string" ? parsed.voice : DEFAULT_PRESENT_SETTINGS.voice,
+      voice: normalizeVoiceId(parsed.voice),
       captionsEnabled: typeof parsed.captionsEnabled === "boolean" ? parsed.captionsEnabled : DEFAULT_PRESENT_SETTINGS.captionsEnabled,
       browserFallbackEnabled:
         typeof parsed.browserFallbackEnabled === "boolean" ? parsed.browserFallbackEnabled : DEFAULT_PRESENT_SETTINGS.browserFallbackEnabled,
@@ -152,49 +155,8 @@ function saveAsrProvider(provider: AsrProviderId) {
   }
 }
 
-// Wake greetings (Phase 3/4 of the activation milestone): short, warm,
-// human -- spoken through the same Kokoro voice path as everything else.
-// Several variants each so back-to-back wake cycles don't repeat verbatim.
-const HUMOROUS_GREETINGS = [
-  "Hey, I'm here. Ready when you are.",
-  "Alright, I'm awake. No coffee required -- what are we presenting?",
-  "Jack reporting for duty. I promise not to steal the whole presentation.",
-  "Ready. You lead, or I can take it from here.",
-];
-const PROFESSIONAL_GREETINGS = [
-  "I'm ready. How would you like to continue?",
-  "Jack is ready whenever you are.",
-  "Ready to begin whenever you are.",
-];
-
-function pickGreeting(humourEnabled: boolean, assistantName = "Jack"): string {
-  const bank = humourEnabled ? HUMOROUS_GREETINGS : PROFESSIONAL_GREETINGS;
-  const greeting = bank[Math.floor(Math.random() * bank.length)];
-  return greeting.replace(/\bJack\b/g, assistantName.trim() || "Jack");
-}
-
-// The very first thing Jack ever says to the presenter, once, for the whole
-// session -- always warm and professional (not gated by humourEnabled; a
-// first impression isn't the place for a joke). Falls back to an
-// unaddressed greeting if no name was given on the mode-select screen.
-function pickFirstContactGreeting(presenterName: string): string {
-  const name = presenterName.trim();
-  const hi = name ? `Hi ${name}` : "Hi there";
-  const bank = [
-    `${hi}, it's a pleasure to meet you. How can I help?`,
-    `${hi}, welcome -- what would you like me to do?`,
-    `${hi}, glad to be here. What do you need from me?`,
-  ];
-  return bank[Math.floor(Math.random() * bank.length)];
-}
-
 // Brief takeover acknowledgements (Phase 10) -- confirms the command landed
 // before narration starts, so the user isn't left wondering whether it worked.
-const TAKEOVER_ACKS = ["Got it. I'll take it from here.", "Absolutely. I'll take over.", "Sure -- I've got the next part."];
-function pickTakeoverAck(): string {
-  return TAKEOVER_ACKS[Math.floor(Math.random() * TAKEOVER_ACKS.length)];
-}
-
 // Short continuity lines for "Continue" after a pause (Phase 13/14) --
 // explicitly NOT the presentation opening. Resuming mid-presentation should
 // feel like picking a conversation back up, not restarting it.
@@ -209,20 +171,13 @@ function pickResumeLine(humourEnabled: boolean): string {
   return bank[Math.floor(Math.random() * bank.length)];
 }
 
-// "Jack take over again" within the same session (Phase 17) -- distinct from
-// the full first-takeover acknowledgement/opening.
-const TAKEOVER_AGAIN_ACKS = ["Absolutely -- I've got it.", "Sure, I'm back on it.", "Got it -- taking over again."];
-function pickTakeoverAgainAck(): string {
-  return TAKEOVER_AGAIN_ACKS[Math.floor(Math.random() * TAKEOVER_AGAIN_ACKS.length)];
-}
-
 export interface JackContextValue {
   attentionState: JackAttentionState;
   orb: OrbPresentation;
   currentCaption: string;
   lastError: string | null;
   controlMode: ControlMode;
-  /** The presenter's own name, set once on the mode-select screen -- used only for Jack's one-time first-contact greeting (see wakeJackLocal). Empty until set; never required. */
+  /** The presenter's own name, set once on the mode-select screen for session context. Empty until set; never required. */
   presenterName: string;
   setPresenterName(name: string): void;
   audienceQuestionPolicy: AudienceQuestionPolicy;
@@ -255,7 +210,7 @@ export interface JackContextValue {
   asrProvider: AsrProviderId;
   /** Last few measured transcriptions (both engines), newest first -- see AsrDiagnosticEntry. */
   asrDiagnostics: AsrDiagnosticEntry[];
-  /** Last few end-to-end latency traces (voice commands, typed commands, narration steps, wake greetings), newest first -- see perfTrace.ts. */
+  /** Last few end-to-end latency traces (voice commands, typed commands, and narration steps), newest first -- see perfTrace.ts. */
   perfTraces: TraceRecord[];
   setVoice(voice: string): void;
   setCaptionsEnabled(enabled: boolean): void;
@@ -273,19 +228,15 @@ export interface JackContextValue {
    * side effect -- call synchronously from inside a real user gesture that
    * will trigger Jack speech later in the same async chain (see
    * jackSpeechPlayer.ts's class comment) when that later speech shouldn't
-   * ALSO be preceded by a greeting. wakeJackLocal() itself does this same
-   * unlock as its first statement, but also plays the greeting and sets
-   * jackAwake -- calling it just to unlock, then having something else
-   * immediately trigger the real start_presentation flow (which itself
-   * calls wakeJackLocal()), raced the greeting against the takeover
-   * acknowledgment for the SAME speechPlayer slot.
+   * ALSO trigger any speech. wakeJackLocal() performs the same unlock and
+   * marks Jack ready, but readiness itself is deliberately silent.
    */
   unlockSpeech(): void;
   /** True once Jack has been explicitly activated for this local-pipeline session (Phase 1/2). */
   jackAwake: boolean;
-  /** The ONE authoritative activation function (Phase 2) -- idempotent, greets once per sleeping->awake transition (Phase 5). */
+  /** The ONE authoritative activation function -- idempotent and silent. */
   wakeJackLocal(): Promise<void>;
-  /** Explicit local sleep -- stops any current speech/narration and resets the wake guard so the next wake greets again. */
+  /** Explicit local sleep -- stops any current speech/narration and resets readiness. */
   sleepJackLocal(): void;
   /** Marks the presentation-opening intro not-yet-delivered (Phase 18) -- call when a presentation session genuinely ends (leaving Present mode), not on every sleep. */
   resetPresentationOpening(): void;
@@ -482,8 +433,8 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const perfTraces = useSyncExternalStore(subscribeTraces, getTraceHistory, getTraceHistory);
   const [lastError, setLastError] = useState<string | null>(null);
   const [controlMode, setControlModeState] = useState<ControlMode>("presenterLeads");
-  // Set once, up front (ModeSelectStage), reused for the first-contact
-  // greeting below -- not persisted, this is a per-session identity, not a
+  // Set once, up front (ModeSelectStage), and kept as per-session context --
+  // not persisted because this is an identity, not a
   // saved preference like language/voice/captions.
   const [presenterName, setPresenterNameState] = useState("");
   const [audienceQuestionPolicy, setAudienceQuestionPolicyState] = useState<AudienceQuestionPolicy>("askPresenterFirst");
@@ -497,7 +448,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // before, so the divergence was silent; once assistantName (below) started
   // being rendered on the very first screen (UploadStage), this became a
   // real, visible React hydration-mismatch error ("server rendered text
-  // didn't match the client") -- e.g. the orb saying "Bella" for one frame
+  // didn't match the client") -- e.g. the orb saying "Jack" for one frame
   // server-side while the client immediately re-renders "Nova". Both the
   // server AND the client's first render must now produce the exact same
   // (default) output; the real persisted values are synced in afterward, in
@@ -506,9 +457,8 @@ export function JackProvider({ children }: { children: ReactNode }) {
   const [voice, setVoiceState] = useState(DEFAULT_PRESENT_SETTINGS.voice);
   const [captionsEnabled, setCaptionsEnabledState] = useState(DEFAULT_PRESENT_SETTINGS.captionsEnabled);
   const [browserFallbackEnabled, setBrowserFallbackEnabledState] = useState(DEFAULT_PRESENT_SETTINGS.browserFallbackEnabled);
-  // Multi-persona milestone: the assistant answers to whichever name goes
-  // with the currently selected voice (Bella/Adam/Nova/Sarah/George/Emma/
-  // Jack/...) -- see voiceSettings.ts's VOICE_OPTIONS. This is the single
+  // The assistant answers to the name paired with the selected Jack/Nova
+  // voice -- see voiceSettings.ts's VOICE_OPTIONS. This is the single
   // source of that name for the whole provider: the wake-word gate, wake
   // greeting, narration self-introduction, and Q&A prompts all read it from
   // here so renaming the voice renames every part of Jack's spoken identity
@@ -528,8 +478,9 @@ export function JackProvider({ children }: { children: ReactNode }) {
   );
   const setVoice = useCallback(
     (next: string) => {
-      setVoiceState(next);
-      persistPresentSettings({ voice: next });
+      const normalized = normalizeVoiceId(next);
+      setVoiceState(normalized);
+      persistPresentSettings({ voice: normalized });
     },
     [persistPresentSettings],
   );
@@ -601,18 +552,10 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // milestone) -- deliberately separate from attentionState's
   // sleeping/standby (the dormant OpenAI Realtime path's states, unused
   // since the Realtime implementation was removed -- see PROGRESS.md).
-  // jackAwakeRef is the authoritative synchronous guard against a double
-  // greeting; jackAwake is its reactive mirror for the UI.
+  // jackAwakeRef is the authoritative synchronous readiness guard;
+  // jackAwake is its reactive mirror for the UI.
   const jackAwakeRef = useRef(false);
   const [jackAwake, setJackAwake] = useState(false);
-  // Separate from jackAwakeRef on purpose: jackAwake/asleep resets on every
-  // mode transition (Present/Practice/Ask Jack each sleep Jack on unmount),
-  // so a wake genuinely does re-greet each time -- but the personalized
-  // first-contact greeting (name + "what do you need") must happen exactly
-  // once for the whole session, the very first time the presenter calls
-  // Jack anywhere, never again afterward regardless of how many times he
-  // sleeps/wakes or which mode that first call happens in.
-  const presenterGreetedRef = useRef(false);
   // Structurally isolated per provider (Part 9/24 of the WHISPER SAFETY
   // CORRECTION milestone) -- see capturePolicy.ts. Recomputed whenever
   // asrProvider changes; useLocalRecorder reads the latest value on every
@@ -975,34 +918,22 @@ export function JackProvider({ children }: { children: ReactNode }) {
   );
 
   /**
-   * The ONE authoritative activation function (Phase 2). Idempotent: calling
-   * it while already awake just re-unlocks audio and does nothing else --
-   * no duplicate greeting (Phase 5). Greets once per sleeping->awake
-   * transition, through the same Kokoro voice as everything else (Phase 6),
-   * varying by humourEnabled (Phase 3/4). jackAwakeRef (not just the state)
-   * guards the check so two rapid wake calls in the same tick can't both
-   * observe "not yet awake" and both greet.
+   * The authoritative activation function. Ready means available and
+   * listening; it never means speaking. Idempotent, with a ref guard so two
+   * rapid calls cannot race the sleeping -> ready transition.
    */
   const wakeJackLocal = useCallback(async () => {
     speechPlayer.unlock(); // must run synchronously inside the originating gesture
     if (jackAwakeRef.current) return;
     jackAwakeRef.current = true;
     setJackAwake(true);
-    const traceId = startTrace("wake_greeting");
-    // The very first wake of the whole session gets the personalized
-    // greeting-by-name instead of the generic rotation -- see
-    // presenterGreetedRef's comment.
-    const isFirstEverContact = !presenterGreetedRef.current;
-    presenterGreetedRef.current = true;
-    const greeting = isFirstEverContact ? pickFirstContactGreeting(presenterName) : pickGreeting(humourEnabled, assistantName);
-    await speakAndWait(greeting, traceId);
-  }, [speechPlayer, speakAndWait, humourEnabled, presenterName, assistantName]);
+  }, [speechPlayer]);
 
   const unlockSpeech = useCallback(() => {
     speechPlayer.unlock();
   }, [speechPlayer]);
 
-  /** Sleep is explicit and local -- stops any current speech/narration and resets the wake guard so the next wake greets again. */
+  /** Sleep is explicit and local -- stops current speech/narration and resets readiness. */
   const sleepJackLocal = useCallback(() => {
     cancelAutonomousPresentingRef.current();
     jackAwakeRef.current = false;
@@ -1208,7 +1139,9 @@ export function JackProvider({ children }: { children: ReactNode }) {
       // exactly 0ms of THIS narration step's latency, same reasoning as the
       // prefetch case below, just covering every slide instead of one.
       const pregenDeck = pregeneratedNarrationRef.current.get(appSessionRef.current.activeFileId ?? "");
-      const pregenSlide = pregenDeck?.get(resolvedSlideIndex);
+      const cachedPregenSlide = pregenDeck?.get(resolvedSlideIndex);
+      const pregenSlide =
+        cachedPregenSlide && canUsePregeneratedNarration(isOpening, resolvedSlideIndex) ? cachedPregenSlide : undefined;
 
       let opening: { text: string; audio: Blob } | null = null;
       mark(traceId, "llmRequestStart"); // T12
@@ -1449,7 +1382,10 @@ export function JackProvider({ children }: { children: ReactNode }) {
     dispatchEvent({ type: "LOCAL_COMMAND_START" });
     try {
       mark(traceId, "asrRequestStart"); // T4
-      const result = await jackApi.transcribeAudio(audio, undefined, asrProvider);
+      // Prime ASR with the selected persona's wake word. The exact address
+      // and self-echo gates below remain authoritative; this only prevents
+      // the selected name being decoded incorrectly by a mismatched prompt.
+      const result = await jackApi.transcribeAudio(audio, undefined, asrProvider, assistantName);
       mark(traceId, "asrTranscriptReady"); // T5
       if (traceId) setTraceProvider(traceId, result.provider);
       const transcript = result.text.trim();
@@ -1466,6 +1402,13 @@ export function JackProvider({ children }: { children: ReactNode }) {
         // Ambient noise / background speech that never named Jack, or
         // Jack's own voice leaking back into the mic -- ignore it entirely
         // rather than surfacing it as a failed "Interruption".
+        if (transcript) {
+          console.log("[mic] transcript rejected by address/self-echo gate", {
+            transcript,
+            addressed: isAddressedToJack(transcript),
+            selfEcho,
+          });
+        }
         recordAsrDiagnostic({ provider: result.provider, transcript, latencyMs: result.latencyMs, success: true });
         finishTrace(traceId, false);
         bargeInTraceIdRef.current = undefined;
@@ -1614,6 +1557,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
         bargeInArmGuardTimeoutRef.current = setTimeout(() => {
         if (bargeInPhaseRef.current !== "guarding") return; // disarmed/interrupted during the guard window
         setBargeInPhaseBoth("calibrating");
+        console.log("[mic] speech detector calibrating", { durationMs: capturePolicy.calibrationMs });
         bargeInCalibrationSamplesRef.current = [];
         bargeInCalibrationIntervalRef.current = setInterval(() => {
           bargeInCalibrationSamplesRef.current.push(localMicLevelRef.current);
@@ -1623,12 +1567,16 @@ export function JackProvider({ children }: { children: ReactNode }) {
           clearBargeInArmTimers();
           const samples = bargeInCalibrationSamplesRef.current;
           const floor = samples.length > 0 ? samples.reduce((a, b) => a + b, 0) / samples.length : 0;
-          const threshold = Math.max(capturePolicy.bargeInLevel, floor + capturePolicy.floorMargin);
+          const threshold = effectiveSpeechThreshold(floor, capturePolicy);
           bargeInEffectiveThresholdRef.current = threshold;
           setBargeInNoiseFloor(floor);
           setBargeInThreshold(threshold);
           bargeInLoudTicksRef.current = 0;
           setBargeInPhaseBoth("armed");
+          console.log("[mic] speech detector armed", {
+            noiseFloor: Number(floor.toFixed(3)),
+            threshold: Number(threshold.toFixed(3)),
+          });
         }, capturePolicy.calibrationMs);
         }, capturePolicy.armGuardMs);
       });
@@ -1868,19 +1816,14 @@ export function JackProvider({ children }: { children: ReactNode }) {
             mark(traceId, "slideMutationDone"); // T9
             if (startResult.success) {
               setPresenterControl("jack");
-              // Wake (with greeting) first if Jack was still asleep -- Phase
-              // 2's "starting Jack presentation if currently sleeping" wake
-              // trigger -- then a brief takeover acknowledgement (Phase 10),
-              // and only once THAT finishes does narration begin (Phase 21:
-              // never talk over the previous utterance). Already-awake is
-              // the common case and skips straight to the acknowledgement.
-              // Phase 17: a repeat takeover in the SAME session (opening
-              // already delivered at some earlier point) gets the short
-              // "taking over again" ack, never the first-takeover one --
-              // the opening flag itself is what runNarrationStep uses to
-              // decide whether to actually deliver the audience intro.
-              const ack = presentationOpeningDeliveredRef.current ? pickTakeoverAgainAck() : pickTakeoverAck();
-              traceHandedOff = true; // this trace now measures voice-command -> spoken acknowledgement latency
+              // Ready/wake is silent. On the first takeover, narration must
+              // be Jack's first audible speech because its opening prompt
+              // contains the one-time self-introduction. Later takeovers may
+              // use a short acknowledgement before resuming narration.
+              const openingDelivered = presentationOpeningDeliveredRef.current;
+              const speakAck = shouldSpeakTakeoverAcknowledgement(openingDelivered);
+              const ack = speakAck ? repeatTakeoverAcknowledgement(assistantName) : null;
+              traceHandedOff = speakAck;
               // Captured now, before the awaits below -- see
               // startAutonomousPresenting's param comment.
               const startedIndex = startResult.data.index;
@@ -1895,7 +1838,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
               const requestGeneration = narrationGenerationRef.current;
               void (async () => {
                 if (!jackAwakeRef.current) await wakeJackLocal();
-                await speakAndWait(ack, traceId);
+                if (ack) await speakAndWait(ack, traceId);
                 if (narrationGenerationRef.current !== requestGeneration) return;
                 startAutonomousPresenting(startedIndex); // starts its own separate slide_narration trace
               })();
@@ -1919,6 +1862,17 @@ export function JackProvider({ children }: { children: ReactNode }) {
             const resolution = resolveSlideTarget(text, intent.target, sections);
             if (resolution.status === "resolved") {
               result = controller.goToSlide(resolution.slideIndex);
+              if (result.success && requestsNarrationFromSlide(text)) {
+                // "Start from slide 7" is more than navigation: make sure a
+                // previously paused presentation is active, give Jack the
+                // floor, and narrate the exact index goToSlide resolved.
+                // The persistent ambient-mic toggle is not changed; once the
+                // current voice command leaves "processing", the arm effect
+                // resumes listening while Jack speaks or stands by.
+                controller.startPresentation();
+                setPresenterControl("jack");
+                startAutonomousPresenting(result.data.index);
+              }
             } else if (resolution.status === "ambiguous") {
               const names = resolution.candidates.map((c) => `"${c.title ?? `slide ${c.index + 1}`}"`).join(", ");
               result = { success: false, error: `That could mean ${names} -- which one did you mean?` };

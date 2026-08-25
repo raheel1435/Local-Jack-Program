@@ -19,6 +19,16 @@ function parseProvider(value: unknown): AsrProviderId | undefined | "invalid" {
   return "invalid";
 }
 
+function parseAssistantName(value: unknown): string | undefined | "invalid" {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") return "invalid";
+  const name = value.trim();
+  // Persona labels are short human names. Bound and constrain this decoder
+  // hint so arbitrary query text cannot enlarge or reshape Whisper's prompt.
+  if (!/^[A-Za-z][A-Za-z '-]{0,39}$/.test(name)) return "invalid";
+  return name;
+}
+
 export function transcriptionRouter(whisper: WhisperProvider, vibevoice: AsrProvider): Router {
   const router = Router();
   const providers: Record<AsrProviderId, AsrProvider> = { whisper, vibevoice };
@@ -65,6 +75,16 @@ export function transcriptionRouter(whisper: WhisperProvider, vibevoice: AsrProv
     }
     const providerId: AsrProviderId = parsedProvider ?? "whisper";
     const provider = providers[providerId];
+
+    const assistantName = parseAssistantName(req.query.assistantName);
+    if (assistantName === "invalid") {
+      const err: JackErrorResponse = {
+        error: "invalid_request",
+        detail: "assistantName must be a 1-40 character human name.",
+      };
+      res.status(400).json(err);
+      return;
+    }
 
     const audioBuffer = req.body as Buffer;
     if (audioBuffer.length === 0) {
@@ -115,7 +135,11 @@ export function transcriptionRouter(whisper: WhisperProvider, vibevoice: AsrProv
       const tempPath = join(tmpdir(), `jack-transcribe-${randomUUID()}.wav`);
       try {
         await writeFile(tempPath, audioBuffer);
-        const result = await provider.transcribe(tempPath, language);
+        const result = await provider.transcribe(
+          tempPath,
+          language,
+          assistantName ? { hotwords: [assistantName] } : undefined,
+        );
         res.json(result);
       } catch (e) {
         const err: JackErrorResponse = {

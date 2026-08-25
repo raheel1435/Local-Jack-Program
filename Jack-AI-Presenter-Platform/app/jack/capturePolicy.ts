@@ -96,3 +96,13 @@ export const VibeVoiceTestCapturePolicy: CaptureBoundaryPolicy = {
 export function capturePolicyFor(provider: "whisper" | "vibevoice"): CaptureBoundaryPolicy {
   return provider === "vibevoice" ? VibeVoiceTestCapturePolicy : WhisperApprovedCapturePolicy;
 }
+
+/**
+ * Calibrate down for a quiet microphone, but never above the approved speech
+ * threshold. A user can begin speaking during the short calibration window;
+ * treating that voice as ambient noise must not make the same voice
+ * impossible to detect afterward.
+ */
+export function effectiveSpeechThreshold(noiseFloor: number, policy: CaptureBoundaryPolicy): number {
+  return Math.min(policy.bargeInLevel, noiseFloor + policy.floorMargin);
+}

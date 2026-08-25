@@ -1,7 +1,7 @@
 /**
  * End-to-end latency tracing for Jack's voice/narration pipeline. One trace
  * per interaction (a captured voice command, a typed command, one
- * autonomous slide-narration step, a wake greeting) -- each stage is marked
+ * autonomous slide-narration step) -- each stage is marked
  * only where the code genuinely reaches that point, so a trace for a
  * "next slide" command (no LLM/TTS involved) simply has no LLM/TTS marks
  * rather than a fabricated 0ms.

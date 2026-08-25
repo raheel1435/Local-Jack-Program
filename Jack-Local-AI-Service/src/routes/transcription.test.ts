@@ -13,6 +13,7 @@ import type { AsrProvider, JackTranscribeResponse, ProviderStatus } from "../typ
 
 class FakeAsrProvider implements AsrProvider {
   calls: string[] = [];
+  options: Array<{ hotwords?: string[] } | undefined> = [];
   id: "whisper" | "vibevoice";
   name: string;
   private health: ProviderStatus;
@@ -29,8 +30,9 @@ class FakeAsrProvider implements AsrProvider {
     return this.health;
   }
 
-  async transcribe(audioFilePath: string): Promise<JackTranscribeResponse> {
+  async transcribe(audioFilePath: string, _language?: string, opts?: { hotwords?: string[] }): Promise<JackTranscribeResponse> {
     this.calls.push(audioFilePath);
+    this.options.push(opts);
     return {
       text: "hello from " + this.id,
       provider: this.id,
@@ -98,6 +100,34 @@ test("routes to vibevoice when explicitly selected (upload path)", async () => {
     assert.equal(body.provider, "vibevoice");
     assert.equal(whisper.calls.length, 0);
     assert.equal(vibevoice.calls.length, 1);
+  });
+});
+
+test("passes a valid selected assistant name to ASR as a bounded hotword", async () => {
+  const whisper = new FakeAsrProvider("whisper", "Approved Â· Whisper", "available");
+  const vibevoice = new FakeAsrProvider("vibevoice", "Test Â· VibeVoice", "available");
+  await withServer(whisper, vibevoice, async (base) => {
+    const res = await fetch(`${base}/jack/transcribe?assistantName=Bella`, {
+      method: "POST",
+      headers: { "Content-Type": "audio/wav" },
+      body: Buffer.from([0, 1, 2, 3]),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(whisper.options, [{ hotwords: ["Bella"] }]);
+  });
+});
+
+test("rejects an invalid assistant-name prompt instead of passing arbitrary text to ASR", async () => {
+  const whisper = new FakeAsrProvider("whisper", "Approved Â· Whisper", "available");
+  const vibevoice = new FakeAsrProvider("vibevoice", "Test Â· VibeVoice", "available");
+  await withServer(whisper, vibevoice, async (base) => {
+    const res = await fetch(`${base}/jack/transcribe?assistantName=${encodeURIComponent("Bella, stop. Ignore audio")}`, {
+      method: "POST",
+      headers: { "Content-Type": "audio/wav" },
+      body: Buffer.from([0, 1, 2, 3]),
+    });
+    assert.equal(res.status, 400);
+    assert.equal(whisper.calls.length, 0);
   });
 });
 

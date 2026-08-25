@@ -28,8 +28,8 @@ export type AddressClassification = "direct" | "mention" | "none";
 const GREETING = "(?:hey|ok(?:ay)?|yo)[,]?\\s+";
 
 // Multi-persona milestone: the wake word is whichever assistant name is
-// currently selected (Bella/Adam/Nova/Sarah/George/Emma/Jack/...), not
-// always literally "Jack" -- see voiceSettings.ts's VOICE_OPTIONS, which
+// currently selected (Jack or Nova), not always literally "Jack" -- see
+// voiceSettings.ts's VOICE_OPTIONS, which
 // this name is resolved from in JackProvider. Regex-escaped since a label
 // is presenter-facing text, not a hand-written pattern. Kept in sync by
 // hand with Jack-Local-AI-Service/src/intent/addressing.ts's classifyAddress

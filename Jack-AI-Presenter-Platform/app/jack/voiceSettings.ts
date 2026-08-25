@@ -12,15 +12,18 @@ export interface VoiceOption {
 }
 
 export const VOICE_OPTIONS: VoiceOption[] = [
-  { id: "af_bella", label: "Bella", gender: "Female", accent: "English (US)" },
+  { id: "am_adam", label: "Jack", gender: "Male", accent: "English (US)" },
   { id: "af_nova", label: "Nova", gender: "Female", accent: "English (US)" },
-  { id: "af_sarah", label: "Sarah", gender: "Female", accent: "English (US)" },
-  { id: "am_adam", label: "Adam", gender: "Male", accent: "English (US)" },
-  { id: "bf_emma", label: "Emma", gender: "Female", accent: "English (UK)" },
-  { id: "bm_george", label: "George", gender: "Male", accent: "English (UK)" },
 ];
 
-export const DEFAULT_VOICE_ID = "af_bella";
+export const DEFAULT_VOICE_ID = "am_adam";
+
+/** Removed or malformed persisted selections safely become Jack. */
+export function normalizeVoiceId(value: unknown): string {
+  return typeof value === "string" && VOICE_OPTIONS.some((voice) => voice.id === value)
+    ? value
+    : DEFAULT_VOICE_ID;
+}
 
 /**
  * Language options for Jack's speech/conversation behavior. Honest about

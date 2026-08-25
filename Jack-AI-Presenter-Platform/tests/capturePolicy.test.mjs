@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { WhisperApprovedCapturePolicy, VibeVoiceTestCapturePolicy, capturePolicyFor } from "../app/jack/capturePolicy.ts";
+import {
+  WhisperApprovedCapturePolicy,
+  VibeVoiceTestCapturePolicy,
+  capturePolicyFor,
+  effectiveSpeechThreshold,
+} from "../app/jack/capturePolicy.ts";
 
 // WHISPER SAFETY CORRECTION milestone, Part 9/24: structural isolation
 // between the frozen Whisper capture policy and the experimental Vibe one --
@@ -37,4 +42,12 @@ test("Whisper's frozen values match the pre-existing baseline exactly", () => {
   assert.equal(WhisperApprovedCapturePolicy.silentPeakThreshold, 0.005);
   assert.equal(WhisperApprovedCapturePolicy.shortCaptureWarningMs, 700);
   assert.equal(WhisperApprovedCapturePolicy.activeCaptureMaxMs, 8000);
+});
+
+test("calibration never raises the speech trigger above the approved threshold", () => {
+  assert.equal(effectiveSpeechThreshold(0.3, WhisperApprovedCapturePolicy), 0.12);
+});
+
+test("calibration can lower the trigger for a quiet microphone", () => {
+  assert.ok(Math.abs(effectiveSpeechThreshold(0.01, WhisperApprovedCapturePolicy) - 0.1) < Number.EPSILON);
 });

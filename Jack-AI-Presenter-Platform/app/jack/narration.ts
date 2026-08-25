@@ -56,8 +56,8 @@ function truncateForPrompt(text: string): string {
 }
 
 // Multi-persona milestone: the assistant introduces itself and answers to
-// whichever name is currently selected (Bella/Adam/Nova/Sarah/George/Emma/
-// Jack/...), not always literally "Jack" -- see voiceSettings.ts's
+// whichever supported name is currently selected (Jack or Nova), not
+// always literally "Jack" -- see voiceSettings.ts's
 // VOICE_OPTIONS, which the name is resolved from in JackProvider. Every
 // prompt below is templated with the literal word "Jack" and swapped via
 // this helper at build time, rather than restructuring each string, so the
@@ -109,6 +109,36 @@ export function narrationSystemPrompt(isOpening: boolean, humourEnabled: boolean
   );
 }
 
+/** The first audible presentation line must be the self-introducing opening. */
+export function shouldSpeakTakeoverAcknowledgement(openingDelivered: boolean): boolean {
+  return openingDelivered;
+}
+
+/** Fixed repeat-takeover line, personalized to the selected character. */
+export function repeatTakeoverAcknowledgement(assistantName = "Jack"): string {
+  return `OK! ${assistantName.trim() || "Jack"} is here again.`;
+}
+
+/** A cached slide generated as a continuation cannot serve as the session opening. */
+export function canUsePregeneratedNarration(isOpening: boolean, slideIndex: number): boolean {
+  return !isOpening || slideIndex === 0;
+}
+
+/**
+ * The model is still responsible for the slide-grounded sentence, but the
+ * one-time identity line is a product guarantee rather than a prompt hope.
+ */
+export function ensurePresentationIntroduction(text: string, isOpening: boolean, assistantName = "Jack"): string {
+  const narration = text.trim();
+  if (!isOpening) return narration;
+  const escapedName = assistantName.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const selfIntroduction = new RegExp(`\\b(?:i am|i'm)\\s+${escapedName}\\b`, "i");
+  if (selfIntroduction.test(narration)) return narration;
+  const name = assistantName.trim() || "Jack";
+  const greeting = `Hello everyone, I'm ${name}, and I'll be helping present today.`;
+  return narration ? `${greeting} ${narration}` : greeting;
+}
+
 /** Central narration generator -- the only place that turns a slide into spoken words. */
 export async function generateSlideNarration(
   context: PresentationContext,
@@ -124,7 +154,7 @@ export async function generateSlideNarration(
     ],
     { maxTokens: 160, temperature: 0.5 },
   );
-  return result.content.trim();
+  return ensurePresentationIntroduction(result.content, isOpening, assistantName);
 }
 
 /**
@@ -159,7 +189,7 @@ export async function generateNarrationOpening(
     ],
     { maxTokens: 48, temperature: 0.5 },
   );
-  return result.content.trim();
+  return ensurePresentationIntroduction(result.content, isOpening, assistantName);
 }
 
 export async function generateNarrationContinuation(

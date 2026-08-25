@@ -42,6 +42,16 @@ export function extractExplicitNumber(utterance: string): number | null {
 }
 
 /**
+ * Distinguishes navigation-only requests ("go to slide 7") from requests
+ * that explicitly ask Jack to begin presenting at the destination. Both can
+ * resolve through jump_to_slide, but only the latter should start narration.
+ */
+export function requestsNarrationFromSlide(utterance: string): boolean {
+  return /\b(?:start|begin)(?:\s+(?:the\s+)?presentation)?\s+(?:from|at|on)\s+(?:slide|page|section)\b/i.test(utterance)
+    || /\bpresent\s+(?:from|at|on)\s+(?:slide|page|section)\b/i.test(utterance);
+}
+
+/**
  * Best-effort semantic query when the LLM didn't return a `target`: strip
  * common command verbs/fillers so "go back to the introduction" -> "introduction".
  */
