@@ -61,6 +61,14 @@ export interface JackIntentResult {
   target?: string;
   raw?: string;
   latencyMs: number;
+  /** Council engineering audit finding: this field was already sent by the
+   * gateway's LLM-fallback path (never by the deterministic path) whenever
+   * its own safety gate downgraded a high-impact action (e.g. stop_presentation)
+   * to a harmless "conversation" reply -- but this type never declared it, so
+   * it was silently dropped by every caller. Present only on that downgrade
+   * path; the name of the action that WOULD have run had the extra scrutiny
+   * (direct address + no suspicious repetition) not failed. */
+  downgradedFrom?: string;
 }
 
 export interface JackChatMessage {
@@ -140,8 +148,17 @@ export const jackApi = {
    * `assistantName` is the currently selected persona (Jack or Nova) that
    * the gateway treats as the wake word -- defaults
    * server-side to "Jack" when omitted. */
-  detectIntent(text: string, assistantName?: string): Promise<JackIntentResult> {
-    return postJson<JackIntentResult>("/jack/intent", { text, assistantName }, 15_000);
+  /** `inputSource`: council engineering audit fix -- lets the gateway's
+   * HIGH_IMPACT_ACTIONS safety downgrade (see intent.ts) tell deliberately
+   * typed text (no ambient-noise/ASR-hallucination risk at all) apart from
+   * voice-captured text (where that risk is real and the check must stay).
+   * Omitting it keeps the gateway's existing protected-by-default behavior. */
+  detectIntent(
+    text: string,
+    assistantName?: string,
+    inputSource?: "typed" | "voice" | "interruption",
+  ): Promise<JackIntentResult> {
+    return postJson<JackIntentResult>("/jack/intent", { text, assistantName, inputSource }, 15_000);
   },
 
   chat(messages: JackChatMessage[], opts?: { maxTokens?: number; temperature?: number }): Promise<JackChatResult> {

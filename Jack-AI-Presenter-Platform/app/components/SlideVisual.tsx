@@ -14,6 +14,50 @@ import type { ParsedDocument, ParsedSection, UploadedFile } from "../session/typ
  * and renders THAT through the same canvas path, falling back to the
  * semantic-parser text view only if that conversion is unavailable or fails.
  */
+
+// Council engineering audit finding: without this cache, every mount of this
+// component for a .pptx file re-ran the full PowerPoint-COM conversion --
+// switching Practice <-> Present for the SAME file, or leaving and
+// re-entering Present mode, each burned one of the gateway's 3 AdmissionGate
+// slots on a conversion whose result was already sitting unused in the
+// component that just unmounted. Cached by Blob, not by PdfRenderHandle:
+// PdfRenderHandle wraps a pdfjs document with its own destroy() lifecycle
+// that this component's cleanup calls unconditionally on unmount, so sharing
+// a live handle across mounts would need reference counting to avoid one
+// mount destroying a handle another mount is still rendering from. Caching
+// the Blob instead sidesteps that entirely -- each mount still calls
+// openPdfForRender() itself to get its OWN independent handle, and only the
+// expensive network/COM round trip is shared. Keyed by name+size+lastModified
+// (not content hash -- files are re-uploaded fresh per session, never
+// persisted, so this is a stable-enough identity within one browser tab's
+// lifetime). Capped like this file's other session-scoped caches
+// (JackProvider's asrDiagnostics) so re-uploading many different large decks
+// across a long session can't grow this unboundedly.
+const MAX_CACHED_PPTX_CONVERSIONS = 10;
+const pptxConversionCache = new Map<string, Promise<Blob>>();
+
+function pptxCacheKey(file: File): string {
+  return `${file.name}|${file.size}|${file.lastModified}`;
+}
+
+function getOrConvertPptxToPdf(file: File): Promise<Blob> {
+  const key = pptxCacheKey(file);
+  const cached = pptxConversionCache.get(key);
+  if (cached) return cached;
+  const promise = jackApi.convertPptxToPdf(file);
+  // A failed conversion (busy gate, timeout, transient COM error) must NOT
+  // poison the cache -- the next mount (or the same mount's own retry path)
+  // should get a genuinely fresh attempt, not a cached rejection forever.
+  promise.catch(() => {
+    pptxConversionCache.delete(key);
+  });
+  if (pptxConversionCache.size >= MAX_CACHED_PPTX_CONVERSIONS) {
+    const oldestKey = pptxConversionCache.keys().next().value;
+    if (oldestKey !== undefined) pptxConversionCache.delete(oldestKey);
+  }
+  pptxConversionCache.set(key, promise);
+  return promise;
+}
 export function SlideVisual({
   doc,
   activeFile,
@@ -47,8 +91,7 @@ export function SlideVisual({
       };
     }
     if (doc.format === "pptx") {
-      jackApi
-        .convertPptxToPdf(activeFile.file)
+      getOrConvertPptxToPdf(activeFile.file)
         .then((pdfBlob) => openPdfForRender(pdfBlob))
         .then((handle) => {
           if (cancelled) {
@@ -113,8 +156,15 @@ export function SlideVisual({
       {currentSection?.title && <h2>{currentSection.title}</h2>}
       <p>{currentSection?.text}</p>
       {doc.format === "pptx" && pptxVisualStatus === "failed" && (
-        <p className="present-warning" title={pptxVisualError ?? undefined}>
+        <p className="present-warning">
           Original PowerPoint formatting, images, and layout are not fully preserved — slide text and speaker notes are shown in a simplified reading view.
+          {/* Council engineering audit finding: this reason used to be captured
+              (pptxVisualError) but only ever exposed via the HTML title
+              tooltip, so a presenter had no visible way to tell "the local
+              gateway isn't running" (fixable, actionable) apart from "your
+              file is password-protected" (not fixable here) -- both showed
+              the exact same generic sentence above. Now shown directly. */}
+          {pptxVisualError && <><br /><span className="present-warning-reason">Reason: {pptxVisualError}</span></>}
         </p>
       )}
     </div>

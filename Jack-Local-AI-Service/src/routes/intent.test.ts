@@ -202,3 +202,74 @@ test("explain_slide (not high-impact) is never downgraded, even from a mention-o
     assert.equal(body.downgradedFrom, undefined);
   });
 });
+
+// Council engineering audit finding: "start from slide no.7." typed directly
+// into the presenter's own command box (no name, no microphone anywhere in
+// its path) was being downgraded exactly like an ambiguous mic capture --
+// confirmed live, Jack summarized slide 7 instead of navigating to it. The
+// address-check protects against ambient noise/ASR hallucination reaching a
+// high-impact action; neither risk exists once a human is deliberately
+// typing, so inputSource: "typed" must skip the check entirely.
+test("inputSource: \"typed\" skips the high-impact downgrade entirely, even for unaddressed text", async () => {
+  const llm = new ScriptedLlmProvider("jump_to_slide");
+  await withServer(llm, async (base) => {
+    const res = await fetch(`${base}/jack/intent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "start from slide no.7", inputSource: "typed" }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.type, "action");
+    assert.equal(body.action, "jump_to_slide");
+    assert.equal(body.downgradedFrom, undefined);
+  });
+});
+
+test("the same unaddressed text WITHOUT inputSource: \"typed\" is still downgraded (default stays protected)", async () => {
+  const llm = new ScriptedLlmProvider("jump_to_slide");
+  await withServer(llm, async (base) => {
+    const res = await fetch(`${base}/jack/intent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "start from slide no.7" }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.type, "conversation");
+    assert.equal(body.action, undefined);
+    assert.equal(body.downgradedFrom, "jump_to_slide");
+  });
+});
+
+test("inputSource: \"voice\" and \"interruption\" both keep the protected (downgraded) behavior, unlike \"typed\"", async () => {
+  const llm = new ScriptedLlmProvider("jump_to_slide");
+  await withServer(llm, async (base) => {
+    for (const inputSource of ["voice", "interruption"]) {
+      const res = await fetch(`${base}/jack/intent`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "start from slide no.7", inputSource }),
+      });
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.equal(body.type, "conversation", `inputSource "${inputSource}" must still be downgraded`);
+      assert.equal(body.downgradedFrom, "jump_to_slide");
+    }
+  });
+});
+
+test("an invalid/unrecognized inputSource value is ignored, not rejected -- falls back to the protected default", async () => {
+  const llm = new ScriptedLlmProvider("jump_to_slide");
+  await withServer(llm, async (base) => {
+    const res = await fetch(`${base}/jack/intent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "start from slide no.7", inputSource: "carrier-pigeon" }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.type, "conversation");
+    assert.equal(body.downgradedFrom, "jump_to_slide");
+  });
+});

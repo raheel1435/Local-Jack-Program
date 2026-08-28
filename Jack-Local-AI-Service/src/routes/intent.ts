@@ -10,12 +10,29 @@ import {
 } from "../lib/requestValidation.js";
 import type { JackErrorResponse, LlmProvider } from "../types/jack.js";
 
+/** How this text reached Jack. Council engineering audit finding: the
+ * HIGH_IMPACT_ACTIONS direct-address downgrade below exists specifically to
+ * protect against ambient noise or ASR hallucination triggering a
+ * consequential action (see that const's own comment) -- neither risk
+ * exists for typed input, where a presenter is deliberately typing directly
+ * into a command box with no ambient-audio path at all. Without this field
+ * the gateway had no way to know the difference, so "start from slide 7."
+ * typed straight into that box was downgraded to a harmless conversational
+ * reply exactly as if it were an unaddressed mutter picked up by the mic --
+ * confirmed live: Jack summarized slide 7 instead of navigating to it. */
+type IntentInputSource = "typed" | "voice" | "interruption";
+const VALID_INPUT_SOURCES: ReadonlySet<string> = new Set<IntentInputSource>(["typed", "voice", "interruption"]);
+
 interface JackIntentRequest {
   text: string;
   /** Multi-persona milestone: the currently selected assistant name
    * (Bella/Adam/Nova/Sarah/George/Emma/Jack/...) -- defaults to "Jack" when
    * omitted so older/typed-only clients keep working unchanged. */
   assistantName?: string;
+  /** Optional and defaults to the SAFE (address-checked) behavior when
+   * omitted or unrecognized -- any existing/future caller that doesn't send
+   * this gets exactly today's protected behavior, never silently loosened. */
+  inputSource?: IntentInputSource;
 }
 
 const VALID_ACTIONS = new Set([
@@ -78,6 +95,10 @@ export function intentRouter(llm: LlmProvider): Router {
     }
 
     const assistantName = typeof body.assistantName === "string" && body.assistantName.trim() ? body.assistantName : "Jack";
+    const inputSource: IntentInputSource | undefined =
+      typeof body.inputSource === "string" && VALID_INPUT_SOURCES.has(body.inputSource)
+        ? (body.inputSource as IntentInputSource)
+        : undefined;
 
     const start = Date.now();
     const deterministic = matchDeterministicCommand(body.text, assistantName);
@@ -156,8 +177,15 @@ export function intentRouter(llm: LlmProvider): Router {
       // comment for why that specific signal, not "any repeated word",
       // distinguishes Codex's reproduced false stop from a real urgent
       // "Jack, stop, stop, stop!").
+      // inputSource === "typed": skip the address/repetition check entirely,
+      // not just relax it. Both signals exist to distinguish a real command
+      // from ambient noise or an ASR hallucination loop -- neither is
+      // possible for text a presenter deliberately typed into a command box
+      // with no microphone/ASR anywhere in its path. Any other value
+      // (including the safe default when omitted) keeps today's protected
+      // behavior unchanged.
       let downgradedFrom: string | undefined;
-      if (type === "action" && action && HIGH_IMPACT_ACTIONS.has(action)) {
+      if (type === "action" && action && HIGH_IMPACT_ACTIONS.has(action) && inputSource !== "typed") {
         const address = classifyAddress(body.text, assistantName);
         const suspicious = hasSuspiciousRepetition(body.text, assistantName);
         if (address !== "direct" || suspicious) {

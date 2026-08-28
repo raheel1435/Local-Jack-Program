@@ -572,6 +572,10 @@ export function JackProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     presenterControlRef.current = presenterControl;
   }, [presenterControl]);
+  const attentionStateRef = useRef(attentionState);
+  useEffect(() => {
+    attentionStateRef.current = attentionState;
+  }, [attentionState]);
 
   const [speechPlayer] = useState(() => createJackSpeechPlayer());
   const narrationGenerationRef = useRef(0);
@@ -1441,7 +1445,15 @@ export function JackProvider({ children }: { children: ReactNode }) {
       setLastError(err instanceof Error ? err.message : "Transcription failed.");
       recordAsrDiagnostic({ provider: asrProvider, transcript: "", latencyMs: 0, success: false });
     }
-  }, [clearBargeInCaptureTimeout, localRecorder, dispatchEvent, setBargeInPhaseBoth, isAddressedToJack, getRecentJackSpeech, asrProvider, recordAsrDiagnostic, assistantName]);
+    // localRecorder.stop only, not the whole localRecorder object -- see the
+    // arm/disarm effect's comment below for why depending on the whole
+    // object is a live-loop hazard (this callback doesn't have that effect's
+    // async-continuation-plus-cancelled-flag shape today, so the churn here
+    // is "only" a wasted recreation every level tick, not a runaway loop --
+    // but narrowing it now removes the landmine for whoever next wraps this
+    // in an effect, per the council engineering audit).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clearBargeInCaptureTimeout, localRecorder.stop, dispatchEvent, setBargeInPhaseBoth, isAddressedToJack, getRecentJackSpeech, asrProvider, recordAsrDiagnostic, assistantName]);
 
   // Safe-interruption fix (latency-fix milestone): detecting sound crossing
   // the barge-in threshold must NOT touch Jack's in-progress narration --
@@ -1497,39 +1509,31 @@ export function JackProvider({ children }: { children: ReactNode }) {
         void finishBargeInCapture(sustainedSilence ? "silence" : "hard_cap");
       }
     }, 150);
-  }, [dispatchEvent, clearBargeInArmTimers, clearBargeInCaptureTimeout, finishBargeInCapture, localRecorder, capturePolicy, setBargeInPhaseBoth]);
+    // localRecorder.markCaptureTriggered only, same narrowing rationale as
+    // finishBargeInCapture's localRecorder.stop above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dispatchEvent, clearBargeInArmTimers, clearBargeInCaptureTimeout, finishBargeInCapture, localRecorder.markCaptureTriggered, capturePolicy, setBargeInPhaseBoth]);
 
-  // Arm/disarm ambient listening. Two independent reasons to be armed:
-  // (1) automatic -- Jack holds the floor (presenterControl === "jack") and
-  //     is speaking or idle-but-in-control ("standby"); unchanged default
-  //     behavior so barge-in during Jack's own narration keeps working with
-  //     no button press needed.
-  // (2) manual -- ambientListeningEnabled is on (the mic button toggle).
-  //     This one is deliberately independent of presenterControl and of
-  //     attentionState's speaking/standby split: once the user turns the
-  //     mic on, it stays on regardless of who's presenting or what Jack is
-  //     doing at that instant, until they turn it off again. Confirmed live
-  //     that gating this the same way as (1) meant the mic still "turned
-  //     itself off" the moment control returned to the presenter.
-  // Either way, EVERY captured utterance still has to pass isAddressedToJack
-  // in finishBargeInCapture before it's treated as a command -- staying
-  // armed longer/wider never means Jack reacts to more ambient noise, only
-  // that he's still listening for his own name.
+  // Arm/disarm ambient listening. ambientListeningEnabled (the mic button)
+  // is the SOLE authority: mic off means Jack hears nothing at all, full
+  // stop, even "stop"/"pause"/"start" by voice -- use the on-screen buttons
+  // or typed commands instead. Mic on means he listens continuously and
+  // reacts only when addressed by name; every captured utterance still has
+  // to pass isAddressedToJack in finishBargeInCapture before it's treated
+  // as a command, so being armed never means Jack reacts to more ambient
+  // noise, only that he's listening for his own name at all.
   //
-  // Deliberately NOT gated on attentionState's sleeping/disconnected/muted/
-  // error (an earlier version of this effect was) -- those only ever get
-  // set by the OpenAI-Realtime-specific wake()/sleep()/mute() calls, and
-  // Present mode's own unmount cleanup calls sleep() unconditionally to tear
-  // down any lingering OpenAI resources. Confirmed live: visit Present mode
-  // once, leave it, and attentionState is stuck at "sleeping" for the rest
-  // of the session -- nothing in the local-only pipeline ever dispatches
-  // WAKE to undo it. With that guard here, ambientListeningEnabled would
-  // still flip on and the UI would still claim "Jack is listening", but
-  // localRecorder.start() would silently never run again anywhere in the
-  // app. attentionState genuinely does track real local speaking/standby
-  // transitions correctly (LOCAL_COMMAND_*/AUDIO_* are dispatched by this
-  // same local pipeline), which is why autoArmWhileJackPresents below still
-  // reads it directly -- only the extra blanket reachability gate was wrong.
+  // This effect deliberately does NOT also gate on attentionState's
+  // sleeping/disconnected/muted/error (an earlier version did) -- those only
+  // ever get set by the OpenAI-Realtime-specific wake()/sleep()/mute()
+  // calls, and Present mode's own unmount cleanup calls sleep()
+  // unconditionally to tear down any lingering OpenAI resources. Confirmed
+  // live: visit Present mode once, leave it, and attentionState is stuck at
+  // "sleeping" for the rest of the session -- nothing in the local-only
+  // pipeline ever dispatches WAKE to undo it. With that guard here,
+  // ambientListeningEnabled would still flip on and the UI would still claim
+  // "Jack is listening", but localRecorder.start() would silently never run
+  // again anywhere in the app.
   //
   // Sequence once armed: start the recorder immediately (so there's no audio
   // gap), but hold off actually watching for a burst for
@@ -1540,12 +1544,26 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // see its comment.
   useEffect(() => {
     let cancelled = false;
-    const autoArmWhileJackPresents = presenterControl === "jack" && (attentionState === "speaking" || attentionState === "standby");
-    const shouldArm = ambientListeningEnabled || autoArmWhileJackPresents;
+    // Sole authority: ambientListeningEnabled (the mic button), full stop.
+    // This USED TO also auto-arm whenever presenterControl === "jack" &&
+    // attentionState was "speaking"/"standby", regardless of the button, so
+    // turning the mic off never actually silenced Jack while he was
+    // presenting -- confirmed live as exactly backwards from the wanted
+    // contract: mic off means Jack hears NOTHING (voice stop/pause/start no
+    // longer available, use the on-screen buttons or typed commands
+    // instead); mic on means he listens continuously and reacts only when
+    // addressed by name, same as before. ambientListeningEnabled is already
+    // set true the moment a presentation starts (see PresentSetup.tsx), so
+    // this doesn't change the default "mic on and listening" experience --
+    // it only makes turning the mic off actually mean something.
+    const shouldArm = ambientListeningEnabled;
     if (shouldArm && bargeInPhaseRef.current === "idle") {
       setBargeInPhaseBoth("guarding");
       bargeInLoudTicksRef.current = 0;
-      console.log("[mic] start() called from: arm effect (armed)", { attentionState, presenterControl });
+      console.log("[mic] start() called from: arm effect (armed)", {
+        attentionState: attentionStateRef.current,
+        presenterControl: presenterControlRef.current,
+      });
       void localRecorder.start().then((started) => {
         if (cancelled || !started || bargeInPhaseRef.current !== "guarding") {
           clearBargeInArmTimers();
@@ -1593,7 +1611,10 @@ export function JackProvider({ children }: { children: ReactNode }) {
       // CURRENT capture is fully done, not before.
       setBargeInPhaseBoth("idle");
       clearBargeInArmTimers();
-      console.log("[mic] stop() called from: disarm effect", { attentionState, presenterControl });
+      console.log("[mic] stop() called from: disarm effect", {
+        attentionState: attentionStateRef.current,
+        presenterControl: presenterControlRef.current,
+      });
       void localRecorder.stop("route_change").catch(() => {}); // fire-and-forget -- see cancelAutonomousPresenting's matching comment
     }
     return () => {
@@ -1614,8 +1635,22 @@ export function JackProvider({ children }: { children: ReactNode }) {
     // see that localRecorder.stop (used only inside the nested start().then()
     // closure above) is covered by the same narrowing as localRecorder.start,
     // and asks for the whole object back -- doing that reintroduces the bug.
+    //
+    // attentionState/presenterControl are deliberately NOT deps either, for
+    // the exact same reason (council engineering audit): the arm decision is
+    // sole-authority on ambientListeningEnabled now (see the comment above),
+    // and both values are read here only for the diagnostic console.log
+    // lines, via attentionStateRef/presenterControlRef -- not as reactive
+    // deps. Keeping them as real deps would re-run this effect (and set
+    // cancelled=true on whatever start() is still in its guard window) on
+    // every attentionState transition, which fires on essentially every
+    // dispatchEvent call (AUDIO_START, USER_SPEECH_DETECTED, LOCAL_COMMAND_*)
+    // -- a live narration starting right after a barge-in command completes
+    // would race exactly like the whole-localRecorder-object bug above, just
+    // triggered by a different unstable-ish dependency instead of an
+    // unstable object identity.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [attentionState, presenterControl, ambientListeningEnabled, localRecorder.start, localRecorder.stop, clearBargeInArmTimers, setBargeInPhaseBoth, capturePolicy]);
+  }, [ambientListeningEnabled, localRecorder.start, localRecorder.stop, clearBargeInArmTimers, setBargeInPhaseBoth, capturePolicy]);
 
   // Watches mic level while armed for a sustained loud burst -> real
   // interruption, against this utterance's calibrated effective threshold
@@ -1680,9 +1715,27 @@ export function JackProvider({ children }: { children: ReactNode }) {
           await wakeJackLocal();
         }
         mark(traceId, "intentRequestStart"); // T6
-        const intent = await jackApi.detectIntent(text, assistantName);
+        const intent = await jackApi.detectIntent(text, assistantName, kind);
         mark(traceId, "intentResultReady"); // T7
         dispatchEvent({ type: "LOCAL_COMMAND_ACTING" });
+        // Council engineering audit finding: the gateway's safety gate can
+        // silently downgrade a high-impact action (e.g. a "stop" that wasn't
+        // direct-addressed enough, or looked like a repeated-name ASR
+        // hallucination) to a harmless "conversation" reply -- intentional,
+        // documented gateway behavior (see intent.ts's HIGH_IMPACT_ACTIONS
+        // comment), but previously invisible client-side: a genuine command
+        // that got safety-downgraded looked identical, from the UI, to Jack
+        // simply misunderstanding. Logged here, not surfaced in the UI --
+        // this is exactly the kind of low-frequency safety-path event this
+        // codebase's [mic]-prefixed diagnostic logs already exist to make
+        // debuggable without adding new user-facing noise for something
+        // that's supposed to be rare and is already handled safely.
+        if (intent.downgradedFrom) {
+          console.log("[mic] high-impact action safety-downgraded to conversation", {
+            downgradedFrom: intent.downgradedFrom,
+            text,
+          });
+        }
 
         // Phase 1 safety gate: the presentation may ONLY change for
         // type === "action". Conversation/unknown never reach the switch
@@ -1928,10 +1981,20 @@ export function JackProvider({ children }: { children: ReactNode }) {
             }
             break;
           case "stop_presentation":
-            cancelAutonomousPresenting();
-            result = controller.endPresentation();
+            // Deliberately the same effect as pause_presentation, not
+            // controller.endPresentation() (which used to navigate all the
+            // way back to the mode-select screen): "stop"/"pause"/"hold on"
+            // are presenter-facing synonyms for the same request -- halt
+            // narration, stay on the current slide, resumable with
+            // "continue". Confirmed live: a presenter saying "stop" mid-talk
+            // expects Jack to go quiet, not to exit the presentation.
+            cancelAutonomousPresenting(); // stops current audio/narration before the acknowledgement below fires
+            result = controller.pausePresentation();
             mark(traceId, "slideMutationDone"); // T9
-            setPresenterControl("presenter");
+            if (result.success) {
+              traceHandedOff = true;
+              void speakThroughPlayer("Stopping here.", traceId);
+            }
             break;
           default:
             result = { success: false, error: `Jack didn't recognize "${text}" as a presentation command.` };

@@ -210,6 +210,7 @@ button.sync-presence:hover{filter:brightness(1.15)}
 @media(max-width:900px){.present-orb-corner{right:16px;bottom:16px;transform:scale(.65)}}
 @media(max-width:560px){.present-orb-corner{right:10px;bottom:10px;transform:scale(.42)}}
 .present-warning{text-align:center;font-size:11px;color:#ffb84d;margin:0 24px}
+.present-warning-reason{opacity:.75;font-style:italic}
 .present-subtitle-line{text-align:center;font-size:14px;color:#dff8ff;line-height:1.6;margin:0 24px 4px;min-height:1.6em}
 .present-controls-slider{display:none}
 @media(min-width:900px){.present-controls-slider{display:flex}}
