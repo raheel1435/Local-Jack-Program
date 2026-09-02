@@ -21,8 +21,14 @@
  * post-trigger portion.
  */
 export interface CaptureBoundaryPolicy {
-  readonly provider: "whisper" | "vibevoice";
-  readonly status: "APPROVED_FROZEN" | "TEST_EXPERIMENTAL_TUNABLE";
+  readonly provider: "whisper" | "vibevoice" | "openai";
+  /** Stage 2: "CLOUD_BYOK_FROZEN" is neither "our own approved local
+   * baseline" nor "an experimental local tuning target" -- OpenAI Speech's
+   * VAD/capture timing has no local tuning surface at all (it's just the
+   * network destination for the same captured WAV), so it starts pinned to
+   * the exact Whisper-approved numbers rather than inventing a third
+   * meaning for an existing status value. */
+  readonly status: "APPROVED_FROZEN" | "TEST_EXPERIMENTAL_TUNABLE" | "CLOUD_BYOK_FROZEN";
 
   // --- Barge-in VAD trigger (unchanged from the frozen baseline) ---
   /** 0..1 RMS-derived level a burst must cross before sustain-counting starts. */
@@ -93,8 +99,32 @@ export const VibeVoiceTestCapturePolicy: CaptureBoundaryPolicy = {
   maxSubmittedWavMs: 500 + 8000 + CAPTURE_TOLERANCE_MS,
 };
 
-export function capturePolicyFor(provider: "whisper" | "vibevoice"): CaptureBoundaryPolicy {
-  return provider === "vibevoice" ? VibeVoiceTestCapturePolicy : WhisperApprovedCapturePolicy;
+// Stage 2 (OpenAI Speech ASR): deliberately a SEPARATE object literal too
+// (same isolation rule as VibeVoiceTestCapturePolicy above), values
+// currently identical to Whisper's -- mic authority/VAD capture is a
+// browser-side concern entirely independent of which ASR engine ultimately
+// receives the resulting WAV, and there is no product reason yet for
+// OpenAI Speech to diverge from the approved baseline.
+export const OpenAiSpeechCapturePolicy: CaptureBoundaryPolicy = {
+  provider: "openai",
+  status: "CLOUD_BYOK_FROZEN",
+  bargeInLevel: 0.12,
+  sustainTicks: 10,
+  silenceMs: 1500,
+  armGuardMs: 350,
+  calibrationMs: 250,
+  floorMargin: 0.09,
+  silentPeakThreshold: 0.005,
+  shortCaptureWarningMs: 700,
+  preRollMs: 500,
+  activeCaptureMaxMs: 8000,
+  maxSubmittedWavMs: 500 + 8000 + CAPTURE_TOLERANCE_MS,
+};
+
+export function capturePolicyFor(provider: "whisper" | "vibevoice" | "openai"): CaptureBoundaryPolicy {
+  if (provider === "vibevoice") return VibeVoiceTestCapturePolicy;
+  if (provider === "openai") return OpenAiSpeechCapturePolicy;
+  return WhisperApprovedCapturePolicy;
 }
 
 /**

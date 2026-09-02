@@ -29,8 +29,14 @@ export interface CredentialStatusReport {
 }
 
 /** Stable ASR engine ids. "whisper" is APPROVED (default everywhere);
- * "vibevoice" is TEST (opt-in only, never a silent fallback target). */
-export type AsrProviderId = "whisper" | "vibevoice";
+ * "vibevoice" is TEST (opt-in only, never a silent fallback target);
+ * "openai" is OpenAI Speech (Stage 2, multi-provider AI milestone) -- a
+ * cloud BYOK engine, independent of AiBrainSelector's own "openai" value.
+ * Both share the SAME stored "openai" CredentialStore entry (one key, two
+ * possible uses), but ASR selection and AI-brain selection remain two
+ * completely separate axes -- selecting this never implies aiProvider:
+ * "openai" or vice versa. */
+export type AsrProviderId = "whisper" | "vibevoice" | "openai";
 
 export interface HealthReport {
   gateway: "ok";

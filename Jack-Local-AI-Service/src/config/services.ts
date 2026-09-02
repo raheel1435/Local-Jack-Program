@@ -86,4 +86,13 @@ export const config = {
   openaiDefaultModel: process.env.OPENAI_DEFAULT_MODEL ?? "gpt-4o-mini",
   anthropicDefaultModel: process.env.ANTHROPIC_DEFAULT_MODEL ?? "claude-haiku-4-5",
   anthropicMaxTokensDefault: Number(process.env.ANTHROPIC_MAX_TOKENS_DEFAULT ?? "1024"),
+
+  // Stage 2 (OpenAI Speech ASR): a DISTINCT model from openaiDefaultModel
+  // above -- that one is the chat/completions model for the AI-brain axis,
+  // this one is the /v1/audio/transcriptions model for the ASR axis. Default
+  // confirmed current via the openai-node SDK source (2026-09-02): a valid
+  // AudioModel value, and -- unlike whisper-1 -- fast/cheap, matching this
+  // engine's role (short command/narration-adjacent utterances) rather than
+  // a general-purpose "most accurate" default.
+  openaiTranscriptionModel: process.env.OPENAI_TRANSCRIPTION_MODEL ?? "gpt-4o-mini-transcribe",
 };

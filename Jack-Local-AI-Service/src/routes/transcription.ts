@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { Router } from "express";
 import { WhisperProvider } from "../providers/whisper/WhisperProvider.js";
 import { AdmissionGate } from "../lib/admission.js";
+import { CredentialAuthError } from "../lib/providerErrors.js";
+import type { CredentialStore } from "../lib/credentialStore.js";
 import type {
   AsrProvider,
   AsrProviderId,
@@ -15,7 +17,7 @@ const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 
 function parseProvider(value: unknown): AsrProviderId | undefined | "invalid" {
   if (value === undefined) return undefined;
-  if (value === "whisper" || value === "vibevoice") return value;
+  if (value === "whisper" || value === "vibevoice" || value === "openai") return value;
   return "invalid";
 }
 
@@ -29,12 +31,21 @@ function parseAssistantName(value: unknown): string | undefined | "invalid" {
   return name;
 }
 
-export function transcriptionRouter(whisper: WhisperProvider, vibevoice: AsrProvider): Router {
+export function transcriptionRouter(
+  whisper: WhisperProvider,
+  vibevoice: AsrProvider,
+  openaiSpeech: AsrProvider,
+  credentialStore?: CredentialStore,
+): Router {
   const router = Router();
-  const providers: Record<AsrProviderId, AsrProvider> = { whisper, vibevoice };
+  const providers: Record<AsrProviderId, AsrProvider> = { whisper, vibevoice, openai: openaiSpeech };
   const gates: Record<AsrProviderId, AdmissionGate> = {
     whisper: new AdmissionGate(2, 2),
     vibevoice: new AdmissionGate(1, 2),
+    // Same sizing as chat.ts/intent.ts's cloudGates -- bounds fan-out
+    // against a paid, rate-limited API. Unlike whisper/vibevoice this is a
+    // genuinely new exposure class ASR never had before Stage 2.
+    openai: new AdmissionGate(2, 4),
   };
 
   router.post("/jack/transcribe", async (req, res) => {
@@ -68,7 +79,7 @@ export function transcriptionRouter(whisper: WhisperProvider, vibevoice: AsrProv
     if (parsedProvider === "invalid") {
       const err: JackErrorResponse = {
         error: "invalid_request",
-        detail: `Unknown provider "${String(rawProvider)}". Expected "whisper" or "vibevoice".`,
+        detail: `Unknown provider "${String(rawProvider)}". Expected "whisper", "vibevoice", or "openai".`,
       };
       res.status(400).json(err);
       return;
@@ -123,9 +134,26 @@ export function transcriptionRouter(whisper: WhisperProvider, vibevoice: AsrProv
     try {
       const status = await provider.checkHealth();
       if (status === "unavailable") {
+        // openai is a BYOK cloud engine -- "unavailable" can mean not
+        // configured, an invalid stored key, or a genuinely unreachable
+        // API, and the caller deserves to know which (same distinction
+        // chat.ts/intent.ts already make for the AI-brain axis). whisper/
+        // vibevoice stay on the existing static unavailableDetail() text.
+        let detail: string;
+        if (providerId === "openai") {
+          const cred = await credentialStore?.status("openai");
+          detail =
+            !cred || cred.status === "not_configured"
+              ? "No OpenAI API key is configured. Add one in Settings before selecting OpenAI Speech."
+              : cred.status === "invalid"
+                ? "The stored OpenAI API key was rejected. Update it in Settings."
+                : "OpenAI Speech is not reachable right now.";
+        } else {
+          detail = unavailableDetail(providerId);
+        }
         const err: JackErrorResponse = {
           error: `${providerId}_unavailable`,
-          detail: unavailableDetail(providerId),
+          detail,
         };
         res.status(503).json(err);
         return;
@@ -142,6 +170,16 @@ export function transcriptionRouter(whisper: WhisperProvider, vibevoice: AsrProv
         );
         res.json(result);
       } catch (e) {
+        // Distinct failure class only openai's provider can throw (a
+        // previously-valid key that was revoked/rejected mid-flight) --
+        // mirrors chat.ts's CredentialAuthError -> 401 mapping exactly.
+        // whisper/vibevoice never throw this, so this branch is a no-op for
+        // them.
+        if (e instanceof CredentialAuthError) {
+          const err: JackErrorResponse = { error: `${providerId}_unauthorized`, detail: e.message };
+          res.status(401).json(err);
+          return;
+        }
         const err: JackErrorResponse = {
           error: `${providerId}_request_failed`,
           detail: e instanceof Error ? e.message : String(e),
@@ -162,7 +200,11 @@ export function transcriptionRouter(whisper: WhisperProvider, vibevoice: AsrProv
   return router;
 }
 
-function unavailableDetail(providerId: AsrProviderId): string {
+// Narrowed to the two providers that actually use this static text -- the
+// openai branch above builds its own credential-aware detail and never
+// calls this, so a future accidental call with "openai" is a compile error
+// instead of a silently mislabeled (VibeVoice-flavored) message.
+function unavailableDetail(providerId: "whisper" | "vibevoice"): string {
   return providerId === "whisper"
     ? "whisper.cpp is not configured or its executable/model path is missing. Set WHISPER_EXECUTABLE_PATH and WHISPER_MODEL_PATH."
     : "VibeVoice-ASR-BitNet (Test engine) is not configured or its executable/model paths are missing. Set VIBE_ASR_EXECUTABLE_PATH, VIBE_ASR_VAE_MODEL_PATH and VIBE_ASR_LM_MODEL_PATH. There is no automatic fallback to Whisper -- switch engines explicitly if you need a transcript now.";

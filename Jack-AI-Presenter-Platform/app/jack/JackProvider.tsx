@@ -6,6 +6,7 @@ import { capturePolicyFor, effectiveSpeechThreshold } from "./capturePolicy";
 import { isDirectlyAddressedToJack, isSelfEcho, type RecentSpeech } from "./addressing";
 import { useSpeech, type UseSpeechResult } from "../hooks/useSpeech";
 import { jackApi, type AiProviderId, type AsrProviderId, type JackHealth, type JackIntentAction } from "../lib/jackApi";
+import { normalizeAsrProviderId } from "./asrProviderSettings";
 import { DEFAULT_AI_PROVIDER_ID, normalizeAiProviderId } from "./aiProviderSettings";
 import {
   abortTrace,
@@ -140,8 +141,11 @@ const ASR_PROVIDER_STORAGE_KEY = "jack:asrProvider";
 function loadAsrProvider(): AsrProviderId {
   if (typeof window === "undefined") return "whisper";
   try {
-    const raw = window.localStorage.getItem(ASR_PROVIDER_STORAGE_KEY);
-    return raw === "vibevoice" ? "vibevoice" : "whisper";
+    // Stage 2: normalizeAsrProviderId() replaces the old hardcoded 2-way
+    // ternary so a third valid value ("openai") loads correctly, while
+    // still safely defaulting to "whisper" for anything unrecognized
+    // (garbage/removed values), never trusting the raw stored string.
+    return normalizeAsrProviderId(window.localStorage.getItem(ASR_PROVIDER_STORAGE_KEY));
   } catch {
     return "whisper";
   }

@@ -58,7 +58,7 @@ export interface TraceRecord {
   traceId: string;
   kind: TraceKind;
   /** ASR provider, when this trace involved a transcription. */
-  asrProvider?: "whisper" | "vibevoice";
+  asrProvider?: "whisper" | "vibevoice" | "openai";
   /** Short label for the diagnostics list (e.g. the transcript or narration text, truncated). */
   label: string;
   marks: Partial<Record<TraceStage, number>>;
@@ -90,7 +90,7 @@ export function startTrace(kind: TraceKind, label = ""): string {
   return traceId;
 }
 
-export function setTraceProvider(traceId: string, provider: "whisper" | "vibevoice") {
+export function setTraceProvider(traceId: string, provider: "whisper" | "vibevoice" | "openai") {
   const t = active.get(traceId);
   if (t) t.asrProvider = provider;
 }
@@ -242,7 +242,7 @@ const COMMAND_SEGMENTS: StagePair[] = [
   {
     start: "asrRequestStart",
     end: "asrTranscriptReady",
-    label: (t) => `ASR ${t.asrProvider === "vibevoice" ? "VibeVoice" : "Whisper"}`,
+    label: (t) => `ASR ${t.asrProvider === "vibevoice" ? "VibeVoice" : t.asrProvider === "openai" ? "OpenAI Speech" : "Whisper"}`,
   },
   { start: "intentRequestStart", end: "intentResultReady", label: () => "Intent" },
   { start: "slideMutationStart", end: "slideMutationDone", label: () => "Action" },
@@ -280,7 +280,7 @@ export function findBottleneck(segments: Segment[]): Segment | null {
 export function collectMetric(
   records: TraceRecord[],
   metric: (d: DerivedLatencies) => number | undefined,
-  filter?: { kind?: TraceKind; asrProvider?: "whisper" | "vibevoice" },
+  filter?: { kind?: TraceKind; asrProvider?: "whisper" | "vibevoice" | "openai" },
 ): number[] {
   return records
     .filter((t) => (!filter?.kind || t.kind === filter.kind) && (!filter?.asrProvider || t.asrProvider === filter.asrProvider))

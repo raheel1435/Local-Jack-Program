@@ -151,6 +151,7 @@ button.sync-presence:hover{filter:brightness(1.15)}
 .jack-asr-status-dot{width:6px;height:6px;border-radius:50%;background:#5a6b80;flex:none}
 .jack-asr-status-dot.available{background:#3ddc84}
 .jack-asr-status-dot.unavailable{background:#ff5c5c}
+.jack-asr-status-dot.not-configured{background:#ffb84d}
 .jack-settings-diagnostics{font-size:11px;color:#8aa0c0}
 .jack-settings-diagnostics summary{cursor:pointer;color:#c3dcea}
 .jack-asr-diag-list{list-style:none;margin:6px 0 0;padding:0;display:flex;flex-direction:column;gap:4px;max-height:160px;overflow-y:auto}

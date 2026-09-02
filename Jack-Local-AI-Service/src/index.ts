@@ -7,6 +7,7 @@ import { WhisperProvider } from "./providers/whisper/WhisperProvider.js";
 import { VibeAsrProvider } from "./providers/vibe/VibeAsrProvider.js";
 import { KokoroProvider } from "./providers/kokoro/KokoroProvider.js";
 import { OpenAiProvider } from "./providers/openai/OpenAiProvider.js";
+import { OpenAiSpeechProvider } from "./providers/openai/OpenAiSpeechProvider.js";
 import { AnthropicProvider } from "./providers/anthropic/AnthropicProvider.js";
 import { healthRouter } from "./routes/health.js";
 import { chatRouter, type LlmProviderRegistry } from "./routes/chat.js";
@@ -75,6 +76,13 @@ const kokoro = new KokoroProvider();
 const credentialStore = new CredentialStore();
 const openaiProvider = new OpenAiProvider(credentialStore);
 const anthropicProvider = new AnthropicProvider(credentialStore);
+// Stage 2 (OpenAI Speech ASR): a THIRD ASR engine alongside whisper/vibevoice
+// below, sharing the same "openai" CredentialStore entry as openaiProvider
+// above -- one BYOK key, two independent uses (AI brain vs. ASR). Always
+// constructed and health-checked, same pattern as every other provider here;
+// never invoked unless a request explicitly asks for provider "openai" on
+// /jack/transcribe.
+const openaiSpeechProvider = new OpenAiSpeechProvider(credentialStore);
 const llmProviders: LlmProviderRegistry = { local: activeLlm, openai: openaiProvider, anthropic: anthropicProvider };
 // Closes a real gap: chatRouter/intentRouter previously had zero
 // concurrency bound, fine for local-only compute but not for paid APIs
@@ -90,7 +98,7 @@ app.use(chatRouter(llmProviders, cloudGates, credentialStore));
 app.use(intentRouter(llmProviders, cloudGates, credentialStore));
 app.use(credentialsRouter(credentialStore));
 app.use(speechRouter(kokoro));
-app.use(transcriptionRouter(whisper, vibevoice));
+app.use(transcriptionRouter(whisper, vibevoice, openaiSpeechProvider, credentialStore));
 app.use(pptxConvertRouter());
 
 const server = app.listen(config.port, config.host, () => {

@@ -66,9 +66,12 @@ export interface CredentialStatusReport {
 }
 
 /** Stable ASR engine ids -- "whisper" is Approved (default everywhere),
- * "vibevoice" is Test (opt-in only, never a silent fallback target). Mirrors
+ * "vibevoice" is Test (opt-in only, never a silent fallback target),
+ * "openai" is OpenAI Speech (Stage 2, multi-provider AI milestone) -- a
+ * cloud BYOK engine, independent of AiProviderId's own "openai" value (two
+ * separate axes; selecting one never implies the other). Mirrors
  * Jack-Local-AI-Service/src/types/jack.ts's AsrProviderId. */
-export type AsrProviderId = "whisper" | "vibevoice";
+export type AsrProviderId = "whisper" | "vibevoice" | "openai";
 
 export interface JackTranscribeResult {
   text: string;
