@@ -5,6 +5,7 @@ import { useJack } from "../jack/JackProvider";
 import type { AudienceQuestionPolicy, ControlMode } from "../jack/types";
 import { LANGUAGE_OPTIONS, VOICE_OPTIONS } from "../jack/voiceSettings";
 import { AsrProviderSelector } from "./AsrProviderSelector";
+import { AiProviderSelector } from "./AiProviderSelector";
 
 // Multi-persona milestone: these templates keep the literal word "Jack" --
 // swapped for whichever assistant name is actually selected via
@@ -118,6 +119,9 @@ export function PresentSetup({ onReady, title }: { onReady: () => void; title: s
           <select value={jack.voice} onChange={(e) => jack.setVoice(e.target.value)}>
             {VOICE_OPTIONS.map((v) => <option key={v.id} value={v.id}>{v.label} -- {v.gender} · {v.accent}</option>)}
           </select>
+
+          <legend>AI Assistant</legend>
+          <AiProviderSelector />
 
           <legend>Speech Recognition</legend>
           <AsrProviderSelector />

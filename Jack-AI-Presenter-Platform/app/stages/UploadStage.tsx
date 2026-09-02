@@ -125,7 +125,9 @@ export function UploadStage() {
       )}
 
       <p className="privacy-note">
-        Your files stay in this browser session — {jack.assistantName} analyzes them locally and nothing is uploaded to an external service.
+        {jack.aiProvider === "local"
+          ? `Your files stay in this browser session — ${jack.assistantName} analyzes them locally and nothing is uploaded to an external service.`
+          : `Your files stay in this browser session for analysis. Because ${jack.assistantName === "Nova" ? "Nova" : "Jack"} is set to use ${jack.aiProvider === "openai" ? "OpenAI" : "Anthropic"}, relevant text (not your files themselves) is sent to ${jack.aiProvider === "openai" ? "OpenAI" : "Anthropic"} using your own API key when you ask a question or request narration.`}
       </p>
     </section>
   );

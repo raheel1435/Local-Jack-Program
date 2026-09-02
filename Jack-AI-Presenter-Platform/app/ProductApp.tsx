@@ -6,7 +6,7 @@ import { ModeSelectStage } from "./stages/ModeSelectStage";
 import { PracticeStage } from "./stages/PracticeStage";
 import { PresentStage } from "./stages/PresentStage";
 import { UploadStage } from "./stages/UploadStage";
-import { JackProvider } from "./jack/JackProvider";
+import { JackProvider, useJack } from "./jack/JackProvider";
 import { SessionProvider, useSession } from "./session/SessionContext";
 
 export default function ProductApp() {
@@ -21,6 +21,7 @@ export default function ProductApp() {
 
 function AppShell() {
   const { session } = useSession();
+  const jack = useJack();
 
   if (session.stage === "present") {
     return <PresentStage />;
@@ -45,7 +46,11 @@ function AppShell() {
 
       <footer>
         <span>JACK AI · TURN ANY PRESENTATION INTO A CONVERSATION</span>
-        <span>Private by design &nbsp;·&nbsp; Your files stay under your control</span>
+        <span>
+          {jack.aiProvider === "local"
+            ? <>Private by design &nbsp;·&nbsp; Your files stay under your control</>
+            : <>Using {jack.aiProvider === "openai" ? "OpenAI" : "Anthropic"} &nbsp;·&nbsp; Relevant text is sent to {jack.aiProvider === "openai" ? "OpenAI" : "Anthropic"} using your own API key</>}
+        </span>
       </footer>
     </div>
   );

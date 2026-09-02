@@ -16,6 +16,10 @@ export const MAX_ASSISTANT_NAME_LENGTH = 100;
 export const MAX_SPEAK_TEXT_LENGTH = 5_000;
 export const MAX_CHAT_MESSAGE_CONTENT_LENGTH = 50_000;
 export const MAX_CHAT_MESSAGES = 100;
+// BYOK API keys: generous upper bound, no format assumption (provider key
+// formats change over time) -- just a defense-in-depth cap consistent with
+// this file's other limits, well above any real OpenAI/Anthropic key length.
+export const MAX_API_KEY_LENGTH = 512;
 
 export function isNonEmptyStringWithinLimit(value: unknown, maxLength: number): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.length <= maxLength;

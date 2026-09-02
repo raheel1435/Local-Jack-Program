@@ -75,4 +75,15 @@ export const config = {
   // "loads models once, processes audio via stdin") -- see VibeWarmServer.ts
   // and VibeVoiceTestConfig.warmRuntime. Same build directory as asr_infer.exe.
   vibeAsrStreamServerExecutablePath: process.env.VIBE_ASR_STREAM_SERVER_EXECUTABLE_PATH ?? "",
+
+  // Multi-provider AI milestone: OpenAI/Anthropic as BYOK AI-brain
+  // providers. These are model DEFAULTS only, not secrets -- the API keys
+  // themselves live in CredentialStore (DPAPI-encrypted, outside git),
+  // never here. gpt-4o-mini / claude-haiku-4-5 are fast/cheap tiers,
+  // matching the local providers' role (short narration text, structured
+  // intent-classification JSON under chat.ts's 512-token cap) rather than
+  // a general-purpose "biggest model" default.
+  openaiDefaultModel: process.env.OPENAI_DEFAULT_MODEL ?? "gpt-4o-mini",
+  anthropicDefaultModel: process.env.ANTHROPIC_DEFAULT_MODEL ?? "claude-haiku-4-5",
+  anthropicMaxTokensDefault: Number(process.env.ANTHROPIC_MAX_TOKENS_DEFAULT ?? "1024"),
 };

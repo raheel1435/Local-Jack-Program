@@ -5,7 +5,8 @@ import { useLocalRecorder, type CaptureCloseReason, type LocalRecorderState } fr
 import { capturePolicyFor, effectiveSpeechThreshold } from "./capturePolicy";
 import { isDirectlyAddressedToJack, isSelfEcho, type RecentSpeech } from "./addressing";
 import { useSpeech, type UseSpeechResult } from "../hooks/useSpeech";
-import { jackApi, type AsrProviderId, type JackHealth, type JackIntentAction } from "../lib/jackApi";
+import { jackApi, type AiProviderId, type AsrProviderId, type JackHealth, type JackIntentAction } from "../lib/jackApi";
+import { DEFAULT_AI_PROVIDER_ID, normalizeAiProviderId } from "./aiProviderSettings";
 import {
   abortTrace,
   finishTrace,
@@ -155,6 +156,34 @@ function saveAsrProvider(provider: AsrProviderId) {
   }
 }
 
+// Multi-provider AI milestone: which AI brain (Local/OpenAI/Anthropic)
+// answers conversational Q&A, non-deterministic intent interpretation,
+// narration generation, slide explanation, and summaries -- deliberately a
+// separate storage key from ASR_PROVIDER_STORAGE_KEY, since these are two
+// independent axes (see aiProviderSettings.ts). This is a client
+// PREFERENCE (which header to send), not where secret material lives --
+// the API key itself never touches localStorage/React state beyond the
+// moment a Settings form submits it to the local gateway.
+const AI_PROVIDER_STORAGE_KEY = "jack:aiProvider";
+
+function loadAiProvider(): AiProviderId {
+  if (typeof window === "undefined") return DEFAULT_AI_PROVIDER_ID;
+  try {
+    return normalizeAiProviderId(window.localStorage.getItem(AI_PROVIDER_STORAGE_KEY));
+  } catch {
+    return DEFAULT_AI_PROVIDER_ID;
+  }
+}
+
+function saveAiProvider(provider: AiProviderId) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(AI_PROVIDER_STORAGE_KEY, provider);
+  } catch {
+    // Storage unavailable -- selection just won't survive reload.
+  }
+}
+
 // Brief takeover acknowledgements (Phase 10) -- confirms the command landed
 // before narration starts, so the user isn't left wondering whether it worked.
 // Short continuity lines for "Continue" after a pause (Phase 13/14) --
@@ -208,6 +237,11 @@ export interface JackContextValue {
    * fails; see runLocalCommand's transcription call sites.
    */
   asrProvider: AsrProviderId;
+  /** Multi-provider AI milestone: which AI brain (Local/OpenAI/Anthropic)
+   * answers conversational Q&A, narration generation, slide explanation,
+   * and summaries -- independent of asrProvider. */
+  aiProvider: AiProviderId;
+  setAiProvider(provider: AiProviderId): void;
   /** Last few measured transcriptions (both engines), newest first -- see AsrDiagnosticEntry. */
   asrDiagnostics: AsrDiagnosticEntry[];
   /** Last few end-to-end latency traces (voice commands, typed commands, and narration steps), newest first -- see perfTrace.ts. */
@@ -507,6 +541,11 @@ export function JackProvider({ children }: { children: ReactNode }) {
     setAsrProviderState(next);
     saveAsrProvider(next);
   }, []);
+  const [aiProvider, setAiProviderState] = useState<AiProviderId>(DEFAULT_AI_PROVIDER_ID);
+  const setAiProvider = useCallback((next: AiProviderId) => {
+    setAiProviderState(next);
+    saveAiProvider(next);
+  }, []);
   // Runs exactly once, after mount -- i.e. strictly after hydration, when
   // `window`/localStorage are safely available and there's no server-
   // rendered markup left to mismatch against. Pulls in whatever was
@@ -527,6 +566,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     setCaptionsEnabledState(saved.captionsEnabled);
     setBrowserFallbackEnabledState(saved.browserFallbackEnabled);
     setAsrProviderState(loadAsrProvider());
+    setAiProviderState(loadAiProvider());
   }, []);
   /* eslint-enable react-hooks/set-state-in-effect */
   const [questions, setQuestions] = useState<QueuedQuestion[]>([]);
@@ -1014,11 +1054,11 @@ export function JackProvider({ children }: { children: ReactNode }) {
           // Slide 0 is the only slide that ever gets the self-introduction --
           // matches runNarrationStep's own presentationOpeningDeliveredRef
           // logic, which likewise only opens on the very first slide spoken.
-          const openingText = await generateNarrationOpening(context, i === 0, humourEnabled, assistantName);
+          const openingText = await generateNarrationOpening(context, i === 0, humourEnabled, assistantName, aiProvider);
           const openingAudio = await jackApi.speak(openingText, voice);
           let continuationText: string | null = null;
           let continuationAudio: Blob | null = null;
-          const rawContinuation = await generateNarrationContinuation(context, openingText, humourEnabled, assistantName);
+          const rawContinuation = await generateNarrationContinuation(context, openingText, humourEnabled, assistantName, aiProvider);
           if (rawContinuation && !isRedundantContinuation(openingText, rawContinuation)) {
             continuationText = rawContinuation;
             continuationAudio = await jackApi.speak(rawContinuation, voice);
@@ -1031,7 +1071,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       }
       pregeneratedNarrationRef.current.set(doc.fileId, slideMap);
     },
-    [humourEnabled, assistantName, voice],
+    [humourEnabled, assistantName, voice, aiProvider],
   );
 
   // --- Autonomous narration loop (Phase 2-5) ------------------------------
@@ -1075,7 +1115,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       }
       const promise = (async () => {
         try {
-          const text = await generateNarrationOpening(context, false, humourEnabled, assistantName);
+          const text = await generateNarrationOpening(context, false, humourEnabled, assistantName, aiProvider);
           const audio = await jackApi.speak(text, voice);
           return { text, audio };
         } catch {
@@ -1084,7 +1124,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       })();
       narrationPrefetchRef.current = { generation, slideIndex, promise };
     },
-    [humourEnabled, voice, assistantName],
+    [humourEnabled, voice, assistantName, aiProvider],
   );
 
   const runNarrationStep = useCallback(
@@ -1176,7 +1216,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       }
       if (!opening) {
         try {
-          const text = await generateNarrationOpening(context, isOpening, humourEnabled, assistantName);
+          const text = await generateNarrationOpening(context, isOpening, humourEnabled, assistantName, aiProvider);
           mark(traceId, "llmFirstToken"); // T13 -- opening sentence text ready (genuinely measurable now, unlike the old single-shot call)
           if (!stillCurrent()) {
             finishTrace(traceId, false);
@@ -1217,7 +1257,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
           )
         : (async () => {
             try {
-              const text = await generateNarrationContinuation(context, opening!.text, humourEnabled, assistantName);
+              const text = await generateNarrationContinuation(context, opening!.text, humourEnabled, assistantName, aiProvider);
               // Empty (model judged the opening already complete) or a
               // near-duplicate of the opening (the model didn't reliably follow
               // that instruction -- see isRedundantContinuation's comment) are
@@ -1287,7 +1327,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
         })();
       });
     },
-    [cancelAutonomousPresenting, dispatchEvent, speechPlayer, voice, humourEnabled, prefetchNextSlideOpening, assistantName, setCurrentCaptionTracked],
+    [cancelAutonomousPresenting, dispatchEvent, speechPlayer, voice, humourEnabled, prefetchNextSlideOpening, assistantName, setCurrentCaptionTracked, aiProvider],
   );
 
   useEffect(() => {
@@ -1715,7 +1755,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
           await wakeJackLocal();
         }
         mark(traceId, "intentRequestStart"); // T6
-        const intent = await jackApi.detectIntent(text, assistantName, kind);
+        const intent = await jackApi.detectIntent(text, assistantName, kind, aiProvider);
         mark(traceId, "intentResultReady"); // T7
         dispatchEvent({ type: "LOCAL_COMMAND_ACTING" });
         // Council engineering audit finding: the gateway's safety gate can
@@ -1833,6 +1873,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
             activeFileId,
             inAskJackMode,
             assistantName,
+            aiProvider,
           );
           mark(traceId, "llmResponseReady"); // T14
           dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
@@ -1853,7 +1894,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
               : "Summarize this slide in one or two sentences.";
           const prompt = ctx ? `${formatContextForPrompt(ctx)}\n\n${instruction}` : instruction;
           mark(traceId, "llmRequestStart"); // T12 -- T13 not measurable (non-streaming)
-          const chat = await jackApi.chat([{ role: "user", content: prompt }], { maxTokens: 150 });
+          const chat = await jackApi.chat([{ role: "user", content: prompt }], { maxTokens: 150, aiProvider });
           mark(traceId, "llmResponseReady"); // T14
           dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
           void speakThroughPlayer(chat.content, traceId); // sets currentCaption itself
@@ -2048,6 +2089,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       queueQuestion,
       controlMode,
       assistantName,
+      aiProvider,
     ],
   );
 
@@ -2112,6 +2154,8 @@ export function JackProvider({ children }: { children: ReactNode }) {
     captionsEnabled,
     browserFallbackEnabled,
     asrProvider,
+    aiProvider,
+    setAiProvider,
     asrDiagnostics,
     perfTraces,
     setVoice,

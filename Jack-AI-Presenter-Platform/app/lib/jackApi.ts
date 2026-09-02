@@ -32,7 +32,37 @@ export interface JackHealth {
   whisper: "available" | "unavailable";
   vibevoice: "available" | "unavailable";
   kokoro: "available" | "unavailable";
+  /** Multi-provider AI milestone: collapses "no key configured" into
+   * "unavailable", same as every other provider's "can't be used right
+   * now" -- the not-configured/invalid nuance lives in
+   * jackApi.getCredentialStatus(), not here. */
+  openai: "available" | "unavailable";
+  anthropic: "available" | "unavailable";
   activeLlmProvider: "colibri" | "llamacpp";
+}
+
+/** Multi-provider AI milestone: which AI brain a request wants, independent
+ * of ASR selection. "local" means whichever local engine the gateway
+ * already picked at boot (colibri/llamacpp) -- this selector does not
+ * choose between those two, it chooses local vs. a cloud BYOK provider.
+ * Mirrors Jack-Local-AI-Service/src/types/jack.ts's AiBrainSelector. */
+export type AiProviderId = "local" | "openai" | "anthropic";
+
+/** BYOK credential-status vocabulary. Mirrors
+ * Jack-Local-AI-Service/src/types/jack.ts's CredentialProviderId/
+ * CredentialStatus/CredentialStatusReport. */
+export type CredentialProviderId = "openai" | "anthropic";
+export type CredentialStatus = "not_configured" | "connected" | "invalid";
+
+export interface CredentialStatusReport {
+  provider: CredentialProviderId;
+  status: CredentialStatus;
+  /** Last 4 characters of the stored key. Present only when
+   * status !== "not_configured". NEVER the full key -- the gateway never
+   * returns it, and this client never asks for or stores it. */
+  lastFour?: string;
+  updatedAt?: string;
+  detail?: string;
 }
 
 /** Stable ASR engine ids -- "whisper" is Approved (default everywhere),
@@ -139,6 +169,8 @@ export const jackApi = {
         whisper: "unavailable",
         vibevoice: "unavailable",
         kokoro: "unavailable",
+        openai: "unavailable",
+        anthropic: "unavailable",
         activeLlmProvider: "llamacpp",
       };
     }
@@ -153,18 +185,30 @@ export const jackApi = {
    * typed text (no ambient-noise/ASR-hallucination risk at all) apart from
    * voice-captured text (where that risk is real and the check must stay).
    * Omitting it keeps the gateway's existing protected-by-default behavior. */
+  /** `aiProvider`: multi-provider AI milestone -- which AI brain classifies
+   * the LLM-fallback case (never consulted for a deterministic match).
+   * Omitting it keeps today's "local" default. */
   detectIntent(
     text: string,
     assistantName?: string,
     inputSource?: "typed" | "voice" | "interruption",
+    aiProvider?: AiProviderId,
   ): Promise<JackIntentResult> {
-    return postJson<JackIntentResult>("/jack/intent", { text, assistantName, inputSource }, 15_000);
+    return postJson<JackIntentResult>("/jack/intent", { text, assistantName, inputSource, aiProvider }, 15_000);
   },
 
-  chat(messages: JackChatMessage[], opts?: { maxTokens?: number; temperature?: number }): Promise<JackChatResult> {
+  chat(
+    messages: JackChatMessage[],
+    opts?: { maxTokens?: number; temperature?: number; aiProvider?: AiProviderId },
+  ): Promise<JackChatResult> {
     return postJson<JackChatResult>(
       "/jack/chat",
-      { messages, max_tokens: opts?.maxTokens ?? 200, temperature: opts?.temperature ?? 0.4 },
+      {
+        messages,
+        max_tokens: opts?.maxTokens ?? 200,
+        temperature: opts?.temperature ?? 0.4,
+        aiProvider: opts?.aiProvider,
+      },
       30_000,
     );
   },
@@ -227,5 +271,47 @@ export const jackApi = {
       throw new Error(detail?.detail || `PPTX conversion failed: ${res.status}`);
     }
     return res.blob();
+  },
+
+  /**
+   * BYOK credential management (multi-provider AI milestone). The API key
+   * is only ever sent TO the gateway (saveCredential's request body) --
+   * every response from these four methods is a CredentialStatusReport,
+   * which structurally cannot carry the full key (only `lastFour`). This
+   * client never stores a raw key anywhere (no localStorage, no React
+   * state) beyond the moment a Settings form submits it.
+   */
+  async getCredentialStatus(): Promise<Record<CredentialProviderId, CredentialStatusReport>> {
+    const res = await fetch(`${BASE_URL}/jack/credentials`, { signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS) });
+    if (!res.ok) throw new Error(`Failed to fetch credential status: ${res.status}`);
+    return res.json();
+  },
+
+  saveCredential(provider: CredentialProviderId, apiKey: string): Promise<CredentialStatusReport> {
+    return postJson<CredentialStatusReport>(`/jack/credentials/${provider}`, { apiKey }, 15_000);
+  },
+
+  async removeCredential(provider: CredentialProviderId): Promise<CredentialStatusReport> {
+    const res = await fetch(`${BASE_URL}/jack/credentials/${provider}`, {
+      method: "DELETE",
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) {
+      const detail = (await res.json().catch(() => null)) as { detail?: string } | null;
+      throw new Error(detail?.detail || `Failed to remove credential: ${res.status}`);
+    }
+    return res.json();
+  },
+
+  async testCredential(provider: CredentialProviderId): Promise<CredentialStatusReport> {
+    const res = await fetch(`${BASE_URL}/jack/credentials/${provider}/test`, {
+      method: "POST",
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) {
+      const detail = (await res.json().catch(() => null)) as { detail?: string } | null;
+      throw new Error(detail?.detail || `Connection test failed: ${res.status}`);
+    }
+    return res.json();
   },
 };

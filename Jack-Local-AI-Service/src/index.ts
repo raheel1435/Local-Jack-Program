@@ -6,13 +6,18 @@ import { LlamaCppProvider } from "./providers/llamacpp/LlamaCppProvider.js";
 import { WhisperProvider } from "./providers/whisper/WhisperProvider.js";
 import { VibeAsrProvider } from "./providers/vibe/VibeAsrProvider.js";
 import { KokoroProvider } from "./providers/kokoro/KokoroProvider.js";
+import { OpenAiProvider } from "./providers/openai/OpenAiProvider.js";
+import { AnthropicProvider } from "./providers/anthropic/AnthropicProvider.js";
 import { healthRouter } from "./routes/health.js";
-import { chatRouter } from "./routes/chat.js";
+import { chatRouter, type LlmProviderRegistry } from "./routes/chat.js";
 import { intentRouter } from "./routes/intent.js";
 import { speechRouter } from "./routes/speech.js";
 import { transcriptionRouter } from "./routes/transcription.js";
 import { pptxConvertRouter } from "./routes/pptxConvert.js";
-import type { LlmProvider } from "./types/jack.js";
+import { credentialsRouter } from "./routes/credentials.js";
+import { CredentialStore } from "./lib/credentialStore.js";
+import { AdmissionGate } from "./lib/admission.js";
+import type { AiBrainSelector, LlmProvider } from "./types/jack.js";
 
 const app = express();
 app.use(express.json());
@@ -63,9 +68,27 @@ const whisper = new WhisperProvider();
 const vibevoice = new VibeAsrProvider();
 const kokoro = new KokoroProvider();
 
-app.use(healthRouter(colibri, llamacpp, whisper, kokoro, vibevoice));
-app.use(chatRouter(activeLlm));
-app.use(intentRouter(activeLlm));
+// Multi-provider AI milestone: OpenAI/Anthropic as BYOK AI-brain providers,
+// always constructed and health-checked (same pattern as colibri/llamacpp
+// above), selected per-request via `aiProvider` rather than one fixed
+// choice at boot -- see LlmProviderRegistry's own doc comment in chat.ts.
+const credentialStore = new CredentialStore();
+const openaiProvider = new OpenAiProvider(credentialStore);
+const anthropicProvider = new AnthropicProvider(credentialStore);
+const llmProviders: LlmProviderRegistry = { local: activeLlm, openai: openaiProvider, anthropic: anthropicProvider };
+// Closes a real gap: chatRouter/intentRouter previously had zero
+// concurrency bound, fine for local-only compute but not for paid APIs
+// where uncontrolled fan-out means runaway billing. `local` intentionally
+// keeps its current zero-gate behavior (no entry in this map).
+const cloudGates: Partial<Record<AiBrainSelector, AdmissionGate>> = {
+  openai: new AdmissionGate(2, 4),
+  anthropic: new AdmissionGate(2, 4),
+};
+
+app.use(healthRouter(colibri, llamacpp, whisper, kokoro, vibevoice, openaiProvider, anthropicProvider));
+app.use(chatRouter(llmProviders, cloudGates, credentialStore));
+app.use(intentRouter(llmProviders, cloudGates, credentialStore));
+app.use(credentialsRouter(credentialStore));
 app.use(speechRouter(kokoro));
 app.use(transcriptionRouter(whisper, vibevoice));
 app.use(pptxConvertRouter());

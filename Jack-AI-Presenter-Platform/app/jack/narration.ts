@@ -1,4 +1,4 @@
-import { jackApi } from "../lib/jackApi";
+import { jackApi, type AiProviderId } from "../lib/jackApi";
 import type { ParsedDocument } from "../session/types";
 import { retrieveForQuestion } from "./deckRetrieval";
 import { formatContextForPrompt, formatContextForQA, type PresentationContext } from "./presentationContext";
@@ -145,6 +145,7 @@ export async function generateSlideNarration(
   isOpening: boolean,
   humourEnabled: boolean,
   assistantName = "Jack",
+  aiProvider?: AiProviderId,
 ): Promise<string> {
   const prompt = `${formatContextForPrompt(context)}\n\nNarrate this slide now.`;
   const result = await jackApi.chat(
@@ -152,7 +153,7 @@ export async function generateSlideNarration(
       { role: "system", content: narrationSystemPrompt(isOpening, humourEnabled, assistantName) },
       { role: "user", content: prompt },
     ],
-    { maxTokens: 160, temperature: 0.5 },
+    { maxTokens: 160, temperature: 0.5, aiProvider },
   );
   return ensurePresentationIntroduction(result.content, isOpening, assistantName);
 }
@@ -176,6 +177,7 @@ export async function generateNarrationOpening(
   isOpening: boolean,
   humourEnabled: boolean,
   assistantName = "Jack",
+  aiProvider?: AiProviderId,
 ): Promise<string> {
   const prompt =
     `${formatContextForPrompt(context)}\n\n` +
@@ -187,7 +189,7 @@ export async function generateNarrationOpening(
       { role: "system", content: narrationSystemPrompt(isOpening, humourEnabled, assistantName) },
       { role: "user", content: prompt },
     ],
-    { maxTokens: 48, temperature: 0.5 },
+    { maxTokens: 48, temperature: 0.5, aiProvider },
   );
   return ensurePresentationIntroduction(result.content, isOpening, assistantName);
 }
@@ -197,6 +199,7 @@ export async function generateNarrationContinuation(
   openingSentence: string,
   humourEnabled: boolean,
   assistantName = "Jack",
+  aiProvider?: AiProviderId,
 ): Promise<string> {
   const prompt =
     `${formatContextForPrompt(context)}\n\n` +
@@ -217,7 +220,7 @@ export async function generateNarrationContinuation(
       { role: "system", content: narrationSystemPrompt(false, humourEnabled, assistantName) },
       { role: "user", content: prompt },
     ],
-    { maxTokens: 120, temperature: 0.5 },
+    { maxTokens: 120, temperature: 0.5, aiProvider },
   );
   return result.content.trim();
 }
@@ -348,6 +351,7 @@ export async function answerDeckQuestion(
   activeFileId: string | null,
   comprehensive = false,
   assistantName = "Jack",
+  aiProvider?: AiProviderId,
 ): Promise<DeckAnswer> {
   const retrieval = retrieveForQuestion(question, context, docs, activeFileId, comprehensive);
   const matches = retrieval.matches;
@@ -369,7 +373,7 @@ export async function answerDeckQuestion(
         { role: "system", content: systemPrompt },
         { role: "user", content: prompt },
       ],
-      { maxTokens: 120, temperature: 0.4 },
+      { maxTokens: 120, temperature: 0.4, aiProvider },
     );
     return { answer: result.content.trim(), grounded: false, confidence: "low" };
   }
@@ -412,7 +416,7 @@ export async function answerDeckQuestion(
     // for a fuller answer -- capping it at the same 180 tokens used for a
     // lean, single-slide, real-time narration answer risked truncating a
     // genuinely thorough answer mid-sentence.
-    { maxTokens: comprehensive ? 320 : 180, temperature: 0.3 },
+    { maxTokens: comprehensive ? 320 : 180, temperature: 0.3, aiProvider },
   );
   return { answer: result.content.trim(), grounded: matches.length > 0, confidence: retrieval.confidence };
 }

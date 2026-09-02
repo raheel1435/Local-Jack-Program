@@ -8,7 +8,13 @@ import {
   MAX_ASSISTANT_NAME_LENGTH,
   MAX_INTENT_TEXT_LENGTH,
 } from "../lib/requestValidation.js";
-import type { JackErrorResponse, LlmProvider } from "../types/jack.js";
+import { CredentialAuthError } from "../lib/providerErrors.js";
+import type { AdmissionGate } from "../lib/admission.js";
+import type { CredentialStore } from "../lib/credentialStore.js";
+import type { LlmProviderRegistry } from "./chat.js";
+import type { AiBrainSelector, JackErrorResponse } from "../types/jack.js";
+
+const VALID_AI_PROVIDERS: ReadonlySet<AiBrainSelector> = new Set(["local", "openai", "anthropic"]);
 
 /** How this text reached Jack. Council engineering audit finding: the
  * HIGH_IMPACT_ACTIONS direct-address downgrade below exists specifically to
@@ -33,6 +39,13 @@ interface JackIntentRequest {
    * omitted or unrecognized -- any existing/future caller that doesn't send
    * this gets exactly today's protected behavior, never silently loosened. */
   inputSource?: IntentInputSource;
+  /** Multi-provider AI milestone: which AI brain to use for the LLM-fallback
+   * classification (never consulted for a deterministic match). Omitted ->
+   * "local" (today's exact behavior). This field is independent of, and has
+   * zero effect on, the HIGH_IMPACT_ACTIONS downgrade gate below -- that
+   * gate only ever inspects the raw text + assistantName, never which
+   * provider produced the classification. */
+  aiProvider?: AiBrainSelector;
 }
 
 const VALID_ACTIONS = new Set([
@@ -72,7 +85,11 @@ const HIGH_IMPACT_ACTIONS = new Set([
   "stop_presentation",
 ]);
 
-export function intentRouter(llm: LlmProvider): Router {
+export function intentRouter(
+  providers: LlmProviderRegistry,
+  gates?: Partial<Record<AiBrainSelector, AdmissionGate>>,
+  credentialStore?: CredentialStore,
+): Router {
   const router = Router();
 
   router.post("/jack/intent", async (req, res) => {
@@ -113,18 +130,59 @@ export function intentRouter(llm: LlmProvider): Router {
       return;
     }
 
-    const status = await llm.checkHealth();
-    if (status === "unavailable") {
+    // aiProvider is only ever consulted past this point -- a deterministic
+    // match above already returned early regardless of its value, and
+    // nothing below feeds it into classifyAddress/hasSuspiciousRepetition
+    // (see JackIntentRequest's own doc comment on this field).
+    if (body.aiProvider !== undefined && (typeof body.aiProvider !== "string" || !VALID_AI_PROVIDERS.has(body.aiProvider as AiBrainSelector))) {
       const err: JackErrorResponse = {
-        error: "llm_unavailable",
-        detail:
-          "No deterministic match, and the configured local LLM provider is not reachable.",
+        error: "invalid_request",
+        detail: '`aiProvider`, when provided, must be one of "local", "openai", or "anthropic".',
       };
-      res.status(503).json(err);
+      res.status(400).json(err);
       return;
+    }
+    const selector: AiBrainSelector = (body.aiProvider as AiBrainSelector | undefined) ?? "local";
+    const llm = providers[selector];
+
+    let release: (() => void) | undefined;
+    if (selector !== "local" && gates?.[selector]) {
+      const abortController = new AbortController();
+      const abort = () => abortController.abort();
+      req.once("aborted", abort);
+      res.once("close", abort);
+      const acquired = await gates[selector]!.acquire(abortController.signal);
+      req.off("aborted", abort);
+      res.off("close", abort);
+      if (!acquired) {
+        const err: JackErrorResponse = {
+          error: `${selector}_busy`,
+          detail: `${selector} is at capacity; retry after an in-flight request completes.`,
+        };
+        res.status(429).json(err);
+        return;
+      }
+      release = acquired;
     }
 
     try {
+      const status = await llm.checkHealth();
+      if (status === "unavailable") {
+        let detail = "No deterministic match, and the configured local LLM provider is not reachable.";
+        if (selector !== "local") {
+          const cred = await credentialStore?.status(selector);
+          detail =
+            !cred || cred.status === "not_configured"
+              ? `No API key is configured for ${selector}. Add one in Settings before selecting this provider.`
+              : cred.status === "invalid"
+                ? `The stored ${selector} API key was rejected. Update it in Settings.`
+                : `${selector} is not reachable right now.`;
+        }
+        const err: JackErrorResponse = { error: `${selector}_unavailable`, detail };
+        res.status(503).json(err);
+        return;
+      }
+
       const result = await llm.chat({
         messages: [
           { role: "system", content: buildActionSystemPrompt(assistantName) },
@@ -206,11 +264,18 @@ export function intentRouter(llm: LlmProvider): Router {
         latencyMs: Date.now() - start,
       });
     } catch (e) {
+      if (e instanceof CredentialAuthError) {
+        const err: JackErrorResponse = { error: `${selector}_unauthorized`, detail: e.message };
+        res.status(401).json(err);
+        return;
+      }
       const err: JackErrorResponse = {
-        error: "llm_request_failed",
+        error: `${selector}_request_failed`,
         detail: e instanceof Error ? e.message : String(e),
       };
       res.status(502).json(err);
+    } finally {
+      release?.();
     }
   });
 

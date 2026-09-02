@@ -49,3 +49,21 @@ test("health() reports gateway: \"unreachable\" on a non-2xx response, not \"ok\
   const health = await jackApi.health();
   assert.equal(health.gateway, "unreachable");
 });
+
+// Multi-provider AI milestone: the synthetic offline-fallback literal must
+// include openai/anthropic like every other provider field, or a caller
+// reading health.openai on a genuinely unreachable gateway would see
+// `undefined` instead of the honest "unavailable".
+test("health()'s offline synthetic fallback reports openai/anthropic as unavailable too", async (t) => {
+  const realFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = realFetch;
+  });
+  globalThis.fetch = async () => {
+    throw new TypeError("fetch failed");
+  };
+
+  const health = await jackApi.health();
+  assert.equal(health.openai, "unavailable");
+  assert.equal(health.anthropic, "unavailable");
+});

@@ -3,6 +3,7 @@ import test from "node:test";
 import express from "express";
 import type { AddressInfo } from "node:net";
 import { intentRouter } from "./intent.ts";
+import type { LlmProviderRegistry } from "./chat.ts";
 import type { JackChatRequest, JackChatResponse, LlmProvider, ProviderStatus } from "../types/jack.ts";
 
 // Coverage for the latency-fix milestone's Part 4 requirement: deterministic
@@ -26,10 +27,19 @@ class RecordingLlmProvider implements LlmProvider {
   }
 }
 
-async function withServer(llm: LlmProvider, fn: (baseUrl: string) => Promise<void>) {
+/** Multi-provider AI milestone: intentRouter now takes a full
+ * LlmProviderRegistry, not one fixed LlmProvider. Every existing test in
+ * this file cares only about the "local" (default, aiProvider omitted)
+ * path, so a single provider is reused across all three registry slots
+ * unless a test explicitly wants to distinguish them. */
+function registryOf(llm: LlmProvider): LlmProviderRegistry {
+  return { local: llm, openai: llm, anthropic: llm };
+}
+
+async function withServer(providers: LlmProviderRegistry, fn: (baseUrl: string) => Promise<void>) {
   const app = express();
   app.use(express.json());
-  app.use(intentRouter(llm));
+  app.use(intentRouter(providers));
   const server = app.listen(0);
   await new Promise<void>((resolve) => server.once("listening", resolve));
   const { port } = server.address() as AddressInfo;
@@ -51,7 +61,7 @@ test("deterministic commands (next/previous/pause/continue/stop/take over/handof
     "Jack, take over.",
     "I'll take it from here.",
   ];
-  await withServer(llm, async (base) => {
+  await withServer(registryOf(llm), async (base) => {
     for (const text of phrases) {
       const res = await fetch(`${base}/jack/intent`, {
         method: "POST",
@@ -66,9 +76,30 @@ test("deterministic commands (next/previous/pause/continue/stop/take over/handof
   });
 });
 
+test("a deterministic command never calls any provider's chat(), regardless of aiProvider", async () => {
+  const local = new RecordingLlmProvider();
+  const openai = new RecordingLlmProvider();
+  const anthropic = new RecordingLlmProvider();
+  await withServer({ local, openai, anthropic }, async (base) => {
+    for (const aiProvider of ["local", "openai", "anthropic"]) {
+      const res = await fetch(`${base}/jack/intent`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "Next.", aiProvider }),
+      });
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.equal(body.source, "deterministic");
+    }
+    assert.equal(local.chatCallCount, 0);
+    assert.equal(openai.chatCallCount, 0);
+    assert.equal(anthropic.chatCallCount, 0);
+  });
+});
+
 test("a genuinely ambiguous phrase (no deterministic match) DOES fall through to the LLM", async () => {
   const llm = new RecordingLlmProvider();
-  await withServer(llm, async (base) => {
+  await withServer(registryOf(llm), async (base) => {
     const res = await fetch(`${base}/jack/intent`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -78,6 +109,36 @@ test("a genuinely ambiguous phrase (no deterministic match) DOES fall through to
     const body = await res.json();
     assert.equal(body.source, "llm");
     assert.equal(llm.chatCallCount, 1);
+  });
+});
+
+test('aiProvider: "openai" routes the LLM-fallback call to the openai provider, not local', async () => {
+  const local = new RecordingLlmProvider();
+  const openai = new RecordingLlmProvider();
+  const anthropic = new RecordingLlmProvider();
+  await withServer({ local, openai, anthropic }, async (base) => {
+    const res = await fetch(`${base}/jack/intent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "What does the pricing slide say?", aiProvider: "openai" }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(local.chatCallCount, 0);
+    assert.equal(openai.chatCallCount, 1);
+    assert.equal(anthropic.chatCallCount, 0);
+  });
+});
+
+test("an unrecognized aiProvider value is a 400, never silently defaulted to local", async () => {
+  const local = new RecordingLlmProvider();
+  await withServer(registryOf(local), async (base) => {
+    const res = await fetch(`${base}/jack/intent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "What does the pricing slide say?", aiProvider: "bogus" }),
+    });
+    assert.equal(res.status, 400);
+    assert.equal(local.chatCallCount, 0);
   });
 });
 
@@ -105,7 +166,7 @@ class ScriptedLlmProvider implements LlmProvider {
 
 test("Codex's reproduced incident: a hallucinated repeated-'Jack' transcript proposing stop_presentation is downgraded to conversation", async () => {
   const llm = new ScriptedLlmProvider("stop_presentation");
-  await withServer(llm, async (base) => {
+  await withServer(registryOf(llm), async (base) => {
     const res = await fetch(`${base}/jack/intent`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -122,7 +183,7 @@ test("Codex's reproduced incident: a hallucinated repeated-'Jack' transcript pro
 
 test("a genuine urgent repeated command word (name said once) is NOT penalized by the repetition guard", async () => {
   const llm = new ScriptedLlmProvider("stop_presentation");
-  await withServer(llm, async (base) => {
+  await withServer(registryOf(llm), async (base) => {
     const res = await fetch(`${base}/jack/intent`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -138,7 +199,7 @@ test("a genuine urgent repeated command word (name said once) is NOT penalized b
 
 test("an incidental mention of Jack proposing a destructive action is downgraded to conversation", async () => {
   const llm = new ScriptedLlmProvider("stop_presentation");
-  await withServer(llm, async (base) => {
+  await withServer(registryOf(llm), async (base) => {
     const res = await fetch(`${base}/jack/intent`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -154,7 +215,7 @@ test("an incidental mention of Jack proposing a destructive action is downgraded
 
 test("a direct, non-repeated address proposing a destructive action is allowed through", async () => {
   const llm = new ScriptedLlmProvider("pause_presentation");
-  await withServer(llm, async (base) => {
+  await withServer(registryOf(llm), async (base) => {
     const res = await fetch(`${base}/jack/intent`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -174,7 +235,7 @@ test("a direct, non-repeated address proposing a destructive action is allowed t
 // with nobody watching to notice, unlike a false next_slide.
 test("pause_presentation IS downgraded from a mention-only utterance (re-added to the high-impact set)", async () => {
   const llm = new ScriptedLlmProvider("pause_presentation");
-  await withServer(llm, async (base) => {
+  await withServer(registryOf(llm), async (base) => {
     const res = await fetch(`${base}/jack/intent`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -189,7 +250,7 @@ test("pause_presentation IS downgraded from a mention-only utterance (re-added t
 
 test("explain_slide (not high-impact) is never downgraded, even from a mention-only utterance", async () => {
   const llm = new ScriptedLlmProvider("explain_slide");
-  await withServer(llm, async (base) => {
+  await withServer(registryOf(llm), async (base) => {
     const res = await fetch(`${base}/jack/intent`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -212,7 +273,7 @@ test("explain_slide (not high-impact) is never downgraded, even from a mention-o
 // typing, so inputSource: "typed" must skip the check entirely.
 test("inputSource: \"typed\" skips the high-impact downgrade entirely, even for unaddressed text", async () => {
   const llm = new ScriptedLlmProvider("jump_to_slide");
-  await withServer(llm, async (base) => {
+  await withServer(registryOf(llm), async (base) => {
     const res = await fetch(`${base}/jack/intent`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -228,7 +289,7 @@ test("inputSource: \"typed\" skips the high-impact downgrade entirely, even for 
 
 test("the same unaddressed text WITHOUT inputSource: \"typed\" is still downgraded (default stays protected)", async () => {
   const llm = new ScriptedLlmProvider("jump_to_slide");
-  await withServer(llm, async (base) => {
+  await withServer(registryOf(llm), async (base) => {
     const res = await fetch(`${base}/jack/intent`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -244,7 +305,7 @@ test("the same unaddressed text WITHOUT inputSource: \"typed\" is still downgrad
 
 test("inputSource: \"voice\" and \"interruption\" both keep the protected (downgraded) behavior, unlike \"typed\"", async () => {
   const llm = new ScriptedLlmProvider("jump_to_slide");
-  await withServer(llm, async (base) => {
+  await withServer(registryOf(llm), async (base) => {
     for (const inputSource of ["voice", "interruption"]) {
       const res = await fetch(`${base}/jack/intent`, {
         method: "POST",
@@ -261,7 +322,7 @@ test("inputSource: \"voice\" and \"interruption\" both keep the protected (downg
 
 test("an invalid/unrecognized inputSource value is ignored, not rejected -- falls back to the protected default", async () => {
   const llm = new ScriptedLlmProvider("jump_to_slide");
-  await withServer(llm, async (base) => {
+  await withServer(registryOf(llm), async (base) => {
     const res = await fetch(`${base}/jack/intent`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -272,4 +333,26 @@ test("an invalid/unrecognized inputSource value is ignored, not rejected -- fall
     assert.equal(body.type, "conversation");
     assert.equal(body.downgradedFrom, "jump_to_slide");
   });
+});
+
+// Multi-provider AI milestone: the HIGH_IMPACT_ACTIONS downgrade gate must
+// stay provider-agnostic -- classifyAddress/hasSuspiciousRepetition take
+// only (text, assistantName), never a provider identifier. Parametrized
+// across all three aiProvider values to prove the gate behaves identically
+// no matter which provider produced the classification.
+test("the HIGH_IMPACT_ACTIONS downgrade gate is provider-agnostic -- an unaddressed mention is downgraded under local, openai, and anthropic alike", async () => {
+  for (const aiProvider of ["local", "openai", "anthropic"]) {
+    const llm = new ScriptedLlmProvider("stop_presentation");
+    await withServer(registryOf(llm), async (base) => {
+      const res = await fetch(`${base}/jack/intent`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "The next slide explains why Jack stopped.", aiProvider }),
+      });
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.equal(body.type, "conversation", `aiProvider "${aiProvider}" should not change the downgrade outcome`);
+      assert.equal(body.downgradedFrom, "stop_presentation");
+    });
+  }
 });

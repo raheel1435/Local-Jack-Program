@@ -2,6 +2,32 @@ export type ProviderStatus = "available" | "unavailable";
 
 export type LlmProviderName = "colibri" | "llamacpp";
 
+/** Multi-provider AI milestone: which "brain" a request wants, independent
+ * of ASR selection. "local" means whichever local engine LlmProviderName
+ * already picked at boot (colibri/llamacpp) -- this selector does not
+ * choose between those two, it chooses local vs. a cloud BYOK provider. */
+export type AiBrainSelector = "local" | "openai" | "anthropic";
+
+/** BYOK credential-status vocabulary. Deliberately NOT folded into
+ * ProviderStatus (see CredentialStore's own doc comment) -- ProviderStatus
+ * is a flat available/unavailable pair meaningful for every provider
+ * (including the five local/always-on ones); "not configured" only ever
+ * applies to a BYOK provider and needs its own richer type. */
+export type CredentialProviderId = "openai" | "anthropic";
+export type CredentialStatus = "not_configured" | "connected" | "invalid";
+
+export interface CredentialStatusReport {
+  provider: CredentialProviderId;
+  status: CredentialStatus;
+  /** Last 4 characters of the stored key. Present only when
+   * status !== "not_configured". NEVER the full key. */
+  lastFour?: string;
+  updatedAt?: string;
+  /** Human-readable reason for "invalid" (e.g. "Unauthorized (401)").
+   * NEVER the key itself. */
+  detail?: string;
+}
+
 /** Stable ASR engine ids. "whisper" is APPROVED (default everywhere);
  * "vibevoice" is TEST (opt-in only, never a silent fallback target). */
 export type AsrProviderId = "whisper" | "vibevoice";
@@ -13,6 +39,11 @@ export interface HealthReport {
   whisper: ProviderStatus;
   vibevoice: ProviderStatus;
   kokoro: ProviderStatus;
+  /** Collapses "no key configured" into "unavailable", same as every other
+   * provider's "can't be used right now" -- the not-configured/invalid
+   * nuance lives in GET /jack/credentials (CredentialStatusReport), not here. */
+  openai: ProviderStatus;
+  anthropic: ProviderStatus;
   activeLlmProvider: LlmProviderName;
 }
 

@@ -157,6 +157,28 @@ button.sync-presence:hover{filter:brightness(1.15)}
 .jack-asr-diag-row{display:grid;grid-template-columns:64px 48px 56px 1fr;gap:6px;align-items:center;font-family:monospace;font-size:10px;padding:3px 4px;background:rgba(255,255,255,.03);border-radius:4px}
 .jack-asr-diag-transcript{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#dff8ff}
 
+/* Multi-provider AI milestone: AI Assistant selector + BYOK key settings,
+   mirroring the .jack-asr-* rules above so both selectors read as one
+   visual family. */
+.jack-ai-selector{display:flex;flex-direction:column;gap:6px}
+.jack-ai-segmented{display:flex;gap:6px}
+.jack-ai-option{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:8px;color:var(--text);padding:8px 10px;font-size:11px;cursor:pointer}
+.jack-ai-option.active{background:rgba(0,217,245,.14);border-color:rgba(0,217,245,.5);color:var(--cyan)}
+.jack-ai-option-status{display:inline-flex;align-items:center;gap:4px;font-size:10px;color:#8aa0c0}
+.jack-ai-status-dot{width:6px;height:6px;border-radius:50%;background:#5a6b80;flex:none}
+.jack-ai-status-dot.available{background:#3ddc84}
+.jack-ai-status-dot.unavailable{background:#ff5c5c}
+.jack-ai-status-dot.not-configured{background:#ffb84d}
+.jack-ai-key-settings{margin-top:4px;padding:10px;border:1px solid var(--line);border-radius:8px;background:rgba(255,255,255,.02);display:flex;flex-direction:column;gap:6px}
+.jack-ai-key-status{font-size:10px;color:#8aa0c0;margin:0}
+.jack-ai-key-status.connected{color:#3ddc84}
+.jack-ai-key-status.invalid{color:#ff5c5c}
+.jack-ai-key-row{display:flex;gap:6px;flex-wrap:wrap}
+.jack-ai-key-row input[type="password"]{flex:1;min-width:160px;background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:6px;color:var(--text);padding:6px 8px;font-size:12px}
+.jack-ai-key-row button{background:rgba(255,255,255,.06);border:1px solid var(--line);border-radius:6px;color:var(--text);padding:6px 10px;font-size:11px;cursor:pointer}
+.jack-ai-key-row button:disabled{opacity:.5;cursor:default}
+.jack-ai-key-error{font-size:10px;color:#ff5c5c;margin:0}
+
 /* Jack Performance panel (latency-observatory milestone) */
 .jack-perf-subtitle{font-size:10px;color:#8aa0c0;text-transform:uppercase;letter-spacing:.04em;margin:8px 0 4px}
 .jack-perf-trace-card{background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
