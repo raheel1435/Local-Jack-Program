@@ -8,7 +8,7 @@ import {
   MAX_ASSISTANT_NAME_LENGTH,
   MAX_INTENT_TEXT_LENGTH,
 } from "../lib/requestValidation.js";
-import { CredentialAuthError } from "../lib/providerErrors.js";
+import { CredentialAuthError, publicAuthFailure, publicBrainFailure } from "../lib/providerErrors.js";
 import type { AdmissionGate } from "../lib/admission.js";
 import type { CredentialStore } from "../lib/credentialStore.js";
 import type { LlmProviderRegistry } from "./chat.js";
@@ -265,13 +265,15 @@ export function intentRouter(
       });
     } catch (e) {
       if (e instanceof CredentialAuthError) {
-        const err: JackErrorResponse = { error: `${selector}_unauthorized`, detail: e.message };
+        const err: JackErrorResponse = { error: `${selector}_unauthorized`, detail: publicAuthFailure(e.providerId) };
         res.status(401).json(err);
         return;
       }
       const err: JackErrorResponse = {
         error: `${selector}_request_failed`,
-        detail: e instanceof Error ? e.message : String(e),
+        detail: selector === "local"
+          ? e instanceof Error ? e.message : String(e)
+          : publicBrainFailure(selector),
       };
       res.status(502).json(err);
     } finally {

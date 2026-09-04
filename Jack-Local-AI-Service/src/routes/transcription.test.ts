@@ -358,7 +358,7 @@ test("a CredentialAuthError from openai's transcribe() (key revoked mid-flight) 
     "OpenAI Speech",
     "available",
     undefined,
-    new CredentialAuthError("openai", "Incorrect API key provided."),
+    new CredentialAuthError("openai", "Authorization: Bearer sk-FAKE-SECRET"),
   );
   await withServer(
     whisper,
@@ -372,11 +372,51 @@ test("a CredentialAuthError from openai's transcribe() (key revoked mid-flight) 
       assert.equal(res.status, 401);
       const body = await res.json();
       assert.equal(body.error, "openai_unauthorized");
-      // The stored key itself must never leak into an error response.
-      assert.doesNotMatch(JSON.stringify(body), /sk-[A-Za-z0-9]/);
+      assert.equal(body.detail, "OpenAI rejected the configured API key.");
+      assert.doesNotMatch(JSON.stringify(body), /Authorization|Bearer|sk-FAKE-SECRET/i);
     },
     openaiSpeech,
   );
+});
+
+test("OpenAI Speech rate limits use a fixed message and never expose the provider diagnostic", async () => {
+  const whisper = new FakeAsrProvider("whisper", "Approved · Whisper", "available");
+  const vibevoice = new FakeAsrProvider("vibevoice", "Test · VibeVoice", "available");
+  const rateLimit = Object.assign(new Error("provider rejected api_key=sk-FAKE-SECRET"), { status: 429 });
+  const openaiSpeech = new FakeAsrProvider("openai", "OpenAI Speech", "available", undefined, rateLimit);
+  await withServer(whisper, vibevoice, async (base) => {
+    const res = await fetch(`${base}/jack/transcribe?provider=openai`, {
+      method: "POST", headers: { "Content-Type": "audio/wav" }, body: Buffer.from([0, 1, 2, 3]),
+    });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.detail, "OpenAI Speech is temporarily rate limited.");
+    assert.doesNotMatch(JSON.stringify(body), /api_key|sk-FAKE-SECRET/i);
+    assert.equal(whisper.calls.length, 0);
+    assert.equal(vibevoice.calls.length, 0);
+  }, openaiSpeech);
+});
+
+test("OpenAI Speech generic/network failures expose no hostile provider content", async () => {
+  for (const hostile of [
+    '{"error":{"message":"bad sk-FAKE-SECRET"}}',
+    "request body contained sensitive diagnostic",
+  ]) {
+    const whisper = new FakeAsrProvider("whisper", "Approved · Whisper", "available");
+    const vibevoice = new FakeAsrProvider("vibevoice", "Test · VibeVoice", "available");
+    const openaiSpeech = new FakeAsrProvider("openai", "OpenAI Speech", "available", undefined, new Error(hostile));
+    await withServer(whisper, vibevoice, async (base) => {
+      const res = await fetch(`${base}/jack/transcribe?provider=openai`, {
+        method: "POST", headers: { "Content-Type": "audio/wav" }, body: Buffer.from([0, 1, 2, 3]),
+      });
+      assert.equal(res.status, 502);
+      const body = await res.json();
+      assert.equal(body.detail, "OpenAI Speech could not transcribe this audio.");
+      assert.doesNotMatch(JSON.stringify(body), /sk-FAKE-SECRET|sensitive diagnostic/i);
+      assert.equal(whisper.calls.length, 0);
+      assert.equal(vibevoice.calls.length, 0);
+    }, openaiSpeech);
+  }
 });
 
 test("a generic openai transcription failure (rate limit / network) maps to 502, with no silent fallback to whisper/vibevoice", async () => {

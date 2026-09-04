@@ -10,11 +10,26 @@ import type { CredentialProviderId } from "../types/jack.js";
  * provider (llama.cpp/Colibri) has ever needed to represent.
  */
 export class CredentialAuthError extends Error {
-  constructor(
-    readonly providerId: CredentialProviderId,
-    message: string,
-  ) {
-    super(message);
+  constructor(readonly providerId: CredentialProviderId, _unsafeProviderMessage?: string) {
+    super(`${providerLabel(providerId)} rejected the configured API key.`);
     this.name = "CredentialAuthError";
   }
+}
+
+export function providerLabel(providerId: CredentialProviderId): string {
+  return providerId === "openai" ? "OpenAI" : "Anthropic";
+}
+
+export function publicAuthFailure(providerId: CredentialProviderId): string {
+  return `${providerLabel(providerId)} rejected the configured API key.`;
+}
+
+export function publicBrainFailure(providerId: CredentialProviderId): string {
+  return `${providerLabel(providerId)} is currently unavailable.`;
+}
+
+export function isRateLimitError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { status?: unknown; name?: unknown };
+  return candidate.status === 429 || candidate.name === "RateLimitError";
 }

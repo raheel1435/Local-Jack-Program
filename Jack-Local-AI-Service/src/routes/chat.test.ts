@@ -168,7 +168,35 @@ test("a CredentialAuthError from the provider surfaces as 401 <provider>_unautho
     assert.equal(res.status, 401);
     const body = await res.json();
     assert.equal(body.error, "openai_unauthorized");
+    assert.equal(body.detail, "OpenAI rejected the configured API key.");
+    assert.doesNotMatch(JSON.stringify(body), /bad key/i);
   });
+});
+
+test("cloud failures expose fixed application messages and never retry Local", async () => {
+  const hostileMessages = [
+    "Authorization: Bearer sk-FAKE-SECRET",
+    "provider rejected api_key=sk-FAKE-SECRET",
+    '{"error":{"message":"bad sk-FAKE-SECRET"}}',
+    "request body contained sensitive diagnostic",
+  ];
+  for (const aiProvider of ["openai", "anthropic"] as const) {
+    for (const hostile of hostileMessages) {
+      const localCaptured: JackChatRequest[] = [];
+      const registry: LlmProviderRegistry = {
+        local: fakeProvider("available", localCaptured),
+        openai: fakeProvider("available", [], aiProvider === "openai" ? new Error(hostile) : undefined),
+        anthropic: fakeProvider("available", [], aiProvider === "anthropic" ? new Error(hostile) : undefined),
+      };
+      await withServer(registry, async (base) => {
+        const res = await post(base, { messages: [{ role: "user", content: "hi" }], aiProvider });
+        assert.equal(res.status, 502);
+        const responseText = await res.text();
+        assert.doesNotMatch(responseText, /Authorization|Bearer|sk-FAKE-SECRET|api_key|sensitive diagnostic/i);
+        assert.equal(localCaptured.length, 0, "a cloud failure must never reactivate Local");
+      });
+    }
+  }
 });
 
 test("a full cloud AdmissionGate returns 429, never silently routed to local", async () => {

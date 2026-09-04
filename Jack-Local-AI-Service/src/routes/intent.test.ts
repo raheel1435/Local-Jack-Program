@@ -27,6 +27,17 @@ class RecordingLlmProvider implements LlmProvider {
   }
 }
 
+class FailingLlmProvider extends RecordingLlmProvider {
+  constructor(private readonly failure: Error) {
+    super();
+  }
+
+  override async chat(_req: JackChatRequest): Promise<JackChatResponse> {
+    this.chatCallCount++;
+    throw this.failure;
+  }
+}
+
 /** Multi-provider AI milestone: intentRouter now takes a full
  * LlmProviderRegistry, not one fixed LlmProvider. Every existing test in
  * this file cares only about the "local" (default, aiProvider omitted)
@@ -140,6 +151,28 @@ test("an unrecognized aiProvider value is a 400, never silently defaulted to loc
     assert.equal(res.status, 400);
     assert.equal(local.chatCallCount, 0);
   });
+});
+
+test("intent cloud failures are sanitized and never retry Local", async () => {
+  for (const aiProvider of ["openai", "anthropic"] as const) {
+    const local = new RecordingLlmProvider();
+    const failure = new FailingLlmProvider(new Error("Authorization: Bearer sk-FAKE-SECRET"));
+    const registry = {
+      local,
+      openai: aiProvider === "openai" ? failure : new RecordingLlmProvider(),
+      anthropic: aiProvider === "anthropic" ? failure : new RecordingLlmProvider(),
+    };
+    await withServer(registry, async (base) => {
+      const res = await fetch(`${base}/jack/intent`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "What does the pricing slide say?", aiProvider }),
+      });
+      assert.equal(res.status, 502);
+      assert.doesNotMatch(await res.text(), /Authorization|Bearer|sk-FAKE-SECRET/i);
+      assert.equal(local.chatCallCount, 0, "a cloud failure must never reactivate Local");
+    });
+  }
 });
 
 // WHISPER SAFETY CORRECTION milestone, Part 16/17/27: the LLM-fallback

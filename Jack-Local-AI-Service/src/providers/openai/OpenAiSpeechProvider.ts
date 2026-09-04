@@ -66,7 +66,7 @@ export class OpenAiSpeechProvider implements AsrProvider {
   ): Promise<JackTranscribeResponse> {
     const key = await this.credentials.getDecrypted("openai");
     if (key === null) {
-      throw new CredentialAuthError("openai", "No OpenAI API key is configured.");
+      throw new CredentialAuthError("openai");
     }
 
     // Same vocabulary-priming + hotword-append pattern as
@@ -100,7 +100,7 @@ export class OpenAiSpeechProvider implements AsrProvider {
       };
     } catch (e) {
       if (e instanceof OpenAI.AuthenticationError) {
-        throw new CredentialAuthError("openai", e.message);
+        throw new CredentialAuthError("openai");
       }
       throw e;
     }

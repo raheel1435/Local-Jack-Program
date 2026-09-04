@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { Router } from "express";
 import { WhisperProvider } from "../providers/whisper/WhisperProvider.js";
 import { AdmissionGate } from "../lib/admission.js";
-import { CredentialAuthError } from "../lib/providerErrors.js";
+import { CredentialAuthError, isRateLimitError, publicAuthFailure } from "../lib/providerErrors.js";
 import type { CredentialStore } from "../lib/credentialStore.js";
 import type {
   AsrProvider,
@@ -176,13 +176,17 @@ export function transcriptionRouter(
         // whisper/vibevoice never throw this, so this branch is a no-op for
         // them.
         if (e instanceof CredentialAuthError) {
-          const err: JackErrorResponse = { error: `${providerId}_unauthorized`, detail: e.message };
+          const err: JackErrorResponse = { error: `${providerId}_unauthorized`, detail: publicAuthFailure(e.providerId) };
           res.status(401).json(err);
           return;
         }
         const err: JackErrorResponse = {
           error: `${providerId}_request_failed`,
-          detail: e instanceof Error ? e.message : String(e),
+          detail: providerId === "openai"
+            ? isRateLimitError(e)
+              ? "OpenAI Speech is temporarily rate limited."
+              : "OpenAI Speech could not transcribe this audio."
+            : e instanceof Error ? e.message : String(e),
         };
         res.status(502).json(err);
       } finally {

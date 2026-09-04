@@ -42,7 +42,7 @@ export class AnthropicProvider implements LlmProvider {
   async chat(req: JackChatRequest): Promise<JackChatResponse> {
     const key = await this.credentials.getDecrypted("anthropic");
     if (key === null) {
-      throw new CredentialAuthError("anthropic", "No Anthropic API key is configured.");
+      throw new CredentialAuthError("anthropic");
     }
 
     const start = Date.now();
@@ -81,7 +81,7 @@ export class AnthropicProvider implements LlmProvider {
       };
     } catch (e) {
       if (e instanceof Anthropic.AuthenticationError) {
-        throw new CredentialAuthError("anthropic", e.message);
+        throw new CredentialAuthError("anthropic");
       }
       throw e;
     }

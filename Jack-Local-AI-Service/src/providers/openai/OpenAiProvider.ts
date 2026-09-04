@@ -48,7 +48,7 @@ export class OpenAiProvider implements LlmProvider {
   async chat(req: JackChatRequest): Promise<JackChatResponse> {
     const key = await this.credentials.getDecrypted("openai");
     if (key === null) {
-      throw new CredentialAuthError("openai", "No OpenAI API key is configured.");
+      throw new CredentialAuthError("openai");
     }
 
     const start = Date.now();
@@ -70,7 +70,7 @@ export class OpenAiProvider implements LlmProvider {
       };
     } catch (e) {
       if (e instanceof OpenAI.AuthenticationError) {
-        throw new CredentialAuthError("openai", e.message);
+        throw new CredentialAuthError("openai");
       }
       throw e;
     }
