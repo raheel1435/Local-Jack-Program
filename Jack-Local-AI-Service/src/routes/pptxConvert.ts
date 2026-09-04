@@ -25,6 +25,44 @@ export const PPTX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SCRIPT_PATH = join(__dirname, "..", "..", "scripts", "convert-pptx-to-pdf.ps1");
+const MAX_ERROR_DETAIL_LENGTH = 300;
+
+/**
+ * PPTX visual-fallback fix: never forward a promisified execFile rejection's
+ * raw `.message` (it's "Command failed: <full argv>\n<stderr>" -- the FULL
+ * command line, including this request's own temp file paths) straight to
+ * the client. `stderr` alone is just what the PowerShell script itself
+ * wrote (a short, friendly, stage-tagged "STAGE:<id>|<message>" sentence as
+ * of the root-cause investigation pass); trimmed and length-capped here
+ * too, as a second layer, so an unexpected future failure mode still can't
+ * dump an unbounded/raw block of text into the presentation UI the way the
+ * original COM exception did.
+ */
+export interface ConversionFailure {
+  stage: string;
+  detail: string;
+}
+
+const STAGE_PREFIX = /^STAGE:([a-z_]+)\|([\s\S]*)$/;
+
+export function extractConversionFailure(e: unknown): ConversionFailure {
+  // Node's own execFile-level timeout (the process didn't exit in time and
+  // was killed) never reaches the script's own stderr-writing code at all --
+  // this is its own distinct stage, detected from the error object Node
+  // itself constructs (`killed: true`), not from anything the script wrote.
+  if (e && typeof e === "object" && (e as { killed?: unknown }).killed === true) {
+    return { stage: "timeout", detail: `PowerPoint conversion did not finish within ${CONVERT_TIMEOUT_MS / 1000} seconds.` };
+  }
+
+  const stderr = e && typeof e === "object" && "stderr" in e ? String((e as { stderr?: unknown }).stderr ?? "").trim() : "";
+  const raw = stderr || (e instanceof Error ? e.message : String(e));
+  const firstLine = raw.split(/\r?\n/)[0]?.trim() ?? "";
+
+  const staged = STAGE_PREFIX.exec(firstLine);
+  const stage = staged ? staged[1] : "unknown";
+  const detail = (staged ? staged[2] : firstLine).trim() || "PowerPoint conversion failed for an unknown reason.";
+  return { stage, detail: detail.length > MAX_ERROR_DETAIL_LENGTH ? `${detail.slice(0, MAX_ERROR_DETAIL_LENGTH)}...` : detail };
+}
 
 /**
  * PowerPoint COM automation doesn't handle concurrent Presentations.Open
@@ -136,9 +174,11 @@ export function pptxConvertRouter(): Router {
       // POWERPNT process belongs to this request: leaving a possible orphan
       // is safer than terminating a user's unrelated process and losing
       // unsaved work.
+      const failure = extractConversionFailure(e);
       const err: JackErrorResponse = {
         error: "pptx_conversion_failed",
-        detail: e instanceof Error ? e.message : String(e),
+        stage: failure.stage,
+        detail: failure.detail,
       };
       res.status(502).json(err);
     } finally {

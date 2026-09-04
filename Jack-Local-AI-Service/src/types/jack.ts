@@ -117,4 +117,8 @@ export interface JackSpeakRequest {
 export interface JackErrorResponse {
   error: string;
   detail?: string;
+  /** Optional machine-readable sub-phase within `error` (e.g.
+   * "presentation_open", "pdf_save", "timeout" for pptx_conversion_failed).
+   * Additive/optional -- most routes never set this. */
+  stage?: string;
 }

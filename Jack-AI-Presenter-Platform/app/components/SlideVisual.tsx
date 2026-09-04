@@ -40,6 +40,19 @@ function pptxCacheKey(file: File): string {
   return `${file.name}|${file.size}|${file.lastModified}`;
 }
 
+const MAX_VISIBLE_ERROR_LENGTH = 160;
+
+/** Never let a failure reason (whatever produced it -- the gateway, a raw
+ * COM/OS exception that slipped through some upstream layer, a future
+ * failure mode nobody's anticipated yet) grow into an unbounded wall of
+ * text inside the presentation view. The full string is still reachable
+ * via the `title` tooltip this is paired with, so nothing is lost -- only
+ * what's always-visible is capped. */
+function truncateForDisplay(text: string): string {
+  const singleLine = text.split(/\r?\n/)[0]?.trim() ?? text;
+  return singleLine.length > MAX_VISIBLE_ERROR_LENGTH ? `${singleLine.slice(0, MAX_VISIBLE_ERROR_LENGTH)}…` : singleLine;
+}
+
 function getOrConvertPptxToPdf(file: File): Promise<Blob> {
   const key = pptxCacheKey(file);
   const cached = pptxConversionCache.get(key);
@@ -163,8 +176,24 @@ export function SlideVisual({
               tooltip, so a presenter had no visible way to tell "the local
               gateway isn't running" (fixable, actionable) apart from "your
               file is password-protected" (not fixable here) -- both showed
-              the exact same generic sentence above. Now shown directly. */}
-          {pptxVisualError && <><br /><span className="present-warning-reason">Reason: {pptxVisualError}</span></>}
+              the exact same generic sentence above. Now shown directly.
+              PPTX visual-fallback fix (found live): the gateway is now the
+              primary choke point for keeping this short (see
+              pptxConvert.ts/convert-pptx-to-pdf.ps1), but this is a second,
+              independent line of defense -- a raw multi-line COM exception
+              was confirmed to render here as an unbounded wall of text that
+              visually blended into the slide content above it. Truncating
+              for display (full text still reachable via the title tooltip,
+              so nothing is actually lost) means that can never recur here
+              even from an unanticipated future failure mode upstream. */}
+          {pptxVisualError && (
+            <>
+              <br />
+              <span className="present-warning-reason" title={pptxVisualError}>
+                Reason: {truncateForDisplay(pptxVisualError)}
+              </span>
+            </>
+          )}
         </p>
       )}
     </div>
