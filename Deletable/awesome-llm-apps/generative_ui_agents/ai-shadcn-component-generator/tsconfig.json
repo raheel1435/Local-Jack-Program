@@ -1,7 +1,0 @@
-{
-  "files": [],
-  "references": [
-    { "path": "./apps/ui" },
-    { "path": "./apps/runtime" }
-  ]
-}
