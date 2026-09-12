@@ -11,18 +11,14 @@ import type {
   AiBrainSelector,
   JackChatRequest,
   JackErrorResponse,
-  LlmProvider,
 } from "../types/jack.js";
+import { executeBrainRequest, LocalBrainsUnavailableError, type BrainProviderRegistry } from "../lib/brainFallback.js";
 
 /** Multi-provider AI milestone: chatRouter/intentRouter used to close over
  * one fixed LlmProvider chosen once at boot (JACK_LLM_PROVIDER). Users must
  * be able to switch AI brain per request/session, independent of ASR --
  * this registry holds all three, selected per-request via `aiProvider`. */
-export interface LlmProviderRegistry {
-  local: LlmProvider;
-  openai: LlmProvider;
-  anthropic: LlmProvider;
-}
+export type LlmProviderRegistry = BrainProviderRegistry;
 
 const VALID_AI_PROVIDERS: ReadonlySet<AiBrainSelector> = new Set(["local", "openai", "anthropic"]);
 
@@ -112,7 +108,6 @@ export function chatRouter(
       return;
     }
     const selector: AiBrainSelector = (rawAiProvider as AiBrainSelector | undefined) ?? "local";
-    const llm = providers[selector];
 
     let release: (() => void) | undefined;
     if (selector !== "local" && gates?.[selector]) {
@@ -135,7 +130,7 @@ export function chatRouter(
     }
 
     try {
-      const status = await llm.checkHealth();
+      const status = selector === "local" ? "available" : await providers[selector].checkHealth();
       if (status === "unavailable") {
         let detail = "The configured local LLM provider is not reachable. Start Colibri (`coli serve --model <model-path>`) or llama-server, matching JACK_LLM_PROVIDER.";
         if (selector !== "local") {
@@ -147,7 +142,10 @@ export function chatRouter(
                 ? `The stored ${selector} API key was rejected. Update it in Settings.`
                 : `${selector} is not reachable right now.`;
         }
-        const err: JackErrorResponse = { error: `${selector}_unavailable`, detail };
+        const err: JackErrorResponse = {
+          error: `${selector}_unavailable`, detail, code: "provider_unavailable", provider: selector,
+          fallbackOptions: selector === "local" ? [] : ["local"], requiresConsent: true,
+        };
         res.status(503).json(err);
         return;
       }
@@ -157,19 +155,29 @@ export function chatRouter(
         ...(body.temperature === undefined ? {} : { temperature: body.temperature }),
         ...(body.max_tokens === undefined ? {} : { max_tokens: body.max_tokens }),
       };
-      const result = await llm.chat(request);
+      const result = await executeBrainRequest(providers, selector, request);
       res.json(result);
     } catch (e) {
       if (e instanceof CredentialAuthError) {
-        const err: JackErrorResponse = { error: `${selector}_unauthorized`, detail: publicAuthFailure(e.providerId) };
+        const err: JackErrorResponse = { error: `${selector}_unauthorized`, detail: publicAuthFailure(e.providerId), code: "provider_unauthorized", provider: selector, fallbackOptions: ["local"], requiresConsent: true };
         res.status(401).json(err);
         return;
+      }
+      const cloudOptions: AiBrainSelector[] = [];
+      if (selector === "local") {
+        for (const cloud of ["openai", "anthropic"] as const) {
+          if ((await credentialStore?.status(cloud))?.status === "connected") cloudOptions.push(cloud);
+        }
       }
       const err: JackErrorResponse = {
         error: `${selector}_request_failed`,
         detail: selector === "local"
-          ? e instanceof Error ? e.message : String(e)
+          ? e instanceof LocalBrainsUnavailableError ? e.message : e instanceof Error ? e.message : String(e)
           : publicBrainFailure(selector),
+        code: "provider_request_failed",
+        provider: selector,
+        fallbackOptions: selector === "local" ? cloudOptions : ["local"],
+        requiresConsent: true,
       };
       res.status(502).json(err);
     } finally {

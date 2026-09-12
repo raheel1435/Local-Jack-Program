@@ -127,6 +127,25 @@ test('aiProvider: "anthropic" routes to the anthropic provider', async () => {
   });
 });
 
+test("provider lifecycle OpenAI -> Local explicitly reactivates Local", async () => {
+  const localCaptured: JackChatRequest[] = [];
+  const openaiCaptured: JackChatRequest[] = [];
+  const registry: LlmProviderRegistry = {
+    local: fakeProvider("available", localCaptured),
+    openai: fakeProvider("available", openaiCaptured),
+    anthropic: fakeProvider("available", []),
+  };
+  await withServer(registry, async (base) => {
+    assert.equal((await post(base, { messages: [{ role: "user", content: "cloud" }], aiProvider: "openai" })).status, 200);
+    assert.equal(localCaptured.length, 0, "selecting OpenAI must leave Local inactive");
+    assert.equal(openaiCaptured.length, 1);
+
+    assert.equal((await post(base, { messages: [{ role: "user", content: "local" }], aiProvider: "local" })).status, 200);
+    assert.equal(localCaptured.length, 1, "Local becomes active only after explicit selection");
+    assert.equal(openaiCaptured.length, 1);
+  });
+});
+
 test('an unrecognized aiProvider value is a 400, never silently defaulted to local', async () => {
   const localCaptured: JackChatRequest[] = [];
   const registry: LlmProviderRegistry = {
@@ -219,4 +238,63 @@ test("a full cloud AdmissionGate returns 429, never silently routed to local", a
     { openai: fullGate },
   );
   release();
+});
+
+test("llama.cpp primary success never invokes Colibri", async () => {
+  const llama: JackChatRequest[] = [];
+  const colibri: JackChatRequest[] = [];
+  await withServer({ local: fakeProvider("available", llama), localFallback: fakeProvider("available", colibri), localProviderName: "llamacpp", localFallbackProviderName: "colibri", openai: fakeProvider("available", []), anthropic: fakeProvider("available", []) }, async (base) => {
+    const body = await (await post(base, { messages: [{ role: "user", content: "hi" }] })).json();
+    assert.equal(llama.length, 1);
+    assert.equal(colibri.length, 0);
+    assert.equal(body.actualLocalProvider, "llamacpp");
+    assert.equal(body.fallbackUsed, false);
+  });
+});
+
+test("llama.cpp failure invokes Colibri once and reports fallback", async () => {
+  const llama: JackChatRequest[] = [];
+  const colibri: JackChatRequest[] = [];
+  await withServer({ local: fakeProvider("available", llama, new Error("failed")), localFallback: fakeProvider("available", colibri), localProviderName: "llamacpp", localFallbackProviderName: "colibri", openai: fakeProvider("available", []), anthropic: fakeProvider("available", []) }, async (base) => {
+    const body = await (await post(base, { messages: [{ role: "user", content: "hi" }] })).json();
+    assert.equal(llama.length, 1);
+    assert.equal(colibri.length, 1);
+    assert.equal(body.actualLocalProvider, "colibri");
+    assert.equal(body.fallbackUsed, true);
+  });
+});
+
+test("Colibri primary success skips llama; Colibri failure tries llama once", async () => {
+  const colibri: JackChatRequest[] = [];
+  const llama: JackChatRequest[] = [];
+  const baseRegistry = { local: fakeProvider("available", colibri), localFallback: fakeProvider("available", llama), localProviderName: "colibri" as const, localFallbackProviderName: "llamacpp" as const, openai: fakeProvider("available", []), anthropic: fakeProvider("available", []) };
+  await withServer(baseRegistry, async (base) => {
+    assert.equal((await post(base, { messages: [{ role: "user", content: "hi" }] })).status, 200);
+    assert.equal(colibri.length, 1);
+    assert.equal(llama.length, 0);
+  });
+  colibri.length = 0;
+  await withServer({ ...baseRegistry, local: fakeProvider("available", colibri, new Error("failed")) }, async (base) => {
+    const body = await (await post(base, { messages: [{ role: "user", content: "hi" }] })).json();
+    assert.equal(colibri.length, 1);
+    assert.equal(llama.length, 1);
+    assert.equal(body.actualLocalProvider, "llamacpp");
+  });
+});
+
+test("both local runtimes failing ends once and never invokes cloud", async () => {
+  const primary: JackChatRequest[] = [];
+  const fallback: JackChatRequest[] = [];
+  const openai: JackChatRequest[] = [];
+  const anthropic: JackChatRequest[] = [];
+  await withServer({ local: fakeProvider("available", primary, new Error("one")), localFallback: fakeProvider("available", fallback, new Error("two")), localProviderName: "llamacpp", localFallbackProviderName: "colibri", openai: fakeProvider("available", openai), anthropic: fakeProvider("available", anthropic) }, async (base) => {
+    const res = await post(base, { messages: [{ role: "user", content: "hi" }] });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.requiresConsent, true);
+    assert.equal(primary.length, 1);
+    assert.equal(fallback.length, 1);
+    assert.equal(openai.length, 0);
+    assert.equal(anthropic.length, 0);
+  });
 });

@@ -65,8 +65,8 @@ export interface CredentialStatusReport {
   detail?: string;
 }
 
-/** Stable ASR engine ids -- "whisper" is Approved (default everywhere),
- * "vibevoice" is Test (opt-in only, never a silent fallback target),
+/** Stable ASR engine ids -- "whisper" is Approved (default everywhere and
+ * the request-level local fallback for Vibe), "vibevoice" is Test (opt-in),
  * "openai" is OpenAI Speech (Stage 2, multi-provider AI milestone) -- a
  * cloud BYOK engine, independent of AiProviderId's own "openai" value (two
  * separate axes; selecting one never implies the other). Mirrors
@@ -80,6 +80,10 @@ export interface JackTranscribeResult {
   language?: string;
   confidence?: number;
   metadata?: Record<string, unknown>;
+  requestedProvider?: AsrProviderId;
+  actualProvider?: AsrProviderId;
+  fallbackUsed?: boolean;
+  fallbackFrom?: AsrProviderId;
 }
 
 export type JackIntentType = "action" | "conversation" | "unknown";
@@ -102,6 +106,11 @@ export interface JackIntentResult {
    * path; the name of the action that WOULD have run had the extra scrutiny
    * (direct address + no suspicious repetition) not failed. */
   downgradedFrom?: string;
+  requestedProvider?: AiProviderId;
+  actualProvider?: AiProviderId;
+  actualLocalProvider?: "colibri" | "llamacpp";
+  fallbackUsed?: boolean;
+  fallbackFrom?: "colibri" | "llamacpp";
 }
 
 export interface JackChatMessage {
@@ -113,6 +122,62 @@ export interface JackChatResult {
   content: string;
   model: string;
   latencyMs: number;
+  requestedProvider?: AiProviderId;
+  actualProvider?: AiProviderId;
+  actualLocalProvider?: "colibri" | "llamacpp";
+  fallbackUsed?: boolean;
+  fallbackFrom?: "colibri" | "llamacpp";
+}
+
+export interface ProviderFallbackRequest {
+  kind: "brain" | "asr";
+  failedProvider: AiProviderId | AsrProviderId;
+  options: Array<AiProviderId | AsrProviderId>;
+  detail: string;
+  credentialRequired?: CredentialProviderId;
+}
+
+export interface ProviderRequestStatus {
+  kind: "brain" | "asr";
+  selectedProvider: string;
+  actualProvider: string;
+  actualLocalProvider?: "colibri" | "llamacpp";
+  fallbackUsed: boolean;
+  fallbackFrom?: string;
+}
+
+type FallbackConsentHandler = (request: ProviderFallbackRequest) => Promise<string | null>;
+type ProviderStatusHandler = (status: ProviderRequestStatus) => void;
+let fallbackConsentHandler: FallbackConsentHandler | null = null;
+let providerStatusHandler: ProviderStatusHandler | null = null;
+
+export function setProviderFallbackConsentHandler(handler: FallbackConsentHandler | null): void {
+  fallbackConsentHandler = handler;
+}
+
+export function setProviderRequestStatusHandler(handler: ProviderStatusHandler | null): void {
+  providerStatusHandler = handler;
+}
+
+interface JackApiErrorBody {
+  error?: string;
+  detail?: string;
+  code?: string;
+  provider?: string;
+  fallbackOptions?: string[];
+  requiresConsent?: boolean;
+  credentialRequired?: CredentialProviderId;
+}
+
+export class JackApiError extends Error {
+  readonly status: number;
+  readonly body: JackApiErrorBody;
+
+  constructor(status: number, body: JackApiErrorBody) {
+    super(body.detail || `Jack Local AI request failed: ${status}`);
+    this.status = status;
+    this.body = body;
+  }
 }
 
 const HEALTH_TIMEOUT_MS = 2000;
@@ -125,10 +190,49 @@ async function postJson<T>(path: string, body: unknown, timeoutMs?: number): Pro
     signal: timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined,
   });
   if (!res.ok) {
-    const detail = await res.json().catch(() => null) as { detail?: string } | null;
-    throw new Error(detail?.detail || `Jack Local AI request failed: ${res.status}`);
+    const detail = await res.json().catch(() => ({})) as JackApiErrorBody;
+    throw new JackApiError(res.status, detail);
   }
   return res.json() as Promise<T>;
+}
+
+function observeBrain(result: JackChatResult | JackIntentResult, selected: AiProviderId): void {
+  const actual = result.actualProvider ?? selected;
+  providerStatusHandler?.({
+    kind: "brain",
+    selectedProvider: selected,
+    actualProvider: actual,
+    actualLocalProvider: result.actualLocalProvider,
+    fallbackUsed: (result.fallbackUsed ?? false) || actual !== selected,
+    fallbackFrom: result.fallbackFrom ?? (actual !== selected ? selected : undefined),
+  });
+}
+
+async function withBrainConsent<T extends JackChatResult | JackIntentResult>(
+  path: string,
+  body: Record<string, unknown>,
+  timeoutMs: number,
+): Promise<T> {
+  const selected = (body.aiProvider as AiProviderId | undefined) ?? "local";
+  try {
+    const result = await postJson<T>(path, body, timeoutMs);
+    observeBrain(result, selected);
+    return result;
+  } catch (error) {
+    if (!(error instanceof JackApiError) || !error.body.requiresConsent || !fallbackConsentHandler) throw error;
+    const choice = await fallbackConsentHandler({
+      kind: "brain",
+      failedProvider: (error.body.provider as AiProviderId | undefined) ?? selected,
+      options: (error.body.fallbackOptions ?? []) as AiProviderId[],
+      detail: error.message,
+      credentialRequired: error.body.credentialRequired,
+    });
+    if (!choice) throw error;
+    const retryProvider = choice as AiProviderId;
+    const result = await postJson<T>(path, { ...body, aiProvider: retryProvider }, timeoutMs);
+    observeBrain(result, selected);
+    return result;
+  }
 }
 
 async function rawSpeak(text: string, voice?: string): Promise<Blob> {
@@ -197,14 +301,14 @@ export const jackApi = {
     inputSource?: "typed" | "voice" | "interruption",
     aiProvider?: AiProviderId,
   ): Promise<JackIntentResult> {
-    return postJson<JackIntentResult>("/jack/intent", { text, assistantName, inputSource, aiProvider }, 15_000);
+    return withBrainConsent<JackIntentResult>("/jack/intent", { text, assistantName, inputSource, aiProvider }, 15_000);
   },
 
   chat(
     messages: JackChatMessage[],
     opts?: { maxTokens?: number; temperature?: number; aiProvider?: AiProviderId },
   ): Promise<JackChatResult> {
-    return postJson<JackChatResult>(
+    return withBrainConsent<JackChatResult>(
       "/jack/chat",
       {
         messages,
@@ -230,10 +334,34 @@ export const jackApi = {
       signal: AbortSignal.timeout(30_000),
     });
     if (!res.ok) {
-      const detail = (await res.json().catch(() => null)) as { detail?: string } | null;
-      throw new Error(detail?.detail || `Jack Local AI transcription failed: ${res.status}`);
+      const detail = (await res.json().catch(() => ({}))) as JackApiErrorBody;
+      const error = new JackApiError(res.status, detail);
+      if (!detail.requiresConsent || !fallbackConsentHandler) throw error;
+      const choice = await fallbackConsentHandler({
+        kind: "asr",
+        failedProvider: (detail.provider as AsrProviderId | undefined) ?? provider ?? "whisper",
+        options: (detail.fallbackOptions ?? []) as AsrProviderId[],
+        detail: error.message,
+        credentialRequired: detail.credentialRequired,
+      });
+      if (!choice) throw error;
+      return jackApi.transcribeAudioOnce(audio, language, choice as AsrProviderId, assistantName, provider ?? "whisper");
     }
-    return res.json();
+    const result = await res.json() as JackTranscribeResult;
+    providerStatusHandler?.({ kind: "asr", selectedProvider: provider ?? "whisper", actualProvider: result.actualProvider ?? result.provider, fallbackUsed: result.fallbackUsed ?? false, fallbackFrom: result.fallbackFrom });
+    return result;
+  },
+
+  /** One bounded consent-authorized retry. Kept separate so it cannot recurse. */
+  async transcribeAudioOnce(audio: Blob, language: string | undefined, provider: AsrProviderId, assistantName: string | undefined, selectedProvider: AsrProviderId): Promise<JackTranscribeResult> {
+    const params = new URLSearchParams({ provider });
+    if (language) params.set("language", language);
+    if (assistantName) params.set("assistantName", assistantName);
+    const res = await fetch(`${BASE_URL}/jack/transcribe?${params.toString()}`, { method: "POST", headers: { "Content-Type": "audio/wav" }, body: audio, signal: AbortSignal.timeout(30_000) });
+    if (!res.ok) throw new JackApiError(res.status, await res.json().catch(() => ({})) as JackApiErrorBody);
+    const result = await res.json() as JackTranscribeResult;
+    providerStatusHandler?.({ kind: "asr", selectedProvider, actualProvider: result.actualProvider ?? result.provider, fallbackUsed: true, fallbackFrom: selectedProvider });
+    return result;
   },
 
   /**

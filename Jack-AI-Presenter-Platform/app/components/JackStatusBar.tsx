@@ -13,10 +13,11 @@ export interface JackStatusBarProps {
   name: string;
   jackState: JackState;
   jackLabel: string;
-  /** Jack Local AI gateway health -- the ONE authoritative connection truth for
-   * Present mode. Not the legacy OpenAI Realtime connection (that path isn't
-   * used here and was previously shown side-by-side, contradicting this). */
+  /** Readiness of the explicitly selected AI brain. */
   localHealth: LocalHealthLabel;
+  brainProviderLabel: string;
+  brainStatusText: string;
+  fallbackStatusText?: string;
   presenterControl: ControlOwner;
   isPresentingAutonomously: boolean;
   micLabel: PresentMicLabel;
@@ -30,18 +31,6 @@ export interface JackStatusBarProps {
   onWake: () => void;
   onSleep: () => void;
 }
-
-const LOCAL_HEALTH_LABEL: Record<LocalHealthLabel, string> = {
-  checking: "Checking…",
-  connected: "Connected",
-  offline: "Offline",
-};
-
-const LOCAL_HEALTH_TITLE: Record<LocalHealthLabel, string> = {
-  checking: "Checking whether Jack Local AI is reachable…",
-  connected: "Jack Local AI is connected",
-  offline: "Jack Local AI is unavailable -- manual presentation controls still work",
-};
 
 const MIC_LABEL: Record<PresentMicLabel, string> = {
   off: "Off",
@@ -74,6 +63,9 @@ export function JackStatusBar({
   jackState,
   jackLabel,
   localHealth,
+  brainProviderLabel,
+  brainStatusText,
+  fallbackStatusText,
   presenterControl,
   isPresentingAutonomously,
   micLabel,
@@ -103,9 +95,19 @@ export function JackStatusBar({
           {jackLabel || JACK_STATES[jackState].label}
         </span>
       )}
-      <span className={`sync-item connection-${localHealth}`} title={LOCAL_HEALTH_TITLE[localHealth]}>
-        {LOCAL_HEALTH_LABEL[localHealth]}
+      <span
+        className={`sync-item connection-${localHealth}`}
+        title={
+          localHealth === "checking"
+            ? `Checking whether ${brainProviderLabel} is ready…`
+            : localHealth === "connected"
+              ? `${brainProviderLabel} is ready`
+              : `${brainProviderLabel} is unavailable -- no other brain will be activated automatically`
+        }
+      >
+        {brainStatusText}
       </span>
+      {fallbackStatusText && <span className="sync-item provider-fallback-status">{fallbackStatusText}</span>}
       <span className="sync-item">
         Control: <strong>{presenterControl === "jack" ? name : "Presenter"}</strong>
       </span>

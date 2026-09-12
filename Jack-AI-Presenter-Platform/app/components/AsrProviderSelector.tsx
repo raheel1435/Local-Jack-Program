@@ -28,7 +28,7 @@ type CredentialMap = Partial<Record<CredentialProviderId, CredentialStatusReport
  */
 export function AsrProviderSelector({ titlePrefix }: { titlePrefix?: string }) {
   const jack = useJack();
-  const [credentials, setCredentials] = useState<CredentialMap | null>(null);
+  const [credentials, setCredentials] = useState<CredentialMap | null | undefined>(undefined);
 
   const refreshCredentials = useCallback(() => {
     jackApi
@@ -43,13 +43,17 @@ export function AsrProviderSelector({ titlePrefix }: { titlePrefix?: string }) {
 
   function statusFor(id: "whisper" | "vibevoice" | "openai"): { dot: string; label: string } {
     if (id === "whisper" || id === "vibevoice") {
+      if (jack.jackLocalHealth === null) return { dot: "", label: "Checking service" };
+      if (jack.jackLocalHealth.gateway === "unreachable") return { dot: "unavailable", label: "Service offline" };
       const status = jack.jackLocalHealth?.[id];
       if (status === "available") return { dot: "available", label: "Ready" };
       if (status === "unavailable") return { dot: "unavailable", label: "Unavailable" };
-      return { dot: "", label: "Checking..." };
+      return { dot: "unavailable", label: "Unavailable" };
     }
+    if (credentials === undefined) return { dot: "", label: "Checking key" };
+    if (credentials === null) return { dot: "unavailable", label: "Status unavailable" };
     const cred = credentials?.openai;
-    if (!cred) return { dot: "", label: "Checking..." };
+    if (!cred) return { dot: "not-configured", label: "Add a key below" };
     if (cred.status === "connected") return { dot: "available", label: "Ready" };
     if (cred.status === "invalid") return { dot: "unavailable", label: "Invalid key" };
     return { dot: "not-configured", label: "Add a key below" };

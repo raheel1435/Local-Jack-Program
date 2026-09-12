@@ -10,6 +10,7 @@ import { SlideVisual } from "../components/SlideVisual";
 import { useAutoHideControls } from "../hooks/useAutoHideControls";
 import { useFullscreen } from "../hooks/useFullscreen";
 import { useJack } from "../jack/JackProvider";
+import { activeBrainStatus } from "../jack/brainStatus";
 import { searchDocuments } from "../jack/documentContext";
 import { fail, ok, type PresentationController } from "../jack/presentationController";
 import { isDevDiagnosticsEnabled } from "../lib/devDiagnostics";
@@ -75,6 +76,11 @@ function PresentSession({
   const [commandInput, setCommandInput] = useState("");
   const [commandBusy, setCommandBusy] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  useEffect(() => {
+    const openProviderSettings = () => setSettingsOpen(true);
+    window.addEventListener("jack:open-provider-settings", openProviderSettings);
+    return () => window.removeEventListener("jack:open-provider-settings", openProviderSettings);
+  }, []);
 
   const fullscreen = useFullscreen(stageRef);
 
@@ -327,8 +333,17 @@ function PresentSession({
 
   const devDiagnosticsEnabled = isDevDiagnosticsEnabled();
 
-  const localHealth: "checking" | "connected" | "offline" =
-    jack.jackLocalHealth === null ? "checking" : jack.localUnavailable ? "offline" : "connected";
+  const brainStatus = activeBrainStatus(jack.aiProvider, jack.jackLocalHealth);
+  const localHealth = brainStatus.readiness;
+  const brainProviderLabel = brainStatus.label;
+  const requestStatus = jack.providerRequestStatus;
+  const fallbackStatusText = requestStatus?.fallbackUsed
+    ? requestStatus.kind === "asr"
+      ? `Selected ASR: ${requestStatus.selectedProvider === "vibevoice" ? "Vibe" : requestStatus.selectedProvider === "openai" ? "OpenAI Speech" : "Whisper"} · Current request: ${requestStatus.actualProvider === "openai" ? "OpenAI Speech" : requestStatus.actualProvider === "vibevoice" ? "Vibe" : "Whisper"} (fallback)`
+      : requestStatus.actualLocalProvider
+        ? `Selected AI: ${jack.aiProvider === "local" ? "Local" : jack.aiProvider} · Runtime: ${requestStatus.actualLocalProvider} (${requestStatus.fallbackFrom} unavailable)`
+        : `Selected AI: ${jack.aiProvider} · Current request: ${requestStatus.actualProvider} (fallback)`
+    : undefined;
   // Mic button/status now reflect the ambient-listening pipeline directly
   // (Phase 26) -- there's no separate push-to-talk ownership concept left,
   // just whichever bargeInPhase the shared recorder is actually in, plus
@@ -366,6 +381,9 @@ function PresentSession({
           jackState={jack.orb.orbState}
           jackLabel={jack.orb.label}
           localHealth={localHealth}
+          brainProviderLabel={brainProviderLabel}
+          brainStatusText={brainStatus.text}
+          fallbackStatusText={fallbackStatusText}
           presenterControl={jack.presenterControl}
           isPresentingAutonomously={jack.isPresentingAutonomously}
           micLabel={presentMicLabel}
@@ -401,8 +419,8 @@ function PresentSession({
         )}
       {overlaysVisible && jack.lastError && <p className="speech-error present-subtitle-line" role="alert">{jack.lastError}</p>}
 
-      {overlaysVisible && jack.localUnavailable && (
-        <p className="present-warning">Jack Local AI is unavailable. Manual presentation is still available.</p>
+      {overlaysVisible && localHealth === "offline" && (
+        <p className="present-warning">{brainProviderLabel} is unavailable. Switch providers explicitly or continue with manual presentation controls.</p>
       )}
 
       {/* Acoustic diagnostics (Phase 23): dev-only, never shown to an audience by

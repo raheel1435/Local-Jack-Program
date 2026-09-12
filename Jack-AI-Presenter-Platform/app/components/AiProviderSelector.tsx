@@ -18,7 +18,9 @@ type CredentialMap = Partial<Record<CredentialProviderId, CredentialStatusReport
  */
 export function AiProviderSelector({ titlePrefix }: { titlePrefix?: string }) {
   const jack = useJack();
-  const [credentials, setCredentials] = useState<CredentialMap | null>(null);
+  // undefined means the first request is still in flight; null means the
+  // gateway did not answer. A failed request must not look like an endless check.
+  const [credentials, setCredentials] = useState<CredentialMap | null | undefined>(undefined);
 
   const refreshCredentials = useCallback(() => {
     jackApi
@@ -33,14 +35,18 @@ export function AiProviderSelector({ titlePrefix }: { titlePrefix?: string }) {
 
   function statusFor(id: "local" | "openai" | "anthropic"): { dot: string; label: string } {
     if (id === "local") {
+      if (jack.jackLocalHealth === null) return { dot: "", label: "Checking service" };
+      if (jack.jackLocalHealth.gateway === "unreachable") return { dot: "unavailable", label: "Service offline" };
       const activeLocal = jack.jackLocalHealth?.activeLlmProvider;
       const localStatus = activeLocal ? jack.jackLocalHealth?.[activeLocal] : undefined;
       if (localStatus === "available") return { dot: "available", label: "Ready" };
       if (localStatus === "unavailable") return { dot: "unavailable", label: "Unavailable" };
-      return { dot: "", label: "Checking..." };
+      return { dot: "unavailable", label: "Unavailable" };
     }
+    if (credentials === undefined) return { dot: "", label: "Checking key" };
+    if (credentials === null) return { dot: "unavailable", label: "Status unavailable" };
     const cred = credentials?.[id];
-    if (!cred) return { dot: "", label: "Checking..." };
+    if (!cred) return { dot: "not-configured", label: "Add a key below" };
     if (cred.status === "connected") return { dot: "available", label: "Ready" };
     if (cred.status === "invalid") return { dot: "unavailable", label: "Invalid key" };
     return { dot: "not-configured", label: "Add a key below" };

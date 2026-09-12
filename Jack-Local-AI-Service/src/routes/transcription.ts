@@ -70,10 +70,8 @@ export function transcriptionRouter(
       return;
     }
 
-    // Provider selection: explicit only, defaults to "whisper" (Approved).
-    // There is NO fallback from vibevoice -> whisper anywhere in this route
-    // -- if the requested engine is unavailable, that request fails with a
-    // structured error and the caller decides what to do next.
+    // Provider selection is explicit and defaults to Whisper. Vibe may make
+    // one request-level local fallback to Whisper; no path enters cloud here.
     const rawProvider = req.query.provider;
     const parsedProvider = parseProvider(rawProvider);
     if (parsedProvider === "invalid") {
@@ -134,6 +132,25 @@ export function transcriptionRouter(
     try {
       const status = await provider.checkHealth();
       if (status === "unavailable") {
+        if (providerId === "vibevoice") {
+          const whisperStatus = await whisper.checkHealth();
+          if (whisperStatus === "available") {
+            const language = typeof req.query.language === "string" ? req.query.language : undefined;
+            const tempPath = join(tmpdir(), `jack-transcribe-${randomUUID()}.wav`);
+            try {
+              await writeFile(tempPath, audioBuffer);
+              const result = await whisper.transcribe(tempPath, language, assistantName ? { hotwords: [assistantName] } : undefined);
+              console.warn("[provider-fallback] Vibe unavailable; using Whisper for this request.");
+              res.json({ ...result, requestedProvider: "vibevoice", actualProvider: "whisper", fallbackUsed: true, fallbackFrom: "vibevoice" });
+            } catch (error) {
+              const err: JackErrorResponse = await asrFailure("whisper", error, credentialStore);
+              res.status(502).json(err);
+            } finally {
+              await unlink(tempPath).catch(() => {});
+            }
+            return;
+          }
+        }
         // openai is a BYOK cloud engine -- "unavailable" can mean not
         // configured, an invalid stored key, or a genuinely unreachable
         // API, and the caller deserves to know which (same distinction
@@ -154,6 +171,9 @@ export function transcriptionRouter(
         const err: JackErrorResponse = {
           error: `${providerId}_unavailable`,
           detail,
+          code: "provider_unavailable",
+          provider: providerId,
+          ...(await asrFallbackFields(providerId, credentialStore)),
         };
         res.status(503).json(err);
         return;
@@ -163,12 +183,27 @@ export function transcriptionRouter(
       const tempPath = join(tmpdir(), `jack-transcribe-${randomUUID()}.wav`);
       try {
         await writeFile(tempPath, audioBuffer);
-        const result = await provider.transcribe(
-          tempPath,
-          language,
-          assistantName ? { hotwords: [assistantName] } : undefined,
-        );
-        res.json(result);
+        try {
+          const result = await provider.transcribe(
+            tempPath,
+            language,
+            assistantName ? { hotwords: [assistantName] } : undefined,
+          );
+          res.json({ ...result, requestedProvider: providerId, actualProvider: providerId, fallbackUsed: false });
+        } catch (primaryError) {
+          if (providerId !== "vibevoice" || await whisper.checkHealth() === "unavailable") throw primaryError;
+          try {
+            const result = await whisper.transcribe(
+              tempPath,
+              language,
+              assistantName ? { hotwords: [assistantName] } : undefined,
+            );
+            console.warn("[provider-fallback] Vibe request failed; using Whisper for this request.");
+            res.json({ ...result, requestedProvider: "vibevoice", actualProvider: "whisper", fallbackUsed: true, fallbackFrom: "vibevoice" });
+          } catch (fallbackError) {
+            res.status(502).json(await asrFailure("whisper", fallbackError, credentialStore));
+          }
+        }
       } catch (e) {
         // Distinct failure class only openai's provider can throw (a
         // previously-valid key that was revoked/rejected mid-flight) --
@@ -176,18 +211,11 @@ export function transcriptionRouter(
         // whisper/vibevoice never throw this, so this branch is a no-op for
         // them.
         if (e instanceof CredentialAuthError) {
-          const err: JackErrorResponse = { error: `${providerId}_unauthorized`, detail: publicAuthFailure(e.providerId) };
+          const err: JackErrorResponse = { error: `${providerId}_unauthorized`, detail: publicAuthFailure(e.providerId), code: "provider_unauthorized", provider: providerId, ...(await asrFallbackFields(providerId, credentialStore)) };
           res.status(401).json(err);
           return;
         }
-        const err: JackErrorResponse = {
-          error: `${providerId}_request_failed`,
-          detail: providerId === "openai"
-            ? isRateLimitError(e)
-              ? "OpenAI Speech is temporarily rate limited."
-              : "OpenAI Speech could not transcribe this audio."
-            : e instanceof Error ? e.message : String(e),
-        };
+        const err = await asrFailure(providerId, e, credentialStore);
         res.status(502).json(err);
       } finally {
         await unlink(tempPath).catch(() => {
@@ -211,5 +239,28 @@ export function transcriptionRouter(
 function unavailableDetail(providerId: "whisper" | "vibevoice"): string {
   return providerId === "whisper"
     ? "whisper.cpp is not configured or its executable/model path is missing. Set WHISPER_EXECUTABLE_PATH and WHISPER_MODEL_PATH."
-    : "VibeVoice-ASR-BitNet (Test engine) is not configured or its executable/model paths are missing. Set VIBE_ASR_EXECUTABLE_PATH, VIBE_ASR_VAE_MODEL_PATH and VIBE_ASR_LM_MODEL_PATH. There is no automatic fallback to Whisper -- switch engines explicitly if you need a transcript now.";
+    : "VibeVoice-ASR-BitNet (Test engine) and local Whisper are unavailable. Check their executable and model paths.";
+}
+
+async function asrFallbackFields(providerId: AsrProviderId, credentialStore?: CredentialStore): Promise<Pick<JackErrorResponse, "fallbackOptions" | "requiresConsent" | "credentialRequired">> {
+  if (providerId === "openai") return { fallbackOptions: ["whisper"], requiresConsent: true };
+  if (providerId === "whisper") {
+    const connected = (await credentialStore?.status("openai"))?.status === "connected";
+    return connected
+      ? { fallbackOptions: ["openai"], requiresConsent: true }
+      : { fallbackOptions: [], requiresConsent: true, credentialRequired: "openai" };
+  }
+  return { fallbackOptions: [], requiresConsent: false };
+}
+
+async function asrFailure(providerId: AsrProviderId, error: unknown, credentialStore?: CredentialStore): Promise<JackErrorResponse> {
+  return {
+    error: `${providerId}_request_failed`,
+    detail: providerId === "openai"
+      ? isRateLimitError(error) ? "OpenAI Speech is temporarily rate limited." : "OpenAI Speech could not transcribe this audio."
+      : error instanceof Error ? error.message : String(error),
+    code: "provider_request_failed",
+    provider: providerId,
+    ...(await asrFallbackFields(providerId, credentialStore)),
+  };
 }

@@ -28,8 +28,9 @@ export interface CredentialStatusReport {
   detail?: string;
 }
 
-/** Stable ASR engine ids. "whisper" is APPROVED (default everywhere);
- * "vibevoice" is TEST (opt-in only, never a silent fallback target);
+/** Stable ASR engine ids. "whisper" is APPROVED (default everywhere and
+ * the automatic local fallback target for a failed Vibe request);
+ * "vibevoice" is TEST (opt-in as the selected provider);
  * "openai" is OpenAI Speech (Stage 2, multi-provider AI milestone) -- a
  * cloud BYOK engine, independent of AiBrainSelector's own "openai" value.
  * Both share the SAME stored "openai" CredentialStore entry (one key, two
@@ -73,6 +74,11 @@ export interface JackChatResponse {
   model: string;
   latencyMs: number;
   raw: unknown;
+  requestedProvider?: AiBrainSelector;
+  actualProvider?: AiBrainSelector;
+  actualLocalProvider?: LlmProviderName;
+  fallbackUsed?: boolean;
+  fallbackFrom?: LlmProviderName;
 }
 
 /** Structural interface implemented by every local LLM provider so routes
@@ -94,6 +100,10 @@ export interface JackTranscribeResponse {
   language?: string;
   confidence?: number;
   metadata?: Record<string, unknown>;
+  requestedProvider?: AsrProviderId;
+  actualProvider?: AsrProviderId;
+  fallbackUsed?: boolean;
+  fallbackFrom?: AsrProviderId;
 }
 
 /** Structural interface every ASR provider implements, so routes depend on
@@ -121,4 +131,9 @@ export interface JackErrorResponse {
    * "presentation_open", "pdf_save", "timeout" for pptx_conversion_failed).
    * Additive/optional -- most routes never set this. */
   stage?: string;
+  code?: "provider_unavailable" | "provider_request_failed" | "provider_unauthorized";
+  provider?: AiBrainSelector | AsrProviderId;
+  fallbackOptions?: Array<AiBrainSelector | AsrProviderId>;
+  requiresConsent?: boolean;
+  credentialRequired?: CredentialProviderId;
 }

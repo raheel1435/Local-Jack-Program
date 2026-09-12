@@ -13,6 +13,7 @@ import type { AdmissionGate } from "../lib/admission.js";
 import type { CredentialStore } from "../lib/credentialStore.js";
 import type { LlmProviderRegistry } from "./chat.js";
 import type { AiBrainSelector, JackErrorResponse } from "../types/jack.js";
+import { executeBrainRequest, LocalBrainsUnavailableError } from "../lib/brainFallback.js";
 
 const VALID_AI_PROVIDERS: ReadonlySet<AiBrainSelector> = new Set(["local", "openai", "anthropic"]);
 
@@ -143,7 +144,6 @@ export function intentRouter(
       return;
     }
     const selector: AiBrainSelector = (body.aiProvider as AiBrainSelector | undefined) ?? "local";
-    const llm = providers[selector];
 
     let release: (() => void) | undefined;
     if (selector !== "local" && gates?.[selector]) {
@@ -166,7 +166,7 @@ export function intentRouter(
     }
 
     try {
-      const status = await llm.checkHealth();
+      const status = selector === "local" ? "available" : await providers[selector].checkHealth();
       if (status === "unavailable") {
         let detail = "No deterministic match, and the configured local LLM provider is not reachable.";
         if (selector !== "local") {
@@ -178,12 +178,12 @@ export function intentRouter(
                 ? `The stored ${selector} API key was rejected. Update it in Settings.`
                 : `${selector} is not reachable right now.`;
         }
-        const err: JackErrorResponse = { error: `${selector}_unavailable`, detail };
+        const err: JackErrorResponse = { error: `${selector}_unavailable`, detail, code: "provider_unavailable", provider: selector, fallbackOptions: selector === "local" ? [] : ["local"], requiresConsent: true };
         res.status(503).json(err);
         return;
       }
 
-      const result = await llm.chat({
+      const result = await executeBrainRequest(providers, selector, {
         messages: [
           { role: "system", content: buildActionSystemPrompt(assistantName) },
           { role: "user", content: body.text },
@@ -262,18 +262,33 @@ export function intentRouter(
         downgradedFrom,
         raw: result.content,
         latencyMs: Date.now() - start,
+        requestedProvider: result.requestedProvider,
+        actualProvider: result.actualProvider,
+        actualLocalProvider: result.actualLocalProvider,
+        fallbackUsed: result.fallbackUsed,
+        fallbackFrom: result.fallbackFrom,
       });
     } catch (e) {
       if (e instanceof CredentialAuthError) {
-        const err: JackErrorResponse = { error: `${selector}_unauthorized`, detail: publicAuthFailure(e.providerId) };
+        const err: JackErrorResponse = { error: `${selector}_unauthorized`, detail: publicAuthFailure(e.providerId), code: "provider_unauthorized", provider: selector, fallbackOptions: ["local"], requiresConsent: true };
         res.status(401).json(err);
         return;
+      }
+      const cloudOptions: AiBrainSelector[] = [];
+      if (selector === "local") {
+        for (const cloud of ["openai", "anthropic"] as const) {
+          if ((await credentialStore?.status(cloud))?.status === "connected") cloudOptions.push(cloud);
+        }
       }
       const err: JackErrorResponse = {
         error: `${selector}_request_failed`,
         detail: selector === "local"
-          ? e instanceof Error ? e.message : String(e)
+          ? e instanceof LocalBrainsUnavailableError ? e.message : e instanceof Error ? e.message : String(e)
           : publicBrainFailure(selector),
+        code: "provider_request_failed",
+        provider: selector,
+        fallbackOptions: selector === "local" ? cloudOptions : ["local"],
+        requiresConsent: true,
       };
       res.status(502).json(err);
     } finally {

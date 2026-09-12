@@ -12,10 +12,9 @@ const execFileAsync = promisify(execFile);
 /**
  * TEST ASR engine: VibeVoice-ASR-BitNet, run via VibeASR.cpp. Opt-in only:
  * never invoked unless a request explicitly selects provider "vibevoice"
- * (see routes/transcription.ts). If this fails or is unconfigured, the
- * caller gets a structured error -- there is no automatic fallback to
- * Whisper anywhere in this class or its callers (VibeVoice isolated-
- * optimization milestone, Part 19: no silent fallback).
+ * (see routes/transcription.ts). This adapter reports failures without
+ * rerouting; the route may then perform one visible, request-level local
+ * fallback to Whisper.
  *
  * VibeVoiceTestConfig.warmRuntime (default true) routes transcription
  * through VibeWarmServer, a persistent child process using VibeASR.cpp's

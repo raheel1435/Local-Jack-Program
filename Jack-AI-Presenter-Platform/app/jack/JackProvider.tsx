@@ -5,7 +5,8 @@ import { useLocalRecorder, type CaptureCloseReason, type LocalRecorderState } fr
 import { capturePolicyFor, effectiveSpeechThreshold } from "./capturePolicy";
 import { isDirectlyAddressedToJack, isSelfEcho, type RecentSpeech } from "./addressing";
 import { useSpeech, type UseSpeechResult } from "../hooks/useSpeech";
-import { jackApi, type AiProviderId, type AsrProviderId, type JackHealth, type JackIntentAction } from "../lib/jackApi";
+import { jackApi, setProviderFallbackConsentHandler, setProviderRequestStatusHandler, type AiProviderId, type AsrProviderId, type JackHealth, type JackIntentAction, type ProviderFallbackRequest, type ProviderRequestStatus } from "../lib/jackApi";
+import { ProviderFallbackDialog } from "../components/ProviderFallbackDialog";
 import { normalizeAsrProviderId } from "./asrProviderSettings";
 import { DEFAULT_AI_PROVIDER_ID, normalizeAiProviderId } from "./aiProviderSettings";
 import {
@@ -237,8 +238,8 @@ export interface JackContextValue {
    * Which ASR engine transcribes every mic capture across the whole app
    * (ambient listening, push-to-talk, Ask Jack, Practice) -- there is no
    * per-screen override. Defaults to "whisper" (Approved). "vibevoice"
-   * (Test) is opt-in only and never used as a silent fallback target if it
-   * fails; see runLocalCommand's transcription call sites.
+   * (Test) is opt-in and falls back visibly to local Whisper for a failed
+   * request; see runLocalCommand's transcription call sites.
    */
   asrProvider: AsrProviderId;
   /** Multi-provider AI milestone: which AI brain (Local/OpenAI/Anthropic)
@@ -287,6 +288,7 @@ export interface JackContextValue {
   setPresenterControl(owner: ControlOwner): void;
   /** Jack-Local-AI-Service reachability -- polled independently, so every mode can always report an honest status even when Jack is fully offline. */
   jackLocalHealth: JackHealth | null;
+  providerRequestStatus: ProviderRequestStatus | null;
   /** True once BOTH local LLM providers (llama.cpp and Colibri) are confirmed unavailable -- the one computation every mode's "Jack Local AI is unavailable" warning needs, centralized here instead of copied per-stage. */
   localUnavailable: boolean;
 
@@ -591,6 +593,31 @@ export function JackProvider({ children }: { children: ReactNode }) {
   // unchanged even when this is off.
   const [ambientListeningEnabled, setAmbientListeningEnabledState] = useState(false);
   const [jackLocalHealth, setJackLocalHealth] = useState<JackHealth | null>(null);
+  const [providerRequestStatus, setProviderRequestStatus] = useState<ProviderRequestStatus | null>(null);
+  const [fallbackPrompt, setFallbackPrompt] = useState<ProviderFallbackRequest | null>(null);
+  const fallbackResolverRef = useRef<((choice: string | null) => void) | null>(null);
+
+  useEffect(() => {
+    setProviderFallbackConsentHandler((request) => new Promise((resolve) => {
+      fallbackResolverRef.current?.(null);
+      fallbackResolverRef.current = resolve;
+      setFallbackPrompt(request);
+    }));
+    setProviderRequestStatusHandler(setProviderRequestStatus);
+    return () => {
+      fallbackResolverRef.current?.(null);
+      fallbackResolverRef.current = null;
+      setProviderFallbackConsentHandler(null);
+      setProviderRequestStatusHandler(null);
+    };
+  }, []);
+
+  const resolveFallbackPrompt = useCallback((choice: string | null) => {
+    const resolve = fallbackResolverRef.current;
+    fallbackResolverRef.current = null;
+    setFallbackPrompt(null);
+    resolve?.(choice);
+  }, []);
   const [isPresentingAutonomously, setIsPresentingAutonomously] = useState(false);
   // Local-pipeline activation lifecycle (Phase 1/2 of the activation
   // milestone) -- deliberately separate from attentionState's
@@ -2178,6 +2205,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     presenterControl,
     setPresenterControl,
     jackLocalHealth,
+    providerRequestStatus,
     localUnavailable,
     pause,
     resume,
@@ -2208,5 +2236,10 @@ export function JackProvider({ children }: { children: ReactNode }) {
     bargeInThreshold,
   };
 
-  return <JackContext.Provider value={value}>{children}</JackContext.Provider>;
+  return (
+    <JackContext.Provider value={value}>
+      {children}
+      {fallbackPrompt && <ProviderFallbackDialog request={fallbackPrompt} onChoose={resolveFallbackPrompt} />}
+    </JackContext.Provider>
+  );
 }

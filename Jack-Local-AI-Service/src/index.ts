@@ -60,6 +60,7 @@ app.use((req, res, next) => {
 const colibri = new ColibriProvider();
 const llamacpp = new LlamaCppProvider();
 const activeLlm: LlmProvider = config.llmProvider === "colibri" ? colibri : llamacpp;
+const fallbackLlm: LlmProvider = config.llmProvider === "colibri" ? llamacpp : colibri;
 
 const whisper = new WhisperProvider();
 // VibeAsrProvider (TEST engine) is always constructed and health-checked,
@@ -83,7 +84,14 @@ const anthropicProvider = new AnthropicProvider(credentialStore);
 // never invoked unless a request explicitly asks for provider "openai" on
 // /jack/transcribe.
 const openaiSpeechProvider = new OpenAiSpeechProvider(credentialStore);
-const llmProviders: LlmProviderRegistry = { local: activeLlm, openai: openaiProvider, anthropic: anthropicProvider };
+const llmProviders: LlmProviderRegistry = {
+  local: activeLlm,
+  localFallback: fallbackLlm,
+  localProviderName: config.llmProvider,
+  localFallbackProviderName: config.llmProvider === "colibri" ? "llamacpp" : "colibri",
+  openai: openaiProvider,
+  anthropic: anthropicProvider,
+};
 // Closes a real gap: chatRouter/intentRouter previously had zero
 // concurrency bound, fine for local-only compute but not for paid APIs
 // where uncontrolled fan-out means runaway billing. `local` intentionally

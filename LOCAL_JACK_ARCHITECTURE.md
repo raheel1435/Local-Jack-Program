@@ -134,8 +134,10 @@ jackApi.chat()
   -> normalized text response
 ```
 
-Jack does not start `llama-server`. If it is unavailable, the gateway returns
-`local_unavailable` or `local_request_failed`; it does not select a cloud brain.
+Jack does not start `llama-server`. If it is unavailable or its request fails,
+the gateway checks Colibri and retries once when healthy. This is request-level:
+`JACK_LLM_PROVIDER` remains `llamacpp`. If both fail, the gateway returns a
+structured error; it never selects a cloud brain automatically.
 
 ### Colibri
 
@@ -150,8 +152,9 @@ Jack does not start `llama-server`. If it is unavailable, the gateway returns
   gateway starts.
 - **Defaults:** `http://127.0.0.1:8000`, model ID `colibri`.
 
-Jack does not start Colibri. An unavailable or failed Colibri request becomes a
-local-provider error; it is not silently rerouted to llama.cpp or cloud AI.
+Jack does not start Colibri. If configured as primary and unavailable or failed,
+the gateway checks llama.cpp and retries once when healthy. It never enters
+cloud AI automatically and never rewrites `JACK_LLM_PROVIDER`.
 
 ### whisper.cpp
 
@@ -171,8 +174,9 @@ uploaded WAV -> temporary .wav -> WhisperProvider.transcribe()
   -> whisper-cli.exe -> stdout -> normalized transcript
 ```
 
-Missing configuration or a failed CLI returns an error. Whisper is not a
-fallback for a failed explicitly selected Vibe or OpenAI Speech request.
+Missing configuration or a failed CLI returns a structured error. Whisper is
+the automatic local fallback for Vibe. OpenAI Speech→Whisper is offered as a
+current-request retry and requires user consent.
 
 ### VibeASR.cpp / VibeVoice
 
@@ -193,7 +197,9 @@ is stopped on gateway `SIGINT` or `SIGTERM`.
 The source also retains a one-shot `asr_infer.exe` cold implementation for use
 only if `warmRuntime` is disabled. It is not a request-time fallback from the
 warm path. Missing binaries/models or runtime failures are reported to the
-caller; Jack never silently switches to Whisper.
+caller. When the selected Vibe service/model/startup/runtime request fails,
+the transcription route makes one automatic local retry through Whisper and
+returns `requestedProvider`, `actualProvider`, and `fallbackUsed` metadata.
 
 ### Kokoro-FastAPI
 
@@ -220,9 +226,9 @@ fallback and Kokoro is unreachable.
 
 | Runtime | Purpose | Trigger | Jack adapter | Communication | Output |
 |---|---|---|---|---|---|
-| llama.cpp | Default local AI | `local` brain plus `JACK_LLM_PROVIDER=llamacpp` | `LlamaCppProvider` | HTTP | AI text |
-| Colibri | Alternative local AI | `local` brain plus `JACK_LLM_PROVIDER=colibri` | `ColibriProvider` | HTTP | AI text |
-| whisper.cpp | Default ASR | Whisper selected or ASR omitted | `WhisperProvider` | Per-request CLI | Transcript |
+| llama.cpp | Default/alternate local AI | `local` brain; primary or one fallback according to `JACK_LLM_PROVIDER` | `LlamaCppProvider` | HTTP | AI text + actual-runtime metadata |
+| Colibri | Primary/alternate local AI | `local` brain; primary or one fallback according to `JACK_LLM_PROVIDER` | `ColibriProvider` | HTTP | AI text + actual-runtime metadata |
+| whisper.cpp | Default/fallback ASR | Whisper selected/omitted, or one automatic Vibe fallback | `WhisperProvider` | Per-request CLI | Transcript + actual-provider metadata |
 | VibeASR.cpp | Experimental ASR | Vibe explicitly selected | `VibeAsrProvider`/`VibeWarmServer` | Persistent child stdin/stdout; cold CLI if configured off | Transcript |
 | Kokoro-FastAPI | Primary TTS | Jack speaks | `KokoroProvider` | HTTP | WAV audio |
 
@@ -256,14 +262,37 @@ official `@anthropic-ai/sdk` Messages API. The default is
 
 AI brain and ASR are independent axes. Valid combinations include Whisper +
 OpenAI brain, OpenAI Speech + Local brain, and Vibe + Anthropic brain. Exactly
-one AI brain handles each AI request. If a selected cloud provider lacks a key,
-is unavailable, is busy, rejects authentication, or fails, the route returns
-that provider's error. It never calls Local as a fallback. Local becomes active
-again only after the user explicitly selects Local.
+one AI brain handles each attempt. Provider failures return structured fields
+(`code`, `provider`, `fallbackOptions`, `requiresConsent`) rather than requiring
+the frontend to parse error prose. A selected cloud brain never calls Local
+automatically; the frontend may offer a one-request Local retry. Likewise, a
+failed Local request may offer only credentialed OpenAI/Anthropic choices, and
+no cloud call occurs before the user chooses one.
 
 Availability is also separate from activity: `/health` checks all providers so
 the UI can show what is installed/reachable, while `brainStatus.ts` derives the
 visible active-brain label only from the selected provider.
+
+### Fallback and consent policy
+
+Automatic fallback is limited to providers that remain local:
+
+- Vibe → Whisper, once per transcription request.
+- llama.cpp ↔ Colibri, once per AI request, with the configured runtime still
+  remaining primary for future requests.
+
+Every boundary into cloud requires explicit consent. Whisper failure may offer
+OpenAI Speech only when an OpenAI key is configured; otherwise the UI directs
+the user to credential settings. OpenAI Speech failure may offer Whisper, but
+still asks because it changes the selected request path. When both local AI
+runtimes fail, configured OpenAI and/or Anthropic may be offered. OpenAI or
+Anthropic failure may offer Local. These are one-request retries and do not
+change saved ASR/AI selections.
+
+No retry recursively invokes the fallback workflow: one automatic local retry
+and one user-approved retry are the bounds. Status UI keeps the selected
+provider visible and adds the actual provider/runtime plus a fallback marker,
+so availability is never confused with which provider handled the request.
 
 ## 8. Microphone / ASR Flow
 
@@ -477,12 +506,12 @@ from Git/source evidence.
   executable/model paths, and cloud model defaults.
 - `src/types/jack.ts` - Common provider interfaces and normalized request,
   response, status, and selector types.
-- `src/routes/chat.ts` - Validates chat and invokes exactly one selected AI
-  brain.
+- `src/routes/chat.ts` - Validates chat, invokes the selected AI class, and
+  permits one alternate local-runtime attempt within the Local selection.
 - `src/routes/intent.ts` - Deterministic commands first, then selected-brain
   classification with action safety validation.
 - `src/routes/transcription.ts` - Validates WAV input, manages temp files and
-  admission, and calls exactly one selected ASR provider.
+  admission, and permits one Vibe-to-Whisper local fallback attempt.
 - `src/routes/speech.ts` - Validates text/voice, checks Kokoro, and returns
   audio bytes.
 - `src/routes/health.ts` - Checks all adapters and reports availability plus

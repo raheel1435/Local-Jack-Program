@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeAiProviderId, AI_PROVIDER_OPTIONS, DEFAULT_AI_PROVIDER_ID } from "../app/jack/aiProviderSettings.ts";
-import { jackApi } from "../app/lib/jackApi.ts";
+import { jackApi, setProviderFallbackConsentHandler, setProviderRequestStatusHandler } from "../app/lib/jackApi.ts";
+import { activeBrainStatus } from "../app/jack/brainStatus.ts";
 
 test("normalizeAiProviderId accepts every real option id", () => {
   for (const option of AI_PROVIDER_OPTIONS) {
@@ -14,6 +15,28 @@ test("normalizeAiProviderId safely defaults to local for garbage/removed values"
   assert.equal(normalizeAiProviderId(undefined), DEFAULT_AI_PROVIDER_ID);
   assert.equal(normalizeAiProviderId(null), DEFAULT_AI_PROVIDER_ID);
   assert.equal(normalizeAiProviderId(42), DEFAULT_AI_PROVIDER_ID);
+});
+
+test("active brain status follows only the selected provider", () => {
+  const health = {
+    gateway: "ok", colibri: "available", llamacpp: "unavailable",
+    whisper: "available", vibevoice: "unavailable", kokoro: "available",
+    openai: "available", anthropic: "unavailable", activeLlmProvider: "colibri",
+  };
+
+  assert.deepEqual(activeBrainStatus("local", health), {
+    label: "Local AI", readiness: "connected", text: "Local AI: Brain ready",
+  });
+  assert.deepEqual(activeBrainStatus("openai", health), {
+    label: "OpenAI", readiness: "connected", text: "OpenAI: Brain ready",
+  });
+  assert.deepEqual(activeBrainStatus("anthropic", health), {
+    label: "Anthropic", readiness: "offline", text: "Anthropic: Brain offline",
+  });
+  assert.notEqual(activeBrainStatus("openai", health).text, "Local AI: Brain ready");
+  assert.deepEqual(activeBrainStatus("openai", null), {
+    label: "OpenAI", readiness: "checking", text: "OpenAI: Checking brain…",
+  });
 });
 
 function withMockedFetch(impl, fn) {
@@ -93,3 +116,93 @@ test("testCredential POSTs to the /test endpoint with no body required", () =>
       assert.equal(report.status, "connected");
     },
   ));
+
+test("OpenAI failure never invokes Local before consent; approval retries Local once", async () => {
+  const providers = [];
+  let prompt;
+  let observed;
+  setProviderFallbackConsentHandler(async (request) => { prompt = request; return "local"; });
+  setProviderRequestStatusHandler((status) => { observed = status; });
+  await withMockedFetch(async (_url, init) => {
+    const body = JSON.parse(init.body);
+    providers.push(body.aiProvider);
+    if (providers.length === 1) {
+      assert.deepEqual(providers, ["openai"], "Local must not run before consent");
+      return new Response(JSON.stringify({ detail: "OpenAI unavailable", provider: "openai", fallbackOptions: ["local"], requiresConsent: true }), { status: 502 });
+    }
+    return new Response(JSON.stringify({ content: "local answer", model: "local", latencyMs: 1, actualProvider: "local" }), { status: 200 });
+  }, async () => {
+    const result = await jackApi.chat([{ role: "user", content: "hello" }], { aiProvider: "openai" });
+    assert.equal(result.content, "local answer");
+  });
+  assert.deepEqual(providers, ["openai", "local"]);
+  assert.equal(prompt.failedProvider, "openai");
+  assert.equal(observed.selectedProvider, "openai");
+  assert.equal(observed.actualProvider, "local");
+  assert.equal(observed.fallbackUsed, true);
+  setProviderFallbackConsentHandler(null);
+  setProviderRequestStatusHandler(null);
+});
+
+test("canceling cloud-to-Local consent makes no Local request", async () => {
+  let calls = 0;
+  setProviderFallbackConsentHandler(async () => null);
+  await assert.rejects(withMockedFetch(async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ detail: "Anthropic unavailable", provider: "anthropic", fallbackOptions: ["local"], requiresConsent: true }), { status: 502 });
+  }, () => jackApi.chat([{ role: "user", content: "hello" }], { aiProvider: "anthropic" })));
+  assert.equal(calls, 1);
+  setProviderFallbackConsentHandler(null);
+});
+
+test("Anthropic failure can retry Local exactly once after approval", async () => {
+  const providers = [];
+  setProviderFallbackConsentHandler(async () => "local");
+  await withMockedFetch(async (_url, init) => {
+    const selected = JSON.parse(init.body).aiProvider;
+    providers.push(selected);
+    return providers.length === 1
+      ? new Response(JSON.stringify({ detail: "Anthropic unavailable", provider: "anthropic", fallbackOptions: ["local"], requiresConsent: true }), { status: 502 })
+      : new Response(JSON.stringify({ content: "local", model: "local", latencyMs: 1, actualProvider: "local" }), { status: 200 });
+  }, () => jackApi.chat([{ role: "user", content: "hello" }], { aiProvider: "anthropic" }));
+  assert.deepEqual(providers, ["anthropic", "local"]);
+  setProviderFallbackConsentHandler(null);
+});
+
+test("Whisper failure offers OpenAI Speech and retries it exactly once only after consent", async () => {
+  const urls = [];
+  setProviderFallbackConsentHandler(async (request) => {
+    assert.equal(request.kind, "asr");
+    assert.deepEqual(request.options, ["openai"]);
+    assert.equal(urls.length, 1, "OpenAI Speech must not run before consent");
+    return "openai";
+  });
+  await withMockedFetch(async (url) => {
+    urls.push(String(url));
+    if (urls.length === 1) return new Response(JSON.stringify({ detail: "Whisper unavailable", provider: "whisper", fallbackOptions: ["openai"], requiresConsent: true }), { status: 503 });
+    return new Response(JSON.stringify({ text: "hello", provider: "openai", actualProvider: "openai", latencyMs: 1 }), { status: 200 });
+  }, async () => {
+    const result = await jackApi.transcribeAudio(new Blob(["wav"]), undefined, "whisper");
+    assert.equal(result.provider, "openai");
+  });
+  assert.equal(urls.length, 2);
+  assert.match(urls[1], /provider=openai/);
+  setProviderFallbackConsentHandler(null);
+});
+
+test("OpenAI Speech failure offers Whisper; approval invokes Whisper once", async () => {
+  const urls = [];
+  setProviderFallbackConsentHandler(async (request) => {
+    assert.deepEqual(request.options, ["whisper"]);
+    assert.equal(urls.length, 1, "Whisper must not run before consent");
+    return "whisper";
+  });
+  await withMockedFetch(async (url) => {
+    urls.push(String(url));
+    if (urls.length === 1) return new Response(JSON.stringify({ detail: "OpenAI Speech unavailable", provider: "openai", fallbackOptions: ["whisper"], requiresConsent: true }), { status: 502 });
+    return new Response(JSON.stringify({ text: "hello", provider: "whisper", actualProvider: "whisper", latencyMs: 1 }), { status: 200 });
+  }, () => jackApi.transcribeAudio(new Blob(["wav"]), undefined, "openai"));
+  assert.equal(urls.length, 2);
+  assert.match(urls[1], /provider=whisper/);
+  setProviderFallbackConsentHandler(null);
+});

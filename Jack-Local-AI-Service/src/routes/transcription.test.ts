@@ -167,7 +167,7 @@ test("unknown provider value is rejected with 400, neither engine is invoked", a
   });
 });
 
-test("vibevoice unavailable returns a structured 503 and never falls back to whisper", async () => {
+test("vibevoice unavailable automatically falls back to Whisper exactly once and reports the actual provider", async () => {
   const whisper = new FakeAsrProvider("whisper", "Approved · Whisper", "available");
   const vibevoice = new FakeAsrProvider("vibevoice", "Test · VibeVoice", "unavailable");
   await withServer(whisper, vibevoice, async (base) => {
@@ -176,12 +176,12 @@ test("vibevoice unavailable returns a structured 503 and never falls back to whi
       headers: { "Content-Type": "audio/wav" },
       body: Buffer.from([0, 1, 2, 3]),
     });
-    assert.equal(res.status, 503);
+    assert.equal(res.status, 200);
     const body = await res.json();
-    assert.equal(body.error, "vibevoice_unavailable");
-    // The critical guarantee: an unavailable Test engine must NOT silently
-    // route the request to Whisper.
-    assert.equal(whisper.calls.length, 0);
+    assert.equal(body.requestedProvider, "vibevoice");
+    assert.equal(body.actualProvider, "whisper");
+    assert.equal(body.fallbackUsed, true);
+    assert.equal(whisper.calls.length, 1);
     assert.equal(vibevoice.calls.length, 0);
   });
 });
@@ -245,7 +245,7 @@ test("audio/wav upload path: provider selected via query string, normalized shap
     });
     assert.equal(res.status, 200);
     const body = await res.json();
-    assert.deepEqual(Object.keys(body).sort(), ["confidence", "language", "latencyMs", "provider", "text"].sort());
+    assert.deepEqual(Object.keys(body).sort(), ["actualProvider", "confidence", "fallbackUsed", "language", "latencyMs", "provider", "requestedProvider", "text"].sort());
     assert.equal(body.provider, "vibevoice");
     assert.equal(body.language, "sv");
     // The gateway writes the upload to its own temp path -- the browser
@@ -253,6 +253,37 @@ test("audio/wav upload path: provider selected via query string, normalized shap
     assert.equal(vibevoice.calls.length, 1);
     assert.match(vibevoice.calls[0], /jack-transcribe-.*\.wav$/);
   });
+});
+
+test("Vibe runtime failure falls back to Whisper once; success never invokes Whisper", async () => {
+  const whisper = new FakeAsrProvider("whisper", "Whisper", "available");
+  const failedVibe = new FakeAsrProvider("vibevoice", "Vibe", "available", undefined, new Error("crash"));
+  await withServer(whisper, failedVibe, async (base) => {
+    const res = await fetch(`${base}/jack/transcribe?provider=vibevoice`, { method: "POST", headers: { "Content-Type": "audio/wav" }, body: Buffer.from([1]) });
+    assert.equal(res.status, 200);
+    assert.equal(failedVibe.calls.length, 1);
+    assert.equal(whisper.calls.length, 1);
+  });
+
+  const untouchedWhisper = new FakeAsrProvider("whisper", "Whisper", "available");
+  const healthyVibe = new FakeAsrProvider("vibevoice", "Vibe", "available");
+  await withServer(untouchedWhisper, healthyVibe, async (base) => {
+    assert.equal((await fetch(`${base}/jack/transcribe?provider=vibevoice`, { method: "POST", headers: { "Content-Type": "audio/wav" }, body: Buffer.from([1]) })).status, 200);
+    assert.equal(untouchedWhisper.calls.length, 0);
+  });
+});
+
+test("Vibe then Whisper failure stops without a loop or cloud call", async () => {
+  const whisper = new FakeAsrProvider("whisper", "Whisper", "available", undefined, new Error("whisper crash"));
+  const vibe = new FakeAsrProvider("vibevoice", "Vibe", "available", undefined, new Error("vibe crash"));
+  const openai = new FakeAsrProvider("openai", "OpenAI", "available");
+  await withServer(whisper, vibe, async (base) => {
+    const res = await fetch(`${base}/jack/transcribe?provider=vibevoice`, { method: "POST", headers: { "Content-Type": "audio/wav" }, body: Buffer.from([1]) });
+    assert.equal(res.status, 502);
+    assert.equal(vibe.calls.length, 1);
+    assert.equal(whisper.calls.length, 1);
+    assert.equal(openai.calls.length, 0);
+  }, openai);
 });
 
 test("unknown provider on the upload path is also rejected with 400 before any temp file is written", async () => {
