@@ -18,6 +18,7 @@ import { pptxConvertRouter } from "./routes/pptxConvert.js";
 import { credentialsRouter } from "./routes/credentials.js";
 import { CredentialStore } from "./lib/credentialStore.js";
 import { AdmissionGate } from "./lib/admission.js";
+import { LocalRuntimeManager } from "./lib/LocalRuntimeManager.js";
 import type { AiBrainSelector, LlmProvider } from "./types/jack.js";
 
 const app = express();
@@ -61,6 +62,24 @@ const colibri = new ColibriProvider();
 const llamacpp = new LlamaCppProvider();
 const activeLlm: LlmProvider = config.llmProvider === "colibri" ? colibri : llamacpp;
 const fallbackLlm: LlmProvider = config.llmProvider === "colibri" ? llamacpp : colibri;
+
+// Auto-start milestone: Local AI must be available by default, not
+// something the user has to start with a manual PowerShell command first.
+// This only ensures a llama-server process exists and is healthy --
+// LlamaCppProvider above still does every actual chat/health request
+// exactly as before, whether that server was just launched here or was
+// already running. Colibri is intentionally left untouched (external-only,
+// per this milestone's own scope): it stays available as the existing
+// fallback/reference runtime if the user has started it separately.
+const localRuntimeManager = new LocalRuntimeManager();
+console.log("Starting Local AI...");
+void localRuntimeManager.ensureReady().then((status) => {
+  if (status.state === "ready") {
+    console.log(`Local AI Ready (llama-server${status.ownedByJack ? ", started by Jack" : ", already running"}).`);
+  } else {
+    console.warn(`Local AI is not ready yet: ${status.detail ?? status.state}`);
+  }
+});
 
 const whisper = new WhisperProvider();
 // VibeAsrProvider (TEST engine) is always constructed and health-checked,
@@ -121,6 +140,10 @@ const server = app.listen(config.port, config.host, () => {
 // nothing explicitly terminated it first.
 function shutdown() {
   vibevoice.stop();
+  // Only stops a llama-server process Jack itself launched -- an externally
+  // started one (already running before Jack booted) is left alone, per
+  // LocalRuntimeManager's own ownership rule.
+  localRuntimeManager.stop();
   server.close(() => process.exit(0));
 }
 process.on("SIGINT", shutdown);

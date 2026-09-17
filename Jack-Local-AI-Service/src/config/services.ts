@@ -58,6 +58,14 @@ export const config = {
   colibriModelId: process.env.COLIBRI_MODEL_ID ?? "colibri",
 
   llamacppBaseUrl: process.env.LLAMACPP_BASE_URL ?? "http://127.0.0.1:8081",
+  // Auto-start milestone: LocalRuntimeManager uses these two to launch
+  // llama-server itself when it isn't already running, instead of requiring
+  // the user to start it manually first. Empty string (not a machine-
+  // specific default) when unset -- LocalRuntimeManager treats that as a
+  // clear configuration error, never a crash and never a silent switch to a
+  // cloud provider.
+  llamacppExecutablePath: process.env.LLAMACPP_EXECUTABLE_PATH ?? "",
+  llamacppModelPath: process.env.LLAMACPP_MODEL_PATH ?? "",
 
   kokoroBaseUrl: process.env.KOKORO_BASE_URL ?? "http://127.0.0.1:8880",
 
