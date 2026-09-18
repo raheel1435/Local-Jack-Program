@@ -19,6 +19,7 @@ import { credentialsRouter } from "./routes/credentials.js";
 import { CredentialStore } from "./lib/credentialStore.js";
 import { AdmissionGate } from "./lib/admission.js";
 import { LocalRuntimeManager } from "./lib/LocalRuntimeManager.js";
+import { KokoroRuntimeManager } from "./lib/KokoroRuntimeManager.js";
 import type { AiBrainSelector, LlmProvider } from "./types/jack.js";
 
 const app = express();
@@ -89,6 +90,20 @@ const whisper = new WhisperProvider();
 const vibevoice = new VibeAsrProvider();
 const kokoro = new KokoroProvider();
 
+// Auto-start milestone, extended to TTS: same reasoning as
+// LocalRuntimeManager above, applied to Kokoro-FastAPI. KokoroProvider still
+// does every actual /jack/speak request exactly as before; this only makes
+// sure something is listening at kokoroBaseUrl first.
+const kokoroRuntimeManager = new KokoroRuntimeManager();
+console.log("Starting Kokoro TTS...");
+void kokoroRuntimeManager.ensureReady().then((status) => {
+  if (status.state === "ready") {
+    console.log(`Kokoro TTS Ready${status.ownedByJack ? " (started by Jack)" : " (already running)"}.`);
+  } else {
+    console.warn(`Kokoro TTS is not ready yet: ${status.detail ?? status.state}`);
+  }
+});
+
 // Multi-provider AI milestone: OpenAI/Anthropic as BYOK AI-brain providers,
 // always constructed and health-checked (same pattern as colibri/llamacpp
 // above), selected per-request via `aiProvider` rather than one fixed
@@ -144,6 +159,9 @@ function shutdown() {
   // started one (already running before Jack booted) is left alone, per
   // LocalRuntimeManager's own ownership rule.
   localRuntimeManager.stop();
+  // Same ownership rule as llama-server above -- only a Jack-owned Kokoro
+  // process is stopped here.
+  kokoroRuntimeManager.stop();
   server.close(() => process.exit(0));
 }
 process.on("SIGINT", shutdown);

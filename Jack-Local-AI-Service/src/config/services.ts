@@ -68,6 +68,13 @@ export const config = {
   llamacppModelPath: process.env.LLAMACPP_MODEL_PATH ?? "",
 
   kokoroBaseUrl: process.env.KOKORO_BASE_URL ?? "http://127.0.0.1:8880",
+  // Auto-start milestone: KokoroRuntimeManager launches Kokoro-FastAPI's own
+  // virtualenv's python.exe -m uvicorn (see that class's own doc comment
+  // for why not `uv run uvicorn`, the "official" invocation) when it isn't
+  // already running. Empty project root -- like the llama.cpp pair above --
+  // is a clear configuration error, never a crash and never a silent
+  // switch elsewhere.
+  kokoroProjectRoot: process.env.KOKORO_PROJECT_ROOT ?? "",
 
   whisperExecutablePath: process.env.WHISPER_EXECUTABLE_PATH ?? "",
   whisperModelPath: process.env.WHISPER_MODEL_PATH ?? "",
