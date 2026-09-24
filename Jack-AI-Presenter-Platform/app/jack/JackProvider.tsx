@@ -2,10 +2,10 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useLocalRecorder, type CaptureCloseReason, type LocalRecorderState } from "../hooks/useLocalRecorder";
-import { capturePolicyFor, effectiveSpeechThreshold } from "./capturePolicy";
+import { capturePolicyFor, validateSpeechCalibration } from "./capturePolicy";
 import { isDirectlyAddressedToJack, isSelfEcho, type RecentSpeech } from "./addressing";
 import { useSpeech, type UseSpeechResult } from "../hooks/useSpeech";
-import { jackApi, setProviderFallbackConsentHandler, setProviderRequestStatusHandler, type AiProviderId, type AsrProviderId, type JackHealth, type JackIntentAction, type ProviderFallbackRequest, type ProviderRequestStatus } from "../lib/jackApi";
+import { jackApi, resetProviderFallbackDecisions, setProviderFallbackConsentHandler, setProviderRequestStatusHandler, type AiProviderId, type AsrProviderId, type JackHealth, type JackIntentAction, type ProviderFallbackRequest, type ProviderRequestStatus } from "../lib/jackApi";
 import { ProviderFallbackDialog } from "../components/ProviderFallbackDialog";
 import { normalizeAsrProviderId } from "./asrProviderSettings";
 import { DEFAULT_AI_PROVIDER_ID, normalizeAiProviderId } from "./aiProviderSettings";
@@ -612,6 +612,20 @@ export function JackProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
+  // A new upload starts a new session: forget the previous fallback answers so
+  // the prompt can appear once again for it.
+  const seenUploadIdsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    let hasNewUpload = false;
+    for (const f of appSession.files) {
+      if (!seenUploadIdsRef.current.has(f.id)) {
+        seenUploadIdsRef.current.add(f.id);
+        hasNewUpload = true;
+      }
+    }
+    if (hasNewUpload) resetProviderFallbackDecisions();
+  }, [appSession.files]);
+
   const resolveFallbackPrompt = useCallback((choice: string | null) => {
     const resolve = fallbackResolverRef.current;
     fallbackResolverRef.current = null;
@@ -700,6 +714,11 @@ export function JackProvider({ children }: { children: ReactNode }) {
     bargeInPhaseRef.current = phase;
     setBargeInPhase(phase);
   }, []);
+  // Bumped by finishBargeInCapture each time it returns the phase to "idle".
+  // The arm effect deliberately does not depend on the phase itself (see its
+  // deps comment), so without this nothing re-runs it after a command and the
+  // mic stays off until the button is toggled again.
+  const [bargeInRearmTick, setBargeInRearmTick] = useState(0);
   const bargeInLoudTicksRef = useRef(0);
   // Perf trace id for the in-progress capture (dual-ASR-latency milestone):
   // started the moment barge-in is detected (T0), used by both the silence
@@ -1442,6 +1461,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       abortTrace(traceId);
       bargeInTraceIdRef.current = undefined;
       setBargeInPhaseBoth("idle");
+      setBargeInRearmTick((t) => t + 1);
       dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
       setLastError(err instanceof Error ? err.message : "Microphone capture failed.");
       return;
@@ -1451,6 +1471,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       abortTrace(traceId);
       bargeInTraceIdRef.current = undefined;
       setBargeInPhaseBoth("idle");
+      setBargeInRearmTick((t) => t + 1);
       dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
       return;
     }
@@ -1488,6 +1509,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
         finishTrace(traceId, false);
         bargeInTraceIdRef.current = undefined;
         setBargeInPhaseBoth("idle");
+        setBargeInRearmTick((t) => t + 1);
         dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
         return;
       }
@@ -1501,6 +1523,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       const outcome = await runLocalCommandRef.current(transcript, "interruption", traceId);
       bargeInTraceIdRef.current = undefined;
       setBargeInPhaseBoth("idle");
+      setBargeInRearmTick((t) => t + 1);
       recordAsrDiagnostic({
         provider: result.provider,
         transcript,
@@ -1512,6 +1535,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
       finishTrace(traceId, false);
       bargeInTraceIdRef.current = undefined;
       setBargeInPhaseBoth("idle");
+      setBargeInRearmTick((t) => t + 1);
       dispatchEvent({ type: "LOCAL_COMMAND_DONE" });
       setLastError(err instanceof Error ? err.message : "Transcription failed.");
       recordAsrDiagnostic({ provider: asrProvider, transcript: "", latencyMs: 0, success: false });
@@ -1643,10 +1667,15 @@ export function JackProvider({ children }: { children: ReactNode }) {
           if (cancelled && started) void localRecorder.stop("route_change").catch(() => {});
           return;
         }
+        // A floor at/above bargeInLevel is rejected, never armed on (it would
+        // false-trigger continuously). Jack's own voice can inflate one
+        // reading, so retry a few times before giving up.
+        const MAX_CALIBRATION_ATTEMPTS = 3;
+        const calibrate = (attempt: number) => {
         bargeInArmGuardTimeoutRef.current = setTimeout(() => {
         if (bargeInPhaseRef.current !== "guarding") return; // disarmed/interrupted during the guard window
         setBargeInPhaseBoth("calibrating");
-        console.log("[mic] speech detector calibrating", { durationMs: capturePolicy.calibrationMs });
+        console.log("[mic] speech detector calibrating", { durationMs: capturePolicy.calibrationMs, attempt });
         bargeInCalibrationSamplesRef.current = [];
         bargeInCalibrationIntervalRef.current = setInterval(() => {
           bargeInCalibrationSamplesRef.current.push(localMicLevelRef.current);
@@ -1656,7 +1685,26 @@ export function JackProvider({ children }: { children: ReactNode }) {
           clearBargeInArmTimers();
           const samples = bargeInCalibrationSamplesRef.current;
           const floor = samples.length > 0 ? samples.reduce((a, b) => a + b, 0) / samples.length : 0;
-          const threshold = effectiveSpeechThreshold(floor, capturePolicy);
+          const calibration = validateSpeechCalibration(floor, capturePolicy);
+          if (!calibration.ok) {
+            console.warn("[mic] speech detector calibration rejected", {
+              reason: calibration.reason,
+              noiseFloor: Number(floor.toFixed(3)),
+              bargeInLevel: capturePolicy.bargeInLevel,
+              attempt,
+            });
+            if (attempt < MAX_CALIBRATION_ATTEMPTS) {
+              setBargeInPhaseBoth("guarding");
+              calibrate(attempt + 1);
+              return;
+            }
+            setBargeInPhaseBoth("idle");
+            void localRecorder.stop("route_change").catch(() => {});
+            setAmbientListeningEnabledState(false);
+            setLastError("Background noise is too high for Jack to listen reliably. Reduce the noise, then turn the mic on again.");
+            return;
+          }
+          const threshold = calibration.threshold;
           bargeInEffectiveThresholdRef.current = threshold;
           setBargeInNoiseFloor(floor);
           setBargeInThreshold(threshold);
@@ -1668,6 +1716,8 @@ export function JackProvider({ children }: { children: ReactNode }) {
           });
         }, capturePolicy.calibrationMs);
         }, capturePolicy.armGuardMs);
+        };
+        calibrate(1);
       });
     } else if (
       !shouldArm &&
@@ -1721,7 +1771,7 @@ export function JackProvider({ children }: { children: ReactNode }) {
     // triggered by a different unstable-ish dependency instead of an
     // unstable object identity.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ambientListeningEnabled, localRecorder.start, localRecorder.stop, clearBargeInArmTimers, setBargeInPhaseBoth, capturePolicy]);
+  }, [ambientListeningEnabled, bargeInRearmTick, localRecorder.start, localRecorder.stop, clearBargeInArmTimers, setBargeInPhaseBoth, capturePolicy]);
 
   // Watches mic level while armed for a sustained loud burst -> real
   // interruption, against this utterance's calibrated effective threshold

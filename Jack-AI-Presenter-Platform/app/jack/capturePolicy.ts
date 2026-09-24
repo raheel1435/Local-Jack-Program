@@ -136,3 +136,23 @@ export function capturePolicyFor(provider: "whisper" | "vibevoice" | "openai"): 
 export function effectiveSpeechThreshold(noiseFloor: number, policy: CaptureBoundaryPolicy): number {
   return Math.min(policy.bargeInLevel, noiseFloor + policy.floorMargin);
 }
+
+/**
+ * Outcome of checking a calibrated noise floor. A floor at or above
+ * bargeInLevel is not a valid quiet-room calibration: the effective threshold
+ * is capped at bargeInLevel, so the ambient level would already sit above it
+ * and cause continuous false captures.
+ */
+export type SpeechCalibrationResult =
+  | { readonly ok: true; readonly noiseFloor: number; readonly threshold: number }
+  | { readonly ok: false; readonly reason: "invalid_noise_floor" | "noise_floor_too_high"; readonly noiseFloor: number };
+
+export function validateSpeechCalibration(noiseFloor: number, policy: CaptureBoundaryPolicy): SpeechCalibrationResult {
+  if (!Number.isFinite(noiseFloor) || noiseFloor < 0) {
+    return { ok: false, reason: "invalid_noise_floor", noiseFloor };
+  }
+  if (noiseFloor >= policy.bargeInLevel) {
+    return { ok: false, reason: "noise_floor_too_high", noiseFloor };
+  }
+  return { ok: true, noiseFloor, threshold: effectiveSpeechThreshold(noiseFloor, policy) };
+}

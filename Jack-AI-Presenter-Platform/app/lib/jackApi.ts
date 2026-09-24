@@ -159,6 +159,36 @@ export function setProviderRequestStatusHandler(handler: ProviderStatusHandler |
   providerStatusHandler = handler;
 }
 
+// The user answers a fallback prompt once per upload session: the answer is
+// remembered (null = cancelled) and reused silently until the next upload
+// calls resetProviderFallbackDecisions(). Requests that fail while a prompt is
+// already open share that one prompt instead of replacing it. A cancel while
+// credentials are missing is not remembered -- that dialog sends the user to
+// Settings, and the next request must be able to prompt again once a key exists.
+const fallbackDecisions = new Map<string, string | null>();
+const pendingFallbackPrompts = new Map<string, Promise<string | null>>();
+
+export function resetProviderFallbackDecisions(): void {
+  fallbackDecisions.clear();
+}
+
+function requestFallbackChoice(handler: FallbackConsentHandler, request: ProviderFallbackRequest): Promise<string | null> {
+  const key = `${request.kind}:${request.failedProvider}`;
+  if (fallbackDecisions.has(key)) return Promise.resolve(fallbackDecisions.get(key) ?? null);
+  const pending = pendingFallbackPrompts.get(key);
+  if (pending) return pending;
+  const prompt = handler(request)
+    .then((choice) => {
+      if (choice !== null || !request.credentialRequired) fallbackDecisions.set(key, choice);
+      return choice;
+    })
+    .finally(() => {
+      pendingFallbackPrompts.delete(key);
+    });
+  pendingFallbackPrompts.set(key, prompt);
+  return prompt;
+}
+
 interface JackApiErrorBody {
   error?: string;
   detail?: string;
@@ -220,7 +250,7 @@ async function withBrainConsent<T extends JackChatResult | JackIntentResult>(
     return result;
   } catch (error) {
     if (!(error instanceof JackApiError) || !error.body.requiresConsent || !fallbackConsentHandler) throw error;
-    const choice = await fallbackConsentHandler({
+    const choice = await requestFallbackChoice(fallbackConsentHandler, {
       kind: "brain",
       failedProvider: (error.body.provider as AiProviderId | undefined) ?? selected,
       options: (error.body.fallbackOptions ?? []) as AiProviderId[],
@@ -337,7 +367,7 @@ export const jackApi = {
       const detail = (await res.json().catch(() => ({}))) as JackApiErrorBody;
       const error = new JackApiError(res.status, detail);
       if (!detail.requiresConsent || !fallbackConsentHandler) throw error;
-      const choice = await fallbackConsentHandler({
+      const choice = await requestFallbackChoice(fallbackConsentHandler, {
         kind: "asr",
         failedProvider: (detail.provider as AsrProviderId | undefined) ?? provider ?? "whisper",
         options: (detail.fallbackOptions ?? []) as AsrProviderId[],
