@@ -1,0 +1,10 @@
+exclude:
+  - runtime-dependencies/
+  - node_modules/
+  - vendor/
+  - .bundle/
+  - .github/
+  - android/
+  - ios/
+  - dist/
+  - build/
